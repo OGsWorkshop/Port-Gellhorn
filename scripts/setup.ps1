@@ -39,4 +39,4 @@ if ($Game) {
 
 Write-Host ''
 Write-Host 'Done. Run the game with:' -ForegroundColor Green
-Write-Host '  .\scripts\play.ps1 -Game "D:\path\to\your\GTA VI dump"'
+Write-Host '  .\scripts\play.ps1 -Game "D:\path\to\your\dump"'
