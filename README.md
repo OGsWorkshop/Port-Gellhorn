@@ -26,7 +26,13 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 
 ## 📸 Running right now
 
-### 🆕 The opening scene's 3D world on an RTX 3060
+### 🆕 The open world, drawn live on an RTX 3060
+
+![Open world in debug colours](assets/world-street-debug.png)
+
+<sub>A street in the open world, shown in the game window in real time on an RTX 3060: a picnic table, a building, the road and its markings. This is one of the game's own geometry buffers put on screen with a debug colour view (VIctory + community PRs, `VICTORY_DEBUG_PS=1`, `VICTORY_SHOW_TARGET=2560x1440-f28`), at about 1 fps. Lighting and textures are not there yet.</sub>
+
+### The opening scene's 3D world on an RTX 3060
 
 ![Opening scene geometry in debug colours](assets/world-sofa-debug.png)
 
