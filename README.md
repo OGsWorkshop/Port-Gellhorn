@@ -7,13 +7,13 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 
 ### Progress to playable
 
-![progress](https://img.shields.io/badge/progress-25%25-ff2d95?style=for-the-badge)
+![progress](https://img.shields.io/badge/progress-35%25-ff2d95?style=for-the-badge)
 
 ```
-█████░░░░░░░░░░░░░░░  25%
+███████░░░░░░░░░░░░░  35%
 ```
 
-`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `world renders` 🔨 → `gameplay` ⏳ → `30 fps 1:1` ⏳
+`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `world geometry` ✅ → `gameplay starts` ✅ → `lighting & final image` 🔨 → `30 fps 1:1` ⏳
 
 <a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" height="45"/></a>
 <a href="https://ko-fi.com/ziggymar"><img src="https://img.shields.io/badge/BUY%20A%20COFFEE-Ko--fi-ff5f5f?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" height="45"/></a>
@@ -25,6 +25,12 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 ---
 
 ## 📸 Running right now
+
+### 🆕 Gameplay has started: the movement tutorial
+
+![Movement tutorial prompt](assets/tutorial-prompt.png)
+
+<sub>The game's own "Move around / Move the camera" tutorial on an RTX 3060. The game is past its opening and waiting for the player; the 3D picture behind the prompt is still black because the lighting shaders don't all translate yet (see below).</sub>
 
 ### 🆕 The open world, drawn live on an RTX 3060
 
@@ -59,6 +65,23 @@ The title's own artwork, menus and loading screens, drawn natively on an **RTX 3
 | ![Subtitles setup screen](assets/menu-subtitles.png) | ![Legal notices screen](assets/menu-legal.png) | ![Terms screen](assets/menu-terms.png) |
 
 <sub>Gameplay screenshots go here the moment the world renders. Watch the repo ⭐ so you see it first.</sub>
+
+---
+
+## 🧱 What blocks the final picture
+
+The world's geometry buffers (normals, albedo, depth, shadow maps) fill in correctly. The final image is black because some of the game's GPU programs still fail to translate on NVIDIA, and their work is dropped. The biggest groups, from one world run on an RTX 3060:
+
+| Failure | Shaders | Status |
+|---|:---:|---|
+| Descriptor read only as data | 149 | open |
+| `v_readfirstlane` in divergent control flow | 101 | uniform case fixed, rest open |
+| Lane mask read as data (mesh + compute) | 94 | fixed in our branch (plus upstream VIctory #1407) |
+| Structured buffer of unknown stride | 63 | in progress – the top per-frame drop |
+| Cross-lane wave op in divergent flow | 57 | open |
+| Title heap larger than NVIDIA's 1,000,000-descriptor cap | – | in progress (upstream VIctory #1133) |
+
+Each of these is a self-contained task for one person + one AI agent. Speed is the other wall: about 1 fps in the world today.
 
 ---
 
