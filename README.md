@@ -7,13 +7,13 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 
 ### Progress to playable
 
-![progress](https://img.shields.io/badge/progress-35%25-ff2d95?style=for-the-badge)
+![progress](https://img.shields.io/badge/progress-45%25-ff2d95?style=for-the-badge)
 
 ```
-███████░░░░░░░░░░░░░  35%
+█████████░░░░░░░░░░░  45%
 ```
 
-`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `world geometry` ✅ → `gameplay starts` ✅ → `lighting & final image` 🔨 → `30 fps 1:1` ⏳
+`boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `world geometry` ✅ → `gameplay starts` ✅ → `lit final image` ✅ → `shadows, speed` 🔨 → `30 fps 1:1` ⏳
 
 <a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" height="45"/></a>
 <a href="https://ko-fi.com/ziggymar"><img src="https://img.shields.io/badge/BUY%20A%20COFFEE-Ko--fi-ff5f5f?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" height="45"/></a>
@@ -25,6 +25,12 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 ---
 
 ## 📸 Running right now
+
+### 🆕 The game's own lit picture on an RTX 3060
+
+![Lit gameplay view](assets/world-lit.png)
+
+<sub>The game's real final image in gameplay on an RTX 3060 (Windows 10): sunlight, textures, fences, buildings, with the movement tutorial on screen. About 2.5 fps. Shadowed areas are still too dark and some HUD text is cut off. Built on the public VIctory fork by fxceless (GPL-3.0) with our Windows 10, input, capture and fast-boot work on top.</sub>
 
 ### 🆕 The world with our own stand-in lighting
 
