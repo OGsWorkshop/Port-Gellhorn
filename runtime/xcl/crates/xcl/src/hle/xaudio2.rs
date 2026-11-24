@@ -67,6 +67,10 @@ const CO_E_NOTINITIALIZED: HRESULT = 0x8004_01F0u32 as i32;
 const ENGINE_CREATE_SOURCE_VOICE: usize = 5;
 const ENGINE_CREATE_MASTERING_VOICE: usize = 7;
 const VOICE_DESTROY: usize = 18;
+const VOICE_SET_VOLUME: usize = 12;
+const ENGINE_ADD_REF: usize = 1;
+const ENGINE_START: usize = 8;
+const ENGINE_STOP: usize = 9;
 const VOICE_SUBMIT_SOURCE_BUFFER: usize = 21;
 const VOICE_FLUSH_SOURCE_BUFFERS: usize = 22;
 const VOICE_GET_STATE: usize = 25;
@@ -747,6 +751,7 @@ unsafe fn create_engine(pp: *mut *mut c_void, flags: u32, processor: u32) -> HRE
     }
     patch(*pp, ENGINE_CREATE_SOURCE_VOICE, create_source_voice as usize);
     patch(*pp, ENGINE_CREATE_MASTERING_VOICE, create_mastering_voice as usize);
+    track_engine(*pp);
     ENGINES.fetch_add(1, Ordering::Relaxed);
     crate::xlog_info!("XAudio2: engine created (system XAudio2 2.9, flags {clean:#x})");
     S_OK
@@ -952,6 +957,96 @@ unsafe fn patch_source_voice(voice: *mut c_void) {
     patch(voice, VOICE_DESTROY, destroy_voice as usize);
 }
 
+// ---------------------------------------------------------------------------------------
+// Window focus (crate::qol): the master voice is muted and, for XCL_BACKGROUND=pause, the
+// engines stopped. The title's own master volume is remembered and restored.
+// ---------------------------------------------------------------------------------------
+
+type SetVolumeFn = unsafe extern "system" fn(*mut c_void, f32, u32) -> HRESULT;
+type EngineAddRefFn = unsafe extern "system" fn(*mut c_void) -> u32;
+type EngineStartFn = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+type EngineStopFn = unsafe extern "system" fn(*mut c_void);
+
+struct Background {
+    masters: Vec<usize>,
+    engines: Vec<usize>,
+    muted: bool,
+    stopped: bool,
+    title_volume: f32,
+}
+static BACKGROUND: Mutex<Background> = Mutex::new(Background { masters: Vec::new(), engines: Vec::new(), muted: false, stopped: false, title_volume: 1.0 });
+
+/// The volume handed to the system: the title's, or 0 while muted.
+pub fn effective_volume(title: f32, muted: bool) -> f32 {
+    if muted { 0.0 } else { title }
+}
+
+unsafe fn track_master(voice: *mut c_void) {
+    if voice.is_null() {
+        return;
+    }
+    patch(voice, VOICE_SET_VOLUME, master_set_volume as usize);
+    patch(voice, VOICE_DESTROY, destroy_voice as usize);
+    let mut g = BACKGROUND.lock().unwrap();
+    if !g.masters.contains(&(voice as usize)) {
+        g.masters.push(voice as usize);
+    }
+    if g.muted {
+        if let Some(orig) = original(voice, VOICE_SET_VOLUME) {
+            std::mem::transmute::<usize, SetVolumeFn>(orig)(voice, 0.0, 0);
+        }
+    }
+}
+
+fn untrack_master(voice: *mut c_void) {
+    if let Ok(mut g) = BACKGROUND.lock() {
+        g.masters.retain(|&m| m != voice as usize);
+    }
+}
+
+unsafe fn track_engine(engine: *mut c_void) {
+    let mut g = BACKGROUND.lock().unwrap();
+    if !g.engines.contains(&(engine as usize)) {
+        // our own reference keeps the pointer valid for StartEngine/StopEngine
+        std::mem::transmute::<usize, EngineAddRefFn>(vtable(engine).add(ENGINE_ADD_REF).read())(engine);
+        g.engines.push(engine as usize);
+    }
+}
+
+/// Hook of the master voice's SetVolume: the title's value is kept, 0 is sent while muted.
+unsafe extern "system" fn master_set_volume(this: *mut c_void, volume: f32, op: u32) -> HRESULT {
+    let Some(orig) = original(this, VOICE_SET_VOLUME) else { return E_FAIL };
+    let muted = {
+        let mut g = BACKGROUND.lock().unwrap();
+        g.title_volume = volume;
+        g.muted
+    };
+    std::mem::transmute::<usize, SetVolumeFn>(orig)(this, effective_volume(volume, muted), op)
+}
+
+/// Mute the master voice(s) and/or stop the engines (window thread).
+pub fn set_background(mute: bool, stop: bool) {
+    let mut g = BACKGROUND.lock().unwrap();
+    g.muted = mute;
+    unsafe {
+        for &m in &g.masters {
+            if let Some(orig) = original(m as *mut c_void, VOICE_SET_VOLUME) {
+                std::mem::transmute::<usize, SetVolumeFn>(orig)(m as *mut c_void, effective_volume(g.title_volume, mute), 0);
+            }
+        }
+        if g.stopped != stop {
+            g.stopped = stop;
+            for &e in &g.engines {
+                let vt = vtable(e as *mut c_void);
+                if stop {
+                    std::mem::transmute::<usize, EngineStopFn>(vt.add(ENGINE_STOP).read())(e as *mut c_void);
+                } else {
+                    std::mem::transmute::<usize, EngineStartFn>(vt.add(ENGINE_START).read())(e as *mut c_void);
+                }
+            }
+        }
+    }
+}
 unsafe extern "system" fn create_mastering_voice(
     this: *mut c_void,
     pp: *mut *mut c_void,
@@ -992,6 +1087,7 @@ unsafe extern "system" fn create_mastering_voice(
         crate::xlog_error!("XAudio2: CreateMasteringVoice failed ({:#x}) – no audio device?", hr as u32);
     } else {
         MASTERING.fetch_add(1, Ordering::Relaxed);
+        track_master(*pp);
     }
     hr
 }
@@ -1157,6 +1253,7 @@ unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2Vo
 }
 
 unsafe extern "system" fn destroy_voice(this: *mut c_void) {
+    untrack_master(this);
     let Some(orig) = original(this, VOICE_DESTROY) else { return };
     let orig: DestroyVoiceFn = std::mem::transmute(orig);
     if let Some(m) = XMA.lock().unwrap().as_mut() {

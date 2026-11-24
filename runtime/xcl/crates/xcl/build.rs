@@ -10,6 +10,7 @@ const TRANSLATOR_SOURCES: &[&str] = &[
     "src/gpu/rdna2.rs",
     "src/gpu/rdna2_spec.rs",
     "src/gpu/rdna2_xbox.rs",
+    "src/gpu/recomp/compact.rs",
     "src/gpu/recomp/dxc.rs",
     "src/gpu/recomp/emit.rs",
     "src/gpu/recomp/mesh_wave.rs",
@@ -48,4 +49,13 @@ fn main() {
         add(&mut h, &[0]);
     }
     println!("cargo:rustc-env=XCL_TRANSLATOR_SOURCE_ID={h:016x}");
+    let git = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=XCL_GIT_HASH={git}");
 }

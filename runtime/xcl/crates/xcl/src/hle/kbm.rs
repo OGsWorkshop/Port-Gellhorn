@@ -1,19 +1,35 @@
 //! Keyboard and mouse as the gamepad (`keyboard_mouse` in `xcl.toml`, on by default).
 //!
 //! Console titles read only gamepads. While the XCL window has the focus the keyboard and
-//! the mouse play as the one gamepad XCL reports (on top of a real controller):
+//! the mouse play as the one gamepad XCL reports (on top of a real controller; a controller
+//! stick that is deflected wins over WASD / the mouse):
+//!
+//! Click into the window to capture the mouse (cursor hidden and clipped to the window, raw
+//! deltas drive the camera). Alt, Alt+Tab or losing the focus release it; a click captures
+//! again. While it is free the window title says so. Escape stays B for the game.
 //!
 //! | PC | gamepad |
 //! |---|---|
-//! | W A S D | left stick |
-//! | mouse movement | right stick (the cursor is held in the window; Alt+Tab frees it) |
-//! | left / right mouse button | right / left trigger |
-//! | wheel up / down | right / left bumper (one press a notch) |
-//! | middle mouse button | right stick click |
-//! | Left Shift / Left Ctrl | left / right stick click |
-//! | E / Q | Y / X |
-//! | Space, Enter / Escape, Backspace | A / B |
+//! | W A S D (physical keys) | left stick |
+//! | mouse movement (captured) | right stick (camera) |
+//! | left / right mouse button | RT (shoot) / LT (aim) |
+//! | wheel up / down | D-pad up / down (one press a notch) |
+//! | middle mouse button | right stick click (RS) |
+//! | Left Shift | A (sprint) |
+//! | Space | X (jump) |
+//! | E, F | Y (enter / leave a vehicle) |
+//! | Q / R | LB / RB |
+//! | Left Ctrl | left stick click (LS, crouch) |
+//! | Enter | A (menus: confirm) |
+//! | Escape, Backspace | B |
 //! | arrows / Tab / P | D-pad / View / Menu |
+//!
+//! Every key but WASD can be rebound with a text file: `XCL_KEYMAP=<path>`, one `KEY=BUTTON`
+//! per line (`#` comments). Keys: A-Z (physical position), 0-9, F1-F12, SPACE ENTER ESC
+//! BACKSPACE TAB CAPSLOCK SHIFT RSHIFT CTRL RCTRL UP DOWN LEFT RIGHT. Buttons: A B X Y LB RB
+//! LT RT LS RS VIEW MENU UP DOWN LEFT RIGHT, or NONE to unbind the key. A key listed in the
+//! file replaces its default binding. `XCL_MOUSE_SENS=<f>` (default: `mouse_sensitivity` of
+//! xcl.toml, 1.0) scales the camera speed; `XCL_MOUSE_INVERT_Y=1` inverts it.
 //!
 //! The mouse is read with Raw Input on the XCL window (movement in mouse counts, not the
 //! cursor); its speed becomes a stick deflection – the stick turns the camera at a rate,
@@ -24,7 +40,23 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use super::gameinput::{GamepadState, LEFT_SHOULDER, LEFT_STICK, RIGHT_SHOULDER, RIGHT_STICK, X, Y};
+use super::gameinput::{
+    GamepadState, A, B, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT, DPAD_UP, LEFT_SHOULDER, LEFT_STICK, MENU, RIGHT_SHOULDER, RIGHT_STICK, VIEW, X, Y,
+};
+
+/// a controller stick deflected past this beats the keyboard / mouse on that stick
+const PAD_PRIORITY: f32 = 0.1;
+
+/// The stick `pad` reads (a real controller) or, when it rests, `other` (keys / mouse).
+pub fn pick_stick(pad: (f32, f32), other: (f32, f32)) -> (f32, f32) {
+    if pad.0 * pad.0 + pad.1 * pad.1 > PAD_PRIORITY * PAD_PRIORITY {
+        pad
+    } else if other != (0.0, 0.0) {
+        other
+    } else {
+        pad
+    }
+}
 
 // ---------------------------------------------------------------------------------------
 // the mapping (pure, tested)
@@ -53,14 +85,186 @@ const START: f32 = 0.15;
 const SMOOTHING: f32 = 0.03;
 
 /// The right stick for a mouse velocity (counts a second, screen axes: y grows downwards).
-pub fn stick_from_mouse(vx: f32, vy: f32, sensitivity: f32) -> (f32, f32) {
+/// Linear in speed (no acceleration), clamped to 1; `invert_y` flips the vertical axis.
+pub fn stick_from_mouse(vx: f32, vy: f32, sensitivity: f32, invert_y: bool) -> (f32, f32) {
     let speed = (vx * vx + vy * vy).sqrt();
     if speed < REST_SPEED || sensitivity <= 0.0 {
         return (0.0, 0.0);
     }
     let m = (speed * sensitivity / FULL_SPEED).min(1.0);
     let out = START + (1.0 - START) * m;
-    (vx / speed * out, -vy / speed * out)
+    let sy = if invert_y { 1.0 } else { -1.0 };
+    (vx / speed * out, sy * vy / speed * out)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// `XCL_MOUSE_SENS` (a positive number) or `mouse_sensitivity` of the config.
+fn mouse_sens() -> f32 {
+    static ENV: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| std::env::var("XCL_MOUSE_SENS").ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| *v > 0.0))
+        .unwrap_or_else(|| crate::state::config().mouse_sensitivity)
+}
+
+fn mouse_invert_y() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_flag("XCL_MOUSE_INVERT_Y"))
+}
+
+// ---------------------------------------------------------------------------------------
+// the key map (pure, tested)
+// ---------------------------------------------------------------------------------------
+
+/// A key: a virtual key, or a physical key position (scancode, QWERTY virtual key fallback)
+/// so that letters stay where they are on AZERTY and the like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Vk(i32),
+    Sc(u32, i32),
+}
+
+/// What a key presses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Button(u32),
+    LeftTrigger,
+    RightTrigger,
+}
+
+pub type Keymap = Vec<(Key, Action)>;
+
+/// The default layout (see the table at the top). Parsed like a user's file.
+pub const DEFAULT_KEYMAP: &str = "\
+SHIFT=A
+SPACE=X
+E=Y
+F=Y
+Q=LB
+R=RB
+CTRL=LS
+ENTER=A
+ESC=B
+BACKSPACE=B
+TAB=VIEW
+P=MENU
+UP=UP
+DOWN=DOWN
+LEFT=LEFT
+RIGHT=RIGHT
+";
+
+fn letter_scancode(c: char) -> Option<(u32, i32)> {
+    let rows = [("QWERTYUIOP", 0x10u32), ("ASDFGHJKL", 0x1E), ("ZXCVBNM", 0x2C)];
+    rows.iter().find_map(|(row, base)| row.find(c).map(|i| (base + i as u32, c as i32)))
+}
+
+pub fn parse_key(name: &str) -> Option<Key> {
+    let n = name.trim().to_ascii_uppercase();
+    let mut chars = n.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        if let Some((sc, vk)) = letter_scancode(c) {
+            return Some(Key::Sc(sc, vk));
+        }
+        if c.is_ascii_digit() {
+            return Some(Key::Vk(c as i32));
+        }
+    }
+    if let Some(f) = n.strip_prefix('F').and_then(|d| d.parse::<i32>().ok()) {
+        if (1..=12).contains(&f) {
+            return Some(Key::Vk(0x70 + f - 1));
+        }
+    }
+    let vk = match n.as_str() {
+        "SPACE" => 0x20,
+        "ENTER" | "RETURN" => 0x0D,
+        "ESC" | "ESCAPE" => 0x1B,
+        "BACKSPACE" => 0x08,
+        "TAB" => 0x09,
+        "CAPSLOCK" => 0x14,
+        "SHIFT" | "LSHIFT" => 0xA0,
+        "RSHIFT" => 0xA1,
+        "CTRL" | "LCTRL" => 0xA2,
+        "RCTRL" => 0xA3,
+        "LEFT" => 0x25,
+        "UP" => 0x26,
+        "RIGHT" => 0x27,
+        "DOWN" => 0x28,
+        _ => return None,
+    };
+    Some(Key::Vk(vk))
+}
+
+/// `None`: not a button name; `Some(None)`: NONE (unbind).
+pub fn parse_action(name: &str) -> Option<Option<Action>> {
+    let b = |v| Some(Some(Action::Button(v)));
+    match name.trim().to_ascii_uppercase().as_str() {
+        "A" => b(A),
+        "B" => b(B),
+        "X" => b(X),
+        "Y" => b(Y),
+        "LB" => b(LEFT_SHOULDER),
+        "RB" => b(RIGHT_SHOULDER),
+        "LS" => b(LEFT_STICK),
+        "RS" => b(RIGHT_STICK),
+        "VIEW" => b(VIEW),
+        "MENU" => b(MENU),
+        "UP" | "DPAD_UP" => b(DPAD_UP),
+        "DOWN" | "DPAD_DOWN" => b(DPAD_DOWN),
+        "LEFT" | "DPAD_LEFT" => b(DPAD_LEFT),
+        "RIGHT" | "DPAD_RIGHT" => b(DPAD_RIGHT),
+        "LT" => Some(Some(Action::LeftTrigger)),
+        "RT" => Some(Some(Action::RightTrigger)),
+        "NONE" => Some(None),
+        _ => None,
+    }
+}
+
+/// Apply `key=button` lines of `text` to `map`: a key listed replaces its earlier binding.
+/// Returns a message for each line that could not be used (blank and `#` lines are fine).
+pub fn parse_keymap_into(map: &mut Keymap, text: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((k, a)) = line.split_once('=') else {
+            errors.push(format!("line {}: expected KEY=BUTTON, got \"{line}\"", i + 1));
+            continue;
+        };
+        let (Some(key), Some(action)) = (parse_key(k), parse_action(a)) else {
+            errors.push(format!("line {}: unknown key or button in \"{line}\"", i + 1));
+            continue;
+        };
+        map.retain(|(existing, _)| *existing != key);
+        if let Some(action) = action {
+            map.push((key, action));
+        }
+    }
+    errors
+}
+
+/// The default layout, then the file named by `XCL_KEYMAP` on top.
+fn keymap() -> &'static Keymap {
+    static MAP: std::sync::OnceLock<Keymap> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = Keymap::new();
+        parse_keymap_into(&mut map, DEFAULT_KEYMAP);
+        if let Ok(path) = std::env::var("XCL_KEYMAP") {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    for e in parse_keymap_into(&mut map, &text) {
+                        crate::xlog_warn!("XCL_KEYMAP {path}: {e}");
+                    }
+                    crate::xlog_info!("XCL_KEYMAP: key map from {path}");
+                }
+                Err(e) => crate::xlog_warn!("XCL_KEYMAP {path}: {e}; the default layout stays"),
+            }
+        }
+        map
+    })
 }
 
 /// The mouse's velocity, smoothed: counts since the last update over `dt` seconds.
@@ -84,7 +288,7 @@ impl Velocity {
 const NOTCH_HOLD_US: u64 = 50_000;
 const NOTCH_GAP_US: u64 = 50_000;
 
-/// Wheel notches as bumper presses, one after the other.
+/// Wheel notches as D-pad up / down presses, one after the other.
 #[derive(Debug, Default)]
 pub struct Wheel {
     /// notches still to press (+ up, - down)
@@ -98,7 +302,7 @@ impl Wheel {
         self.pending = (self.pending + n).clamp(-8, 8);
     }
 
-    /// The bumper held now, `dt` seconds after the last call.
+    /// The D-pad button held now, `dt` seconds after the last call.
     pub fn step(&mut self, dt: f32) -> u32 {
         if let Some((b, t)) = self.current.as_mut() {
             *t += (dt.max(0.0) * 1e6).round() as u64;
@@ -113,7 +317,7 @@ impl Wheel {
         if self.pending == 0 {
             return 0;
         }
-        let b = if self.pending > 0 { RIGHT_SHOULDER } else { LEFT_SHOULDER };
+        let b = if self.pending > 0 { DPAD_UP } else { DPAD_DOWN };
         self.pending -= self.pending.signum();
         self.current = Some((b, 0));
         b
@@ -183,6 +387,7 @@ struct RawMouseInput {
 
 const WM_INPUT: u32 = 0x00FF;
 const WM_ACTIVATE: u32 = 0x0006;
+const WM_KILLFOCUS: u32 = 0x0008;
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_SIZE: u32 = 0x0005;
 const WM_MOVE: u32 = 0x0003;
@@ -198,8 +403,10 @@ const MAPVK_VSC_TO_VK_EX: u32 = 3;
 
 /// Physical AT Set 1 keyboard scancodes for the left-hand cluster, paired with their
 /// QWERTY virtual-key fallbacks if `MapVirtualKeyExW` returns 0.
+#[cfg(test)]
 const SC_Q: (u32, i32) = (0x10, 0x51);
 const SC_W: (u32, i32) = (0x11, 0x57);
+#[cfg(test)]
 const SC_E: (u32, i32) = (0x12, 0x45);
 const SC_A: (u32, i32) = (0x1E, 0x41);
 const SC_S: (u32, i32) = (0x1F, 0x53);
@@ -207,8 +414,24 @@ const SC_D: (u32, i32) = (0x20, 0x44);
 
 /// the XCL window (raw input goes there; the cursor is held in it)
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
-/// the cursor is held in the window (it has the focus)
+/// the mouse is captured: a click captured it; Alt, Alt+Tab or a lost focus release it
 static CAPTURED: AtomicBool = AtomicBool::new(false);
+/// the click that captured the mouse is still down: it is not a shot
+static SWALLOW_LMB: AtomicBool = AtomicBool::new(false);
+
+/// The mouse is captured (the window title says how to capture it otherwise).
+pub fn captured() -> bool {
+    CAPTURED.load(Ordering::Acquire)
+}
+
+/// Suffix of the window title while the mouse is free ("" when captured or disabled).
+pub fn title_hint() -> &'static str {
+    if enabled() && WINDOW.load(Ordering::Acquire) != 0 && !captured() {
+        " (click to capture mouse, Alt to release)"
+    } else {
+        ""
+    }
+}
 /// the user is dragging or resizing the window (WM_ENTERSIZEMOVE … WM_EXITSIZEMOVE):
 /// the cursor must stay free, or the 1-pixel clip teleports it back mid-drag
 static SIZING: AtomicBool = AtomicBool::new(false);
@@ -260,7 +483,7 @@ pub fn attach(hwnd: *mut c_void) {
     let dev = RawInputDevice { usage_page: 1, usage: 2, flags: 0, target: hwnd };
     let ok = unsafe { RegisterRawInputDevices(&dev, 1, std::mem::size_of::<RawInputDevice>() as u32) } != 0;
     crate::xlog_info!(
-        "keyboard and mouse play as the gamepad (WASD left stick, mouse right stick, mouse buttons triggers, wheel bumpers){}",
+        "keyboard and mouse play as the gamepad (WASD left stick, mouse right stick once captured by a click, mouse buttons triggers, wheel D-pad){}",
         if ok { "" } else { " – raw mouse input unavailable, the mouse is not read" }
     );
 }
@@ -280,14 +503,17 @@ unsafe fn hold_cursor(hwnd: *mut c_void, on: bool) {
         }
         return;
     }
-    // a point at the client area's centre: the cursor stays there, hidden
+    // the cursor stays in the client area, hidden (WM_SETCURSOR); raw deltas are not clipped
     let mut r = Rect::default();
     GetClientRect(hwnd, &mut r);
-    let mut c = Point { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
-    ClientToScreen(hwnd, &mut c);
-    let at = Rect { left: c.x, top: c.y, right: c.x + 1, bottom: c.y + 1 };
+    let mut tl = Point { x: r.left, y: r.top };
+    let mut br = Point { x: r.right, y: r.bottom };
+    ClientToScreen(hwnd, &mut tl);
+    ClientToScreen(hwnd, &mut br);
+    let at = Rect { left: tl.x, top: tl.y, right: br.x, bottom: br.y };
     ClipCursor(&at);
     CAPTURED.store(true, Ordering::Release);
+    SetCursor(std::ptr::null_mut());
 }
 
 /// The process is ending: the cursor is let go (a held cursor outlives its window).
@@ -317,11 +543,17 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
             false // DefWindowProc cleans up
         }
         WM_ACTIVATE => {
-            let active = wp & 0xFFFF != 0;
-            hold_cursor(hwnd, active);
-            if !active {
+            // activation does not capture (a click does); losing it releases
+            if wp & 0xFFFF == 0 {
+                hold_cursor(hwnd, false);
                 reset_mouse_state();
             }
+            crate::qol::focus_changed(wp & 0xFFFF != 0);
+            false
+        }
+        WM_KILLFOCUS => {
+            hold_cursor(hwnd, false);
+            reset_mouse_state();
             false
         }
         WM_ENTERSIZEMOVE => {
@@ -331,14 +563,24 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
             false
         }
         WM_EXITSIZEMOVE => {
+            // the drag released the mouse: a click captures it again
             SIZING.store(false, Ordering::Release);
-            if GetForegroundWindow() == hwnd {
+            false
+        }
+        WM_LBUTTONDOWN => {
+            if !CAPTURED.load(Ordering::Acquire) && GetForegroundWindow() == hwnd {
+                reset_mouse_state();
                 hold_cursor(hwnd, true);
+                if CAPTURED.load(Ordering::Acquire) {
+                    SWALLOW_LMB.store(true, Ordering::Release);
+                }
             }
             false
         }
-        WM_LBUTTONDOWN | WM_SIZE | WM_MOVE => {
-            if GetForegroundWindow() == hwnd {
+        WM_SIZE | WM_MOVE => {
+            // the clip follows the window while captured
+            if CAPTURED.load(Ordering::Acquire) && GetForegroundWindow() == hwnd {
+                CAPTURED.store(false, Ordering::Release);
                 hold_cursor(hwnd, true);
             }
             false
@@ -404,28 +646,41 @@ pub fn apply(s: &mut GamepadState) {
     }
     let layout = keyboard_layout_for_window(hwnd as *mut c_void);
     let sc_key = |(sc, fb): (u32, i32)| key(scancode_to_vk(sc, fb, layout));
-    // movement keys: physical WASD cluster -> left stick (a real stick moved further wins; so does it for the mouse)
-    let (lx, ly) = stick_from_keys(sc_key(SC_W), sc_key(SC_A), sc_key(SC_S), sc_key(SC_D));
-    if (lx != 0.0 || ly != 0.0) && lx * lx + ly * ly >= s.left_x * s.left_x + s.left_y * s.left_y {
-        s.left_x = lx;
-        s.left_y = ly;
+    // Alt releases the mouse (Esc stays B for the game); a click captures it again
+    if CAPTURED.load(Ordering::Acquire) && key(0x12) {
+        // SAFETY: releases the cursor clip only.
+        unsafe { hold_cursor(hwnd as *mut c_void, false) };
+        reset_mouse_state();
     }
-    // (Space / Enter, Escape / Backspace, arrows, Tab, P: `gameinput::keyboard`)
-    const VK_KEYS: [(i32, u32); 3] = [
-        (0xA0, LEFT_STICK),  // Left Shift
-        (0xA2, RIGHT_STICK), // Left Ctrl
-        (0x04, RIGHT_STICK), // middle mouse button
-    ];
-    const SC_KEYS: [((u32, i32), u32); 2] = [
-        (SC_E, Y), // physical E
-        (SC_Q, X), // physical Q
-    ];
-    s.buttons |= VK_KEYS.iter().filter(|(k, _)| key(*k)).fold(0, |b, (_, g)| b | g);
-    s.buttons |= SC_KEYS.iter().filter(|(sc, _)| sc_key(*sc)).fold(0, |b, (_, g)| b | g);
-    if key(0x01) {
+    // movement keys: physical WASD cluster -> left stick (a deflected real stick wins)
+    let (lx, ly) = pick_stick((s.left_x, s.left_y), stick_from_keys(sc_key(SC_W), sc_key(SC_A), sc_key(SC_S), sc_key(SC_D)));
+    s.left_x = lx;
+    s.left_y = ly;
+    for (k, action) in keymap() {
+        let down = match *k {
+            Key::Vk(vk) => key(vk),
+            Key::Sc(sc, fb) => sc_key((sc, fb)),
+        };
+        if !down {
+            continue;
+        }
+        match *action {
+            Action::Button(b) => s.buttons |= b,
+            Action::LeftTrigger => s.left_trigger = 1.0,
+            Action::RightTrigger => s.right_trigger = 1.0,
+        }
+    }
+    if key(0x04) && CAPTURED.load(Ordering::Acquire) {
+        s.buttons |= RIGHT_STICK; // middle mouse button
+    }
+    if SWALLOW_LMB.load(Ordering::Acquire) {
+        if !key(0x01) {
+            SWALLOW_LMB.store(false, Ordering::Release);
+        }
+    } else if key(0x01) && CAPTURED.load(Ordering::Acquire) {
         s.right_trigger = 1.0;
     }
-    if key(0x02) {
+    if key(0x02) && CAPTURED.load(Ordering::Acquire) {
         s.left_trigger = 1.0;
     }
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
@@ -434,11 +689,9 @@ pub fn apply(s: &mut GamepadState) {
     let dt = now.duration_since(m.last).as_secs_f32();
     m.last = now;
     m.velocity.update(DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed), dt);
-    let (rx, ry) = stick_from_mouse(m.velocity.x, m.velocity.y, crate::state::config().mouse_sensitivity);
-    if (rx != 0.0 || ry != 0.0) && rx * rx + ry * ry >= s.right_x * s.right_x + s.right_y * s.right_y {
-        s.right_x = rx;
-        s.right_y = ry;
-    }
+    let (rx, ry) = pick_stick((s.right_x, s.right_y), stick_from_mouse(m.velocity.x, m.velocity.y, mouse_sens(), mouse_invert_y()));
+    s.right_x = rx;
+    s.right_y = ry;
     m.wheel_rest += WHEEL.swap(0, Ordering::Relaxed);
     let notches = m.wheel_rest / 120;
     m.wheel_rest -= notches * 120;
@@ -464,17 +717,97 @@ mod tests {
     #[test]
     fn mouse_speed_becomes_a_deflection() {
         // resting
-        assert_eq!(stick_from_mouse(5.0, 0.0, 1.0), (0.0, 0.0));
+        assert_eq!(stick_from_mouse(5.0, 0.0, 1.0, false), (0.0, 0.0));
         // slow movement starts past the dead zone, to the right
-        let (x, y) = stick_from_mouse(100.0, 0.0, 1.0);
+        let (x, y) = stick_from_mouse(100.0, 0.0, 1.0, false);
         assert!(x > START && x < 0.2 && y == 0.0);
-        // fast movement: full deflection; the mouse moving down tilts the stick down
-        let (x, y) = stick_from_mouse(0.0, 10_000.0, 1.0);
+        // fast movement: full deflection (clamped); the mouse moving down tilts the stick down
+        let (x, y) = stick_from_mouse(0.0, 10_000.0, 1.0, false);
         assert!(x == 0.0 && (y + 1.0).abs() < 1e-6);
+        let (x, y) = stick_from_mouse(1e9, 1e9, 1.0, false);
+        assert!((x * x + y * y).sqrt() <= 1.0 + 1e-6);
         // sensitivity scales the speed
-        let (a, _) = stick_from_mouse(1000.0, 0.0, 1.0);
-        let (b, _) = stick_from_mouse(1000.0, 0.0, 2.0);
+        let (a, _) = stick_from_mouse(1000.0, 0.0, 1.0, false);
+        let (b, _) = stick_from_mouse(1000.0, 0.0, 2.0, false);
         assert!(b > a);
+        // no acceleration: doubling the speed doubles the deflection above the start offset
+        let (c, _) = stick_from_mouse(500.0, 0.0, 1.0, false);
+        let (d, _) = stick_from_mouse(1000.0, 0.0, 1.0, false);
+        assert!(((d - START) / (c - START) - 2.0).abs() < 1e-4);
+        // invert flips the vertical axis only
+        let (x, y) = stick_from_mouse(300.0, 300.0, 1.0, false);
+        let (xi, yi) = stick_from_mouse(300.0, 300.0, 1.0, true);
+        assert!(x == xi && y == -yi && y < 0.0);
+    }
+
+    #[test]
+    fn stopping_the_mouse_recenters_the_stick() {
+        let mut v = Velocity::default();
+        for _ in 0..30 {
+            v.update(20, 0, 0.004);
+        }
+        assert!(stick_from_mouse(v.x, v.y, 1.0, false).0 > 0.5);
+        for _ in 0..100 {
+            v.update(0, 0, 0.004);
+        }
+        assert_eq!(stick_from_mouse(v.x, v.y, 1.0, false), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_deflected_controller_stick_wins() {
+        assert_eq!(pick_stick((0.5, 0.0), (0.0, 1.0)), (0.5, 0.0));
+        assert_eq!(pick_stick((0.05, 0.0), (0.0, 1.0)), (0.0, 1.0)); // pad at rest
+        assert_eq!(pick_stick((0.05, 0.02), (0.0, 0.0)), (0.05, 0.02));
+    }
+
+    #[test]
+    fn default_keymap_parses_cleanly() {
+        let mut m = Keymap::new();
+        assert!(parse_keymap_into(&mut m, DEFAULT_KEYMAP).is_empty());
+        assert!(m.contains(&(Key::Vk(0xA0), Action::Button(A))));
+        assert!(m.contains(&(Key::Vk(0x20), Action::Button(X))));
+        assert!(m.contains(&(Key::Sc(0x12, 0x45), Action::Button(Y)))); // E
+        assert!(m.contains(&(Key::Sc(0x21, 0x46), Action::Button(Y)))); // F
+        assert!(m.contains(&(Key::Vk(0x1B), Action::Button(B))));
+    }
+
+    #[test]
+    fn keymap_file_overrides_defaults() {
+        let mut m = Keymap::new();
+        parse_keymap_into(&mut m, DEFAULT_KEYMAP);
+        let errors = parse_keymap_into(
+            &mut m,
+            "# my layout\n\
+             space = a   # jump on A\n\
+             f=none\n\
+             g = rt\n\
+             F5=lt\n\
+             bogus=A\n\
+             tab=nowhere\n\
+             no equals sign\n",
+        );
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[0].contains("line 6") && errors[1].contains("line 7") && errors[2].contains("line 8"));
+        assert!(m.contains(&(Key::Vk(0x20), Action::Button(A))));
+        assert!(!m.contains(&(Key::Vk(0x20), Action::Button(X))));
+        assert!(!m.iter().any(|(k, _)| *k == Key::Sc(0x21, 0x46))); // F unbound
+        assert!(m.contains(&(Key::Sc(0x22, 0x47), Action::RightTrigger)));
+        assert!(m.contains(&(Key::Vk(0x74), Action::LeftTrigger)));
+        // untouched defaults stay; the bad tab line left TAB=VIEW alone
+        assert!(m.contains(&(Key::Vk(0x09), Action::Button(VIEW))));
+    }
+
+    #[test]
+    fn key_and_button_names() {
+        assert_eq!(parse_key("w"), Some(Key::Sc(0x11, 0x57)));
+        assert_eq!(parse_key(" Z "), Some(Key::Sc(0x2C, 0x5A)));
+        assert_eq!(parse_key("5"), Some(Key::Vk(0x35)));
+        assert_eq!(parse_key("F12"), Some(Key::Vk(0x7B)));
+        assert_eq!(parse_key("F13"), None);
+        assert_eq!(parse_key("alt"), None);
+        assert_eq!(parse_action("lb"), Some(Some(Action::Button(LEFT_SHOULDER))));
+        assert_eq!(parse_action("NONE"), Some(None));
+        assert_eq!(parse_action("jump"), None);
     }
 
     #[test]
@@ -504,12 +837,12 @@ mod tests {
             }
             last = b;
         }
-        assert_eq!(presses, vec![RIGHT_SHOULDER]);
+        assert_eq!(presses, vec![DPAD_UP]);
         w.notches(-2);
         let held: Vec<u32> = (0..30).map(|_| w.step(0.01)).collect();
         // held for NOTCH_HOLD, released for NOTCH_GAP, then the second press
-        assert_eq!(held.iter().filter(|&&b| b == LEFT_SHOULDER).count(), 10);
-        assert!(held[..5].iter().all(|&b| b == LEFT_SHOULDER) && held[5..10].iter().all(|&b| b == 0));
+        assert_eq!(held.iter().filter(|&&b| b == DPAD_DOWN).count(), 10);
+        assert!(held[..5].iter().all(|&b| b == DPAD_DOWN) && held[5..10].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -563,7 +896,7 @@ mod tests {
             }
             let mut w = Wheel::default();
             w.notches(3);
-            assert_eq!(w.step(0.01), RIGHT_SHOULDER);
+            assert_eq!(w.step(0.01), DPAD_UP);
             *g = Some(Mouse {
                 last: Instant::now(),
                 velocity: v,

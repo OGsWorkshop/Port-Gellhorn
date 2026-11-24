@@ -69,6 +69,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         UnregisterAppConstrainedChangeNotification,
         // threads / system
         SetUnhandledExceptionFilter,
+        Sleep,
         SetThreadName,
         GetThreadName,
         SetThreadpoolAffinityMask,
@@ -486,7 +487,11 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // large as what the title asked for last time (`uma::coherent_hint`).
     if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size <= crate::gpu::uma::MAX_SIZE && std::env::var("XCL_COHERENT_HEAPS").map_or(true, |v| v != "0") {
         static ASKED: AtomicUsize = AtomicUsize::new(0);
-        let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
+        // what the title asked for in total counts frees as if they were still held: the window
+        // grew to its 4 GB cap for a title that keeps far less at once. `XCL_COHERENT_PEAK=0`:
+        // the total again; default: the most it holds at once (the next run's window grows to it)
+        let total = ASKED.fetch_add(size, Ordering::Relaxed) + size;
+        let asked = if std::env::var("XCL_COHERENT_PEAK").is_ok_and(|v| v == "0") { total } else { crate::gpu::uma::coherent_live(uma.map_or(0, |u| u.used()), size) };
         crate::gpu::uma::note_coherent_need(asked);
         if let Some(u) = uma {
             let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
@@ -514,9 +519,74 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             return q;
         }
     }
+    if let Some(q) = lazy_commit_plain(addr, size, t, p) {
+        trace_mem("VirtualAlloc (plain, committed on first touch)", addr as usize, size, t as u64, p, q as usize);
+        return q;
+    }
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
     q
+}
+
+/// Smallest plain commit that is reserved and committed 64 KiB at a time on first touch instead
+/// (`XCL_LAZY_COMMIT_MB`, default 64; `0` or `XCL_LAZY_COMMIT=0` turns it off). Title memory the
+/// game commits for a worst case it never reaches costs address space only (private bytes /
+/// commit charge are what thrash a 32 GB PC, not the touched working set).
+fn lazy_commit_threshold() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        if std::env::var("XCL_LAZY_COMMIT").is_ok_and(|v| v == "0") {
+            return 0;
+        }
+        std::env::var("XCL_LAZY_COMMIT_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64) << 20
+    })
+}
+
+/// Whether `[a, a + n)` is all reserved and not committed (one query per run).
+unsafe fn reserved_only(a: usize, n: usize) -> bool {
+    let mut p = a;
+    while p < a + n {
+        let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if mem::VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != mem::MEM_RESERVE {
+            return false;
+        }
+        p = m.BaseAddress as usize + m.RegionSize;
+    }
+    true
+}
+
+/// A large commit of ordinary read-write title memory (not graphics, not GPU-visible): only
+/// reserved here, each 64 KiB page committed zeroed at its first access (`lazy`; a kernel
+/// call or XCL's own copies commit through `lazy::ensure`). `None`: commit it the usual way.
+unsafe fn lazy_commit_plain(addr: *const c_void, size: usize, t: u32, p: u32) -> Option<*mut c_void> {
+    let min = lazy_commit_threshold();
+    if min == 0 || size < min || t & 0x1000 == 0 || t & (MEM_GRAPHICS | MEM_64K_PAGES | 0x8000_0000 | 0x0004_0000 | 0x0008_0000) != 0 {
+        return None;
+    }
+    if sanitize_protect(p) != mem::PAGE_READWRITE || size % lazy_grain() != 0 || (addr as usize) % lazy_grain() != 0 {
+        return None;
+    }
+    let base = if addr.is_null() {
+        if t & 0x2000 == 0 {
+            return None;
+        }
+        let q = mem::VirtualAlloc(std::ptr::null(), size, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+        if q.is_null() {
+            return None;
+        }
+        q
+    } else {
+        if !reserved_only(addr as usize, size) {
+            return None;
+        }
+        addr as *mut c_void
+    };
+    lazy::mark_range(base as usize, size);
+    Some(base)
+}
+
+fn lazy_grain() -> usize {
+    PHYS_PAGE
 }
 
 /// Whether a VirtualAlloc that reached the plain-memory fallback is GPU-visible title memory
@@ -623,12 +693,29 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
+    if lazy::any() {
+        // the lazy pages of what goes (a release frees the whole allocation)
+        let n = if t & mem::MEM_RELEASE != 0 { allocation_size(addr as usize) } else { size };
+        lazy::forget_range(addr as usize, n);
+    }
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
         mirrors::released(addr as usize);
     }
     ok
+}
+
+/// Bytes of the allocation that starts at `base` (all its regions).
+unsafe fn allocation_size(base: usize) -> usize {
+    let mut p = base;
+    loop {
+        let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if mem::VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.AllocationBase as usize != base {
+            return p - base;
+        }
+        p = m.BaseAddress as usize + m.RegionSize;
+    }
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
@@ -648,6 +735,8 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    // (changing the protection of memory that is not committed yet would fail)
+    lazy::ensure(addr as usize, size);
     mem::VirtualProtect(addr, size, sanitize_protect(p), old)
 }
 
@@ -1568,9 +1657,34 @@ pub unsafe extern "system" fn UnregisterAppStateChangeNotification(_registration
 
 /// `ULONG RegisterAppConstrainedChangeNotification(routine, context, PAPPCONSTRAIN_REGISTRATION* out)`
 pub unsafe extern "system" fn RegisterAppConstrainedChangeNotification(routine: usize, ctx: *mut c_void, out: *mut *const u8) -> u32 {
-    RegisterAppStateChangeNotification(routine, ctx, out)
+    if out.is_null() || routine == 0 {
+        return fnd::ERROR_INVALID_PARAMETER;
+    }
+    if let Ok(mut g) = CONSTRAINED_CALLBACKS.lock() {
+        g.push((routine, ctx as usize));
+    }
+    *out = &APP_NOTIFICATION;
+    0
 }
 
+/// Registered `void CALLBACK (BOOLEAN isConstrained, PVOID context)` routines.
+static CONSTRAINED_CALLBACKS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// The window lost (`true`) or regained focus: the title's constrained callbacks are called
+/// (on their own thread, like the console's system threads), as when the guide opens.
+pub fn notify_constrained(constrained: bool) {
+    let cbs: Vec<(usize, usize)> = CONSTRAINED_CALLBACKS.lock().map(|g| g.clone()).unwrap_or_default();
+    if cbs.is_empty() {
+        return;
+    }
+    crate::xlog_info!("app constrained = {constrained}: {} callback(s)", cbs.len());
+    let _ = std::thread::Builder::new().name("xcl-constrained".into()).spawn(move || {
+        for (routine, ctx) in cbs {
+            // SAFETY: a routine the title registered with this very signature
+            unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(u8, *mut c_void)>(routine)(constrained as u8, ctx as *mut c_void) };
+        }
+    });
+}
 pub unsafe extern "system" fn UnregisterAppConstrainedChangeNotification(_registration: *const u8) {}
 
 // ---------------------------------------------------------------------------------------
@@ -1582,6 +1696,43 @@ fn hresult_to_win32(hr: i32) -> u32 {
         hr as u32 & 0xFFFF
     } else {
         fnd::ERROR_INVALID_PARAMETER
+    }
+}
+
+/// a sleep is taken in steps of at most this, so that time held from then on is not counted
+const SLEEP_STEP_MS: u32 = 20;
+/// how often a sleep looks whether the title is still held
+const SLEEP_HELD_POLL_MS: u32 = 5;
+
+/// Sleep(ms): `ms` of the title's time. The time XCL holds one of the title's threads in a bind
+/// for a pipeline still being built (`pso_async::title_held`) is not the title's: a console
+/// title never waits there. A retail title's own stall check – a thread that ticks once a second
+/// with Sleep and ends the process after 30 ticks without a sign of its main thread – ended it
+/// while the driver built the pipelines of its world (#505, #232). `XCL_SLEEP_HOLD=0`: the PC's
+/// Sleep as it is.
+pub unsafe extern "system" fn Sleep(ms: u32) {
+    static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*HOLD.get_or_init(|| std::env::var("XCL_SLEEP_HOLD").map_or(true, |v| v.trim() != "0")) {
+        return thr::Sleep(ms);
+    }
+    title_sleep(ms, |ms| thr::Sleep(ms), crate::hle::d3d12x::pso_async::title_held)
+}
+
+/// `ms` of time in which the title was not `held`, slept through `sleep` (a yield and an endless
+/// sleep as they are).
+fn title_sleep(ms: u32, sleep: impl Fn(u32), held: impl Fn() -> bool) {
+    if ms == 0 || ms == thr::INFINITE {
+        return sleep(ms);
+    }
+    let mut left = std::time::Duration::from_millis(ms as u64);
+    while !left.is_zero() {
+        if held() {
+            sleep(SLEEP_HELD_POLL_MS);
+            continue;
+        }
+        let t = std::time::Instant::now();
+        sleep((left.as_millis() as u32).clamp(1, SLEEP_STEP_MS));
+        left = left.saturating_sub(t.elapsed());
     }
 }
 
@@ -2103,6 +2254,74 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn real_sleep(ms: u32) {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
+
+    /// A title's Sleep does not count the time the title is held (a bind waiting for a pipeline
+    /// still being built): it returns once that is over and its own time has gone by after it.
+    #[test]
+    fn a_sleep_does_not_count_the_time_the_title_is_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(60, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(355), "back after {took:?}: the 300 ms held were counted");
+    }
+
+    /// Time held from the middle of a sleep on is not counted either (but for the step under way).
+    #[test]
+    fn a_sleep_stops_counting_when_the_title_gets_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(50);
+                held.store(true, Ordering::Release);
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(200, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        // 200 ms of its own, less at most one step counted while held, and the 300 ms held
+        assert!(took >= std::time::Duration::from_millis(200 + 300 - SLEEP_STEP_MS as u64 - 15), "back after {took:?}");
+    }
+
+    /// With the title not held a sleep takes its time, in steps; a yield and an endless sleep
+    /// are passed on as they are.
+    #[test]
+    fn a_sleep_of_a_title_not_held_takes_its_time() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u32| {
+            calls.borrow_mut().push(ms);
+            if ms != 0 && ms != thr::INFINITE {
+                real_sleep(ms);
+            }
+        };
+        title_sleep(0, sleep, || false);
+        title_sleep(thr::INFINITE, sleep, || false);
+        assert_eq!(*calls.borrow(), [0, thr::INFINITE]);
+        calls.borrow_mut().clear();
+        let t = std::time::Instant::now();
+        title_sleep(50, sleep, || false);
+        let took = t.elapsed();
+        assert!(took >= std::time::Duration::from_millis(50) && took < std::time::Duration::from_millis(400), "took {took:?}");
+        assert!(calls.borrow().iter().all(|&ms| (1..=SLEEP_STEP_MS).contains(&ms)), "{:?}", calls.borrow());
+        // a sleep shorter than a step is one sleep, as before
+        calls.borrow_mut().clear();
+        title_sleep(1, sleep, || false);
+        assert_eq!(*calls.borrow(), [1]);
+    }
 
     #[test]
     fn fine_timer_makes_short_sleeps_short() {

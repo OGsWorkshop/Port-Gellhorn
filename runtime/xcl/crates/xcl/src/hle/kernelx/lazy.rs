@@ -78,6 +78,30 @@ pub(crate) fn mark(page: usize) {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).insert(page);
 }
 
+/// `[start, start + len)` (64 KiB aligned, reserved) is title memory committed on first use.
+pub(crate) fn mark_range(start: usize, len: usize) {
+    install();
+    let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+    g.extend((start..start + len).step_by(PAGE));
+}
+
+/// The range is released or decommitted: its pages are no longer lazy.
+pub(crate) fn forget_range(start: usize, len: usize) {
+    let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+    if g.is_empty() {
+        return;
+    }
+    let pages: Vec<usize> = g.range(start & !(PAGE - 1)..start.saturating_add(len)).copied().collect();
+    for p in pages {
+        g.remove(&p);
+    }
+}
+
+/// Whether any page is lazy (the hooks that must commit first skip their work otherwise).
+pub(crate) fn any() -> bool {
+    !LAZY.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
 /// `page` is unmapped: true if it was never used (nothing to keep of it).
 pub(super) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
@@ -120,6 +144,28 @@ mod tests {
             ensure(r + PAGE + 4, 4);
             assert!(!LAZY.read().unwrap().contains(&(r + PAGE)));
             assert!(crate::gpu::shader::readable(r + PAGE, 4));
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A range marked lazy costs no commit until touched; touching one page commits only that
+    /// page, and `forget_range` drops the marks of a released range.
+    #[test]
+    fn a_lazy_range_commits_only_the_pages_touched() {
+        unsafe {
+            let n = 64;
+            let r = VirtualAlloc(std::ptr::null(), n * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            mark_range(r, n * PAGE);
+            assert!(any());
+            assert!(!crate::gpu::shader::readable(r, 4), "reserved only: nothing committed");
+            std::ptr::write_volatile((r + 5 * PAGE + 16) as *mut u32, 9);
+            assert_eq!(std::ptr::read_volatile((r + 5 * PAGE + 16) as *const u32), 9);
+            let committed = (0..n).filter(|i| crate::gpu::shader::readable(r + i * PAGE, 4)).count();
+            assert_eq!(committed, 1, "one 64 KiB page of 64 committed by the touch");
+            forget_range(r, n * PAGE);
+            let g = LAZY.read().unwrap();
+            assert!((0..n).all(|i| !g.contains(&(r + i * PAGE))));
+            drop(g);
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
         }
     }

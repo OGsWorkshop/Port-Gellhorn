@@ -109,7 +109,8 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
-        crate::report::write_final(Some(msg));
+        crate::report::write_final(Some(msg.clone()));
+        crate::qol::write_crash_report(&msg);
         crate::log::flush();
     }
     match TITLE_FILTER.load(Ordering::Acquire) {
@@ -132,6 +133,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
             dump_threads();
+            crate::qol::write_crash_report(&format!("process ends with status {status:#x}"));
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
         }

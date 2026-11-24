@@ -67,7 +67,7 @@ pub struct Config {
     pub xbox_live_tokens: bool,
     /// Keyboard and mouse play as the gamepad while the XCL window has the focus: WASD the
     /// left stick, the mouse the right stick (the cursor is held in the window), the mouse
-    /// buttons the triggers, the wheel the bumpers (see `hle::kbm`).
+    /// buttons the triggers, the wheel the D-pad up / down (see `hle::kbm`).
     pub keyboard_mouse: bool,
     /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
     /// counts a second.
@@ -79,6 +79,9 @@ impl Config {
     /// setting has a concrete value. Returns what came from the manifest (for the log).
     pub fn resolve(&mut self, manifest: Option<&crate::manifest::Manifest>) -> Vec<String> {
         let mut from = Vec::new();
+        if let Some(note) = self.apply_console(std::env::var("XCL_CONSOLE").ok().as_deref()) {
+            from.push(note);
+        }
         let series_s = self.is_series_s();
         // "Auto" / "Advanced" in xcl.toml: read in any case, as device_type and the manifest (#106)
         self.title_memory = self.title_memory.trim().to_ascii_lowercase();
@@ -113,6 +116,23 @@ impl Config {
         from
     }
 
+    /// `XCL_CONSOLE` ("series-s" / "series-x"): the console the title is told it runs on –
+    /// `GetConsoleType`, `XSystemGetDeviceType`, the OEM registry key and `TitleMemoryStatus`
+    /// (8 GiB instead of 13.5 GiB) all follow `device_type`, so a title picks its smaller assets
+    /// on Series S. Returns a log note when it changed the device.
+    pub fn apply_console(&mut self, name: Option<&str>) -> Option<String> {
+        let dev = console_from_name(name?)?;
+        if dev == self.device_type {
+            return None;
+        }
+        // a budget of the other console's standard size is not an explicit setting
+        if matches!(self.title_memory_mb, 8_192 | 13_824) {
+            self.title_memory_mb = 0;
+        }
+        self.device_type = dev.into();
+        Some(format!("XCL_CONSOLE: {dev}"))
+    }
+
     /// TitleMemoryStatus budget (MiB): `title_memory_mb`, 0 = the device's standard budget.
     pub fn title_memory_budget_mb(&self) -> u64 {
         match self.title_memory_mb {
@@ -120,6 +140,15 @@ impl Config {
             0 => 13_824,
             v => v,
         }
+    }
+}
+
+/// `XCL_CONSOLE` value → `device_type`.
+pub fn console_from_name(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().replace([' ', '_'], "-").as_str() {
+        "series-s" | "s" | "lockhart" => Some("lockhart"),
+        "series-x" | "x" | "anaconda" => Some("anaconda"),
+        _ => None,
     }
 }
 
@@ -376,5 +405,29 @@ mod tests {
         assert_eq!(parse_raytracing_tier("tier1_1"), Some(11));
         assert_eq!(parse_raytracing_tier("1.1"), Some(11));
         assert_eq!(parse_raytracing_tier("11"), Some(11));
+    }
+
+    #[test]
+    fn console_names_pick_the_device() {
+        for n in ["series-s", "Series S", "series_s", "LOCKHART", "s"] {
+            assert_eq!(console_from_name(n), Some("lockhart"), "{n}");
+        }
+        for n in ["series-x", " Series X ", "anaconda"] {
+            assert_eq!(console_from_name(n), Some("anaconda"), "{n}");
+        }
+        assert_eq!(console_from_name("xbox one"), None);
+    }
+
+    #[test]
+    fn xcl_console_series_s_gives_the_small_budget() {
+        let mut c = Config { title_memory_mb: 13_824, ..Config::default() };
+        assert!(c.apply_console(Some("series-s")).is_some());
+        assert!(c.is_series_s());
+        assert_eq!(c.title_memory_budget_mb(), 8_192);
+        assert!(c.apply_console(Some("series-s")).is_none(), "already Series S");
+        assert!(c.apply_console(None).is_none() && c.apply_console(Some("bogus")).is_none());
+        let mut x = Config { device_type: "lockhart".into(), title_memory_mb: 6_000, ..Config::default() };
+        x.apply_console(Some("series-x"));
+        assert_eq!(x.title_memory_budget_mb(), 6_000, "an explicit budget stays");
     }
 }

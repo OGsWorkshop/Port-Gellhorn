@@ -515,7 +515,8 @@ unsafe fn valid_user(h: *mut c_void) -> bool {
 }
 
 pub unsafe extern "system" fn XUserAddAsync(options: u32, b: *mut XAsyncBlock) -> HRESULT {
-    crate::xlog_info!("XUserAddAsync(options={options:#x}) → local offline user '{}'", crate::state::config().gamertag);
+    let profile = crate::profiles::choose_for_add(options);
+    crate::xlog_info!("XUserAddAsync(options={options:#x}) → local offline user '{}'", profile.gamertag);
     begin_with(b, &USER_ADD_IDENTITY as *const u8 as usize, || {
         USER.refs.fetch_add(1, Ordering::AcqRel);
         Ok((user_ptr() as usize).to_le_bytes().to_vec())
@@ -564,7 +565,7 @@ pub unsafe extern "system" fn XUserGetId(h: *mut c_void, out: *mut u64) -> HRESU
     if !valid_user(h) || out.is_null() {
         return E_INVALIDARG;
     }
-    *out = crate::state::config().user_id;
+    *out = crate::profiles::identity().1;
     S_OK
 }
 
@@ -592,7 +593,7 @@ pub unsafe extern "system" fn XUserFindUserById(id: u64, out: *mut *mut c_void) 
     if out.is_null() {
         return E_INVALIDARG;
     }
-    if id != crate::state::config().user_id {
+    if id != crate::profiles::identity().1 {
         return E_NOT_FOUND;
     }
     USER.refs.fetch_add(1, Ordering::AcqRel);
@@ -645,7 +646,7 @@ pub unsafe extern "system" fn XUserGetGamertag(h: *mut c_void, component: u32, s
     if !valid_user(h) || component > 3 {
         return E_INVALIDARG;
     }
-    let value = gamertag_component(&crate::state::config().gamertag, component);
+    let value = gamertag_component(&crate::profiles::identity().0, component);
     if size < value.len() + 1 {
         if !used.is_null() {
             *used = value.len() + 1;
@@ -771,6 +772,7 @@ pub unsafe extern "system" fn XUserGetTokenAndSignatureAsync(
     let url = crate::util::from_cstr_ptr(url).unwrap_or_default();
     let allowed = note_token_request(&method, &url);
     let body = copy_capped_body(body_size, body);
+    crate::achievements::note_request(&method, &url, &body);
     begin_with_fixups(b, &TOKEN_UTF8_ID as *const u8 as usize, move || {
         allowed?;
         build_token_payload(false, &method, &url, &body)
@@ -813,6 +815,7 @@ pub unsafe extern "system" fn XUserGetTokenAndSignatureUtf16Async(
     let url = crate::util::from_wide_ptr(url).unwrap_or_default();
     let allowed = note_token_request(&method, &url);
     let body = copy_capped_body(body_size, body);
+    crate::achievements::note_request(&method, &url, &body);
     begin_with_fixups(b, &TOKEN_UTF16_ID as *const u8 as usize, move || {
         allowed?;
         build_token_payload(true, &method, &url, &body)
@@ -1021,6 +1024,21 @@ mod tests {
     #[test]
     fn user_add_and_queries() {
     let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // the default profile, whatever the machine's own profiles.json says
+        let root = std::env::temp_dir().join(format!("xcl-test-profiles-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        std::env::set_var("XCL_DATA_ROOT", &root);
+        std::env::set_var("XCL_PROFILE", "Player1");
+        crate::profiles::reset_active_for_test();
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                std::env::remove_var("XCL_PROFILE");
+                std::env::remove_var("XCL_DATA_ROOT");
+                crate::profiles::reset_active_for_test();
+            }
+        }
+        let _unset = Unset;
         unsafe {
             let mut b: XAsyncBlock = std::mem::zeroed();
             assert_eq!(XUserAddAsync(1, &mut b), S_OK);

@@ -88,11 +88,45 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 - **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
-- **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
-  buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
-  E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
-  the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
-  used together.
+- **Keyboard and mouse** work too, as a gamepad. Click into the window to capture the mouse (cursor
+  hidden and held in the window, raw mouse movement turns the camera); Alt, Alt+Tab or losing the focus
+  release it, another click captures it again (the title bar says "click to capture mouse" while it is
+  free). A deflected controller stick wins over WASD / the mouse.
+
+  | PC | gamepad |
+  |---|---|
+  | W A S D | left stick |
+  | mouse movement | right stick (camera) |
+  | left / right mouse button | RT (shoot) / LT (aim) |
+  | wheel up / down | D-pad up / down |
+  | middle mouse button | right stick click |
+  | Shift | A (sprint) |
+  | Space | X (jump) |
+  | E, F | Y (vehicle) |
+  | Q / R | LB / RB |
+  | Ctrl | left stick click |
+  | Enter | A |
+  | Escape, Backspace | B |
+  | arrows / Tab / P | D-pad / View / Menu |
+
+  `keyboard_mouse` and `mouse_sensitivity` in the game's `xcl.toml` turn it off or change the mouse speed;
+  `XCL_MOUSE_SENS=<f>` and `XCL_MOUSE_INVERT_Y=1` override it per run. `XCL_KEYMAP=<path>` rebinds keys
+  with a text file of `KEY=BUTTON` lines (`#` comments; keys A-Z, 0-9, F1-F12, SPACE, ENTER, ESC,
+  BACKSPACE, TAB, SHIFT, CTRL, arrows; buttons A B X Y LB RB LT RT LS RS VIEW MENU UP DOWN LEFT RIGHT,
+  NONE unbinds), e.g. `SPACE=A`.
+
+## Display
+
+Environment variables (XCL keeps no settings of its own; a launcher passes them). The title renders at its
+own resolution; the image is scaled into the window, letterboxed, with a Catmull-Rom filter.
+
+- `XCL_WINDOW_MODE`: `windowed` | `borderless` | `fullscreen` (exclusive). Alt+Enter toggles windowed / borderless.
+- `XCL_BACKGROUND`: `mute` (default) | `pause` | `run`. Window out of focus: mute the audio and report the title constrained (as the guide does), also stop the audio engines, or change nothing.
+- Crash reports: an unhandled exception, a non-zero exit or a device removal writes `%LOCALAPPDATA%\xcl\crash-reports\<time>.zip` (last 5000 log lines, `XCL_*` variables, GPU/driver, OS build, XCL build; the user name is scrubbed from paths).
+- `XCL_WINDOW_SIZE`: `WxH`, the window's client size (windowed) or the display mode (fullscreen).
+- `XCL_FPS_CAP`: `30` | `60` | `0`. A cap lengthens the title's frame interval; `0` adds none.
+- `XCL_VSYNC`: `1` presents at interval 1; `0` at interval 0 with tearing where supported.
+- `XCL_MONITOR`: monitor index (`EnumDisplayMonitors` order).
 
 ## Building and usage
 

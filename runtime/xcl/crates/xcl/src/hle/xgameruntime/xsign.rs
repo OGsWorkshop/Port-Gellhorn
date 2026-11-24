@@ -106,7 +106,7 @@ fn signer() -> Result<&'static EphemeralSigner, HRESULT> {
 
 /// Offline `XBL3.0` authorization header derived from the configured local user id.
 pub fn offline_token() -> String {
-    format!("XBL3.0 x=xcl;local-{:016x}", crate::state::config().user_id)
+    format!("XBL3.0 x=xcl;local-{:016x}", crate::profiles::identity().1)
 }
 
 /// Current UTC timestamp as a Windows FILETIME (100-ns intervals since 1601-01-01).

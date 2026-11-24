@@ -26,7 +26,9 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POI
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITOR_FROM_FLAGS};
+use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITOR_FROM_FLAGS};
+use super::blit::{self, Blit};
+use super::display::{self, WindowMode};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateEventW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -45,6 +47,14 @@ static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 /// the title called PresentX: the fallback guessing is off
 static PRESENTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
+/// the current window mode (0 windowed, 1 borderless, 2 fullscreen); Alt+Enter changes it
+static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// the swap chain is in exclusive fullscreen (the presenter leaves it when `MODE` changes)
+static EXCLUSIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// the XCL window's rect before it left windowed mode
+static WINDOWED_RECT: Mutex<Option<RECT>> = Mutex::new(None);
+/// posted to the window thread: apply `MODE` to the window's style and rect
+const WM_APPLY_MODE: u32 = WM_APP + 1;
 
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
@@ -413,6 +423,19 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
 // ---------------------------------------------------------------------------------------
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // Alt+Enter: windowed <-> borderless (out of exclusive fullscreen: windowed)
+    if msg == WM_SYSKEYDOWN && wp.0 == 0x0D && (lp.0 & (1 << 30)) == 0 {
+        let to = display::toggled(mode_from(MODE.load(Ordering::Acquire)));
+        MODE.store(mode_u8(to), Ordering::Release);
+        if !EXCLUSIVE.load(Ordering::Acquire) {
+            apply_mode(hwnd);
+        } // else: the presenter leaves exclusive mode, then posts WM_APPLY_MODE
+        return LRESULT(0);
+    }
+    if msg == WM_APPLY_MODE {
+        apply_mode(hwnd);
+        return LRESULT(0);
+    }
     // keyboard and mouse as the gamepad: raw mouse input, the cursor held in the window
     if crate::hle::kbm::on_message(hwnd.0, msg, wp.0, lp.0) {
         return LRESULT(0);
@@ -503,7 +526,7 @@ unsafe fn show_compiling(hwnd: HWND) {
         }
         last.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
     };
-    let title = format!("Ziggy – {} | {fps:.1} FPS", window_name());
+    let title = format!("Ziggy – {} | {fps:.1} FPS{}", window_name(), crate::hle::kbm::title_hint());
     let text = if recent {
         let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
@@ -532,15 +555,32 @@ fn window_thread() {
         RegisterClassW(&wc);
         let cfg = crate::state::config();
         let title = window_name();
-        let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
-        let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
-        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-        let (x, y) = window_position(&cfg.window_pos, w, h);
+        let opts = display::options();
+        let mode = opts.mode.unwrap_or(WindowMode::Windowed);
+        MODE.store(mode_u8(mode), Ordering::Release);
+        let (cw, ch) = opts.size.unwrap_or((cfg.window_width, cfg.window_height));
+        let mon = target_monitor(opts.monitor);
+        let (style, x, y, w, h) = if mode == WindowMode::Windowed {
+            let mut rc = RECT { left: 0, top: 0, right: cw as i32, bottom: ch as i32 };
+            let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
+            let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+            let (x, y) = match mon {
+                // a chosen monitor: centred on it unless XCL_WINDOW_POS says otherwise
+                Some((_, work)) if opts.monitor.is_some() && std::env::var("XCL_WINDOW_POS").is_err() && cfg.window_pos.eq_ignore_ascii_case("auto") => {
+                    (work.left + ((work.right - work.left) - w).max(0) / 2, work.top + ((work.bottom - work.top) - h).max(0) / 2)
+                }
+                _ => window_position(&cfg.window_pos, w, h),
+            };
+            (WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, w, h)
+        } else {
+            let full = mon.map(|m| m.0).unwrap_or(RECT { left: 0, top: 0, right: 1920, bottom: 1080 });
+            (WS_POPUP | WS_VISIBLE, full.left, full.top, full.right - full.left, full.bottom - full.top)
+        };
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             &HSTRING::from(format!("Ziggy – {title}")),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            style,
             x,
             y,
             w,
@@ -555,14 +595,99 @@ fn window_thread() {
             return;
         };
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
-        crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
+        crate::xlog_info!("XCL window created ({w}x{h}, {mode:?})");
         crate::hle::kbm::attach(hwnd.0);
+        super::splash::attach(hwnd);
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+fn mode_u8(m: WindowMode) -> u8 {
+    match m {
+        WindowMode::Windowed => 0,
+        WindowMode::Borderless => 1,
+        WindowMode::Fullscreen => 2,
+    }
+}
+
+fn mode_from(v: u8) -> WindowMode {
+    match v {
+        1 => WindowMode::Borderless,
+        2 => WindowMode::Fullscreen,
+        _ => WindowMode::Windowed,
+    }
+}
+
+/// (monitor rect, work area) of every monitor, in `EnumDisplayMonitors` order
+unsafe fn monitors() -> Vec<(RECT, RECT)> {
+    unsafe extern "system" fn each(mon: HMONITOR, _dc: HDC, _rc: *mut RECT, data: LPARAM) -> windows::core::BOOL {
+        let v = &mut *(data.0 as *mut Vec<(RECT, RECT)>);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            v.push((mi.rcMonitor, mi.rcWork));
+        }
+        true.into()
+    }
+    let mut v: Vec<(RECT, RECT)> = Vec::new();
+    let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM(&mut v as *mut _ as isize));
+    v
+}
+
+/// the monitor `XCL_MONITOR` names (an index out of range: warned, none)
+unsafe fn target_monitor(index: Option<usize>) -> Option<(RECT, RECT)> {
+    let all = monitors();
+    let i = index?;
+    let m = all.get(i).copied();
+    if m.is_none() {
+        crate::xlog_warn!("display: XCL_MONITOR={i} - only {} monitor(s); using the default", all.len());
+    }
+    m
+}
+
+/// Puts `MODE` on the window: a popup over the monitor it is on (borderless / fullscreen) or
+/// the framed window at its earlier rect (windowed). Runs on the window thread.
+unsafe fn apply_mode(hwnd: HWND) {
+    let mode = mode_from(MODE.load(Ordering::Acquire));
+    let mut cur = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut cur);
+    let was_popup = (GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0) == 0;
+    if mode == WindowMode::Windowed {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as isize);
+        let r = WINDOWED_RECT.lock().unwrap().take().unwrap_or_else(|| {
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let _ = GetMonitorInfoW(mon, &mut mi);
+            let (w, h) = ((mi.rcWork.right - mi.rcWork.left) * 3 / 4, (mi.rcWork.bottom - mi.rcWork.top) * 3 / 4);
+            RECT { left: mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2, top: mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - h) / 2, right: 0, bottom: 0 }
+                .with_size(w, h)
+        });
+        let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
+    } else {
+        if !was_popup {
+            *WINDOWED_RECT.lock().unwrap() = Some(cur);
+        }
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(mon, &mut mi);
+        let r = mi.rcMonitor;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as isize);
+        let _ = SetWindowPos(hwnd, Some(HWND_TOP), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+    crate::xlog_info!("display: window mode {mode:?}");
+}
+
+trait WithSize {
+    fn with_size(self, w: i32, h: i32) -> RECT;
+}
+
+impl WithSize for RECT {
+    fn with_size(self, w: i32, h: i32) -> RECT {
+        RECT { left: self.left, top: self.top, right: self.left + w, bottom: self.top + h }
     }
 }
 
@@ -636,10 +761,17 @@ struct Presenter {
     fence: ID3D12Fence,
     copy_source: Option<ID3D12Resource>,
     dumps: Vec<FrameDump>,
+    /// samples the title's frame for the boot splash (`splash`) until it has faded
+    sampler: Option<super::splash::Sampler>,
     disabled: bool,
     value: u64,
     event: HANDLE,
     last: Instant,
+    flags: DXGI_SWAP_CHAIN_FLAG,
+    tearing: bool,
+    exclusive: bool,
+    blit: Option<Blit>,
+    blit_failed: bool,
 }
 
 struct FrameDump {
@@ -679,17 +811,21 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        copy_source: None, dumps: Vec::new(), sampler: None, disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
+        flags: DXGI_SWAP_CHAIN_FLAG(0), tearing: false, exclusive: false, blit: None, blit_failed: false,
     })
 }
 
-unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
+/// The swap chain is `w` x `h` (the window's client size, or the display mode in exclusive
+/// fullscreen; the source's own size when the scaling pass is unavailable). `scaled`: the
+/// scaling pass draws into it, so exclusive fullscreen and the window size apply.
+unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT, scaled: bool) -> bool {
     if let Some(sc) = &p.sc {
         if p.w == w && p.h == h && p.fmt == fmt {
             return true;
         }
-        if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
+        if sc.ResizeBuffers(2, w, h, fmt, p.flags).is_ok() {
             p.w = w;
             p.h = h;
             p.fmt = fmt;
@@ -698,9 +834,27 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         }
         return false;
     }
+    let opts = display::options();
     let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
     let qraw = p.queue as *mut c_void;
     let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return false };
+    let fullscreen = scaled && mode_from(MODE.load(Ordering::Acquire)) == WindowMode::Fullscreen;
+    // tearing (vsync off): the flip model's way to present with no wait
+    p.tearing = opts.vsync == Some(false) && {
+        let mut allow = windows::core::BOOL(0);
+        factory.cast::<IDXGIFactory5>().is_ok_and(|f5| f5.CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &mut allow as *mut _ as *mut c_void, 4).is_ok()) && allow.as_bool()
+    };
+    if opts.vsync == Some(false) && !p.tearing {
+        crate::xlog_warn!("display: XCL_VSYNC=0 - tearing is not supported here, presenting at interval 0");
+    }
+    let mut flags = 0;
+    if p.tearing {
+        flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0;
+    }
+    if fullscreen {
+        flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH.0;
+    }
+    p.flags = DXGI_SWAP_CHAIN_FLAG(flags);
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: w,
         Height: h,
@@ -711,6 +865,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        Flags: flags as u32,
         ..Default::default()
     };
     match factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None) {
@@ -720,13 +875,49 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.w = w;
             p.h = h;
             p.fmt = fmt;
-            crate::xlog_info!("present: swap chain {w}x{h} {:?} – the game image will appear in the XCL window", fmt);
+            crate::xlog_info!("present: swap chain {w}x{h} {:?} - the game image will appear in the XCL window", fmt);
+            if fullscreen {
+                if let Some(sc) = &p.sc {
+                    match sc.SetFullscreenState(true, None) {
+                        Ok(()) => {
+                            let mode = DXGI_MODE_DESC { Width: w, Height: h, Format: fmt, ..Default::default() };
+                            let _ = sc.ResizeTarget(&mode);
+                            let _ = sc.ResizeBuffers(2, w, h, fmt, p.flags);
+                            p.exclusive = true;
+                            EXCLUSIVE.store(true, Ordering::Release);
+                            crate::xlog_info!("display: exclusive fullscreen {w}x{h}");
+                        }
+                        Err(e) => crate::xlog_warn!("display: exclusive fullscreen refused ({e}) - borderless instead"),
+                    }
+                }
+            }
             p.sc.is_some()
         }
         Err(e) => {
             crate::xlog_error!("present: CreateSwapChainForHwnd: {e}");
             false
         }
+    }
+}
+
+/// the window's client size; None while it is minimised
+unsafe fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
+    let mut rc = RECT::default();
+    GetClientRect(hwnd, &mut rc).ok()?;
+    let (w, h) = ((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// Leaves exclusive fullscreen when `MODE` is no longer fullscreen (Alt+Enter), then has the
+/// window thread apply the mode.
+unsafe fn leave_exclusive_if_asked(p: &mut Presenter, hwnd: HWND) {
+    if p.exclusive && mode_from(MODE.load(Ordering::Acquire)) != WindowMode::Fullscreen {
+        if let Some(sc) = &p.sc {
+            let _ = sc.SetFullscreenState(false, None);
+        }
+        p.exclusive = false;
+        EXCLUSIVE.store(false, Ordering::Release);
+        let _ = PostMessageW(Some(hwnd), WM_APPLY_MODE, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -789,7 +980,29 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     p.copy_source = None;
     p.dumps.clear();
-    if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
+    leave_exclusive_if_asked(p, hwnd);
+    let can_scale = !p.blit_failed && (desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0) == 0;
+    if can_scale && p.blit.is_none() {
+        p.blit = Blit::new(&p.dev);
+        if p.blit.is_none() {
+            p.blit_failed = true;
+            crate::xlog_warn!("display: the scaling pass could not be built - the image is stretched by the window system");
+        }
+    }
+    let scaled = can_scale && p.blit.is_some();
+    let (src_w, src_h) = (desc.Width as u32, desc.Height);
+    let (out_w, out_h) = if !scaled {
+        (src_w, src_h)
+    } else if p.exclusive {
+        (p.w, p.h)
+    } else if p.sc.is_none() && mode_from(MODE.load(Ordering::Acquire)) == WindowMode::Fullscreen {
+        // the display mode: XCL_WINDOW_SIZE, else the monitor's size
+        display::options().size.or_else(|| client_size(hwnd)).unwrap_or((src_w, src_h))
+    } else {
+        let Some(sz) = client_size(hwnd) else { return };
+        sz
+    };
+    if !ensure_swapchain(p, hwnd, out_w, out_h, fmt, scaled) {
         return;
     }
     let Some(sc) = p.sc.clone() else { return };
@@ -797,9 +1010,38 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+    let direct = !scaled || (src_w, src_h) == (p.w, p.h);
+    let after = if direct { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_RENDER_TARGET };
+    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, after)];
     p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, &src);
+    if direct {
+        p.list.CopyResource(&bb, &src);
+    } else {
+        // the title's own resolution, scaled into the window: aspect-correct, filtered
+        let (src_view, dst_view) = if blit::is_srgb(desc.Format) { (desc.Format, blit::srgb_view(fmt)) } else { (fmt, fmt) };
+        let ok = p.blit.as_mut().is_some_and(|b| b.record(&p.dev, &p.list, &src, src_view, (src_w, src_h), &bb, dst_view, (p.w, p.h)));
+        if !ok {
+            p.blit_failed = true;
+            crate::xlog_error!("display: the scaling pass failed - not scaling any more");
+            let _ = p.list.Close();
+            return;
+        }
+    }
+    if super::splash::active() {
+        if let Some(luma) = p.sampler.as_mut().and_then(|s| s.harvest()) {
+            super::splash::note_luma(luma);
+        }
+        if super::splash::note_present() {
+            if p.sampler.is_none() {
+                p.sampler = super::splash::Sampler::new(&p.dev);
+            }
+            if let Some(s) = p.sampler.as_mut() {
+                s.record(&p.list, &src, fmt, desc.Width as u32, desc.Height);
+            }
+        }
+    } else {
+        p.sampler = None;
+    }
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due {
@@ -830,7 +1072,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+    let b2 = [transition(&bb, after, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
         return;
@@ -849,7 +1091,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    let interval = u32::from(display::options().vsync == Some(true));
+    let present_flags = if interval == 0 && p.tearing && !p.exclusive { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
+    if let Err(e) = sc.Present(interval, present_flags).ok() {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");

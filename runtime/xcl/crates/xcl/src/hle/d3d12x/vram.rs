@@ -177,11 +177,22 @@ const EVICT_BATCH: usize = 512;
 /// long instead of trying again for every tile.
 const EVICT_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// `XCL_PAGE_BUDGET_MB` value → MB (0: no limit). "auto": 70 % of the adapter's dedicated video
+/// memory (8.4 GB on a 12 GB card), the rest left to render targets, buffers and the driver, so
+/// WDDM does not page title textures out into (and keep shadow copies in) system RAM.
+fn budget_mb(v: Option<&str>, vram_mb: impl FnOnce() -> Option<u64>) -> usize {
+    match v.map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("auto") => vram_mb().map_or(0, |m| (m * 7 / 10) as usize),
+        Some(s) => s.parse().unwrap_or(0),
+        None => 0,
+    }
+}
+
 /// Page budget: pool heaps the pages may take, from `XCL_PAGE_BUDGET_MB` (0: no limit).
 fn pool_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        let mb: usize = std::env::var("XCL_PAGE_BUDGET_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        let mb = budget_mb(std::env::var("XCL_PAGE_BUDGET_MB").ok().as_deref(), || super::real::dedicated_video_mb());
         if mb == 0 {
             return 0;
         }
@@ -1241,5 +1252,14 @@ mod tests {
             assert!(PAGES.lock().unwrap().get(&dev_key).unwrap().as_ref().unwrap().targets[&key(&old)].mapped, "mapped again");
             drop((old, newer, written));
         }
+    }
+
+    #[test]
+    fn page_budget_reads_numbers_and_auto() {
+        assert_eq!(budget_mb(None, || Some(12288)), 0);
+        assert_eq!(budget_mb(Some("6000"), || None), 6000);
+        assert_eq!(budget_mb(Some("junk"), || None), 0);
+        assert_eq!(budget_mb(Some(" Auto "), || Some(12288)), 8601);
+        assert_eq!(budget_mb(Some("auto"), || None), 0, "no adapter: no limit");
     }
 }

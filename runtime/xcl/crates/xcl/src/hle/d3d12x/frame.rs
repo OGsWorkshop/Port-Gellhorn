@@ -198,6 +198,8 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
         crate::xlog_warn!("D3D12.X: SetFrameIntervalX({len_us} µs) – not an interval of this display");
         return E_INVALIDARG;
     }
+    // XCL_FPS_CAP: the longer of the title's interval and the cap's
+    let len_us = super::display::options().fps_cap.map_or(len_us, |cap| super::display::capped_interval(len_us, cap));
     with(|c| {
         if c.interval_us != len_us {
             c.kinds[0].scheduled = false;

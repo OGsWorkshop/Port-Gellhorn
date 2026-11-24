@@ -80,7 +80,10 @@ The game boots, runs its menus, loads the open world (peds and cars spawn, and t
 - **Unlit mode (`XCL_FLAT=1`).** Big lighting shaders get a tiny flat grey stand-in, so the world can show without waiting on NVIDIA's slow compiles. Menus and loading screens keep their real shaders.
 - **Pipeline journal.** Every GPU pipeline the game creates is recorded, even in runs that crash, and `xcl pipelines <game>` builds them all ahead of time. This is the path to a one-time "build shaders" step instead of compiling at world start.
 - **Native launcher.** One exe with the runtime built in: [download it from Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases).
-- **Current wall:** the moment the world starts, a piece of GPU work runs past Windows' 2-second limit and the driver resets. Finding which one is task #3.
+- **World-start GPU crash fixed.** A two-pass mesh draw used to fall back to a draw that read from address 0 and reset the GPU. That draw is now skipped safely (upstream #1124 plus our indirect-draw guard), and the game survives 7+ minutes in the world on an RTX 3060.
+- **New in the runtime:** a boot splash from your own game files, click-to-capture mouse with a remappable keyboard layout, local profiles, achievement recording with pop-ups, windowed/borderless/fullscreen with an FPS cap, mute on Alt+Tab, and automatic crash reports.
+- **Launcher:** a Display settings page, automatic save backups before each Play, and a crash notice.
+- **Current wall:** the world's draws now run, but **the final image stays black**, and memory reaches ~29 GB committed at world start. Drawing the two-pass mesh calls (`XCL_TWO_PASS_INDIRECT=1`, off by default) still resets the GPU on some runs.
 
 Already fixed in this repo's runtime: the 64-bit wait ordering (black screen), the BCPack texture decoder (empty world textures), the `CopyFromSubresource` crash at the end of loading, and runaway shader loops.
 

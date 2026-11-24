@@ -528,7 +528,7 @@ fn classes() -> Vec<Class> {
                 forward: &[],
             },
             // telemetry: offline, accepted and dropped
-            Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", ok as usize)], forward: &[] },
+            Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", game_event_write as usize)], forward: &[] },
             Class { name: "XNetworking", clsid: XNETWORKING, impls: xnetworking(), forward: &[] },
             Class { name: "XError", clsid: XERROR, impls: xerror(), forward: &[] },
             // dialogs and text entry without a user handle go to the PC runtime
@@ -997,6 +997,15 @@ unsafe extern "system" fn display_deferral(out: *mut usize) -> HRESULT {
 
 static PICTURE_ID: u8 = 0;
 
+/// XGameEventWrite(user, serviceConfigId, playerSessionId, eventName, dimensions, measurements):
+/// recorded in the title's achievements.json (there is no service to send it to).
+unsafe extern "system" fn game_event_write(_user: *mut c_void, _scid: *const u8, _session: *const u8, name: *const u8, _dimensions: *const u8, _measurements: *const u8) -> HRESULT {
+    if let Some(n) = crate::util::from_cstr_ptr(name).filter(|n| !n.is_empty()) {
+        crate::achievements::note_event(&n);
+    }
+    S_OK
+}
+
 /// XUserGetGamerPictureAsync(user, size, async): a plain picture (PNG) of the requested size
 /// (XUserGamerPictureSize: 64, 208, 424, 1080 pixels) – there is no profile offline.
 unsafe extern "system" fn gamer_picture_async(user: *mut c_void, size: u32, b: *mut XAsyncBlock) -> HRESULT {
@@ -1010,7 +1019,7 @@ unsafe extern "system" fn gamer_picture_async(user: *mut c_void, size: u32, b: *
     if !super::valid_user(user) {
         return E_INVALIDARG;
     }
-    begin_with(b, &PICTURE_ID as *const u8 as usize, move || Ok(png_square(side, [0x5A, 0x6E, 0x82])))
+    begin_with(b, &PICTURE_ID as *const u8 as usize, move || Ok(crate::profiles::picture_bytes().unwrap_or_else(|| png_square(side, [0x5A, 0x6E, 0x82]))))
 }
 
 unsafe extern "system" fn gamer_picture_result(b: *mut XAsyncBlock, size: usize, buf: *mut c_void, used: *mut usize) -> HRESULT {

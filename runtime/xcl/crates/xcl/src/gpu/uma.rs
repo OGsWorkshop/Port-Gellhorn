@@ -720,6 +720,13 @@ fn free_commit() -> usize {
     m.ullAvailPageFile as usize
 }
 
+/// Bytes the title holds in the coherent window if `size` more are placed: what `used` has handed
+/// out (the title's and XCL's own pool) plus the request, without the 512 MB XCL margin the next
+/// window adds itself.
+pub fn coherent_live(used: usize, size: usize) -> usize {
+    used.saturating_sub(POOL).saturating_add(size)
+}
+
 /// The title has asked for `bytes` of graphics memory XCL places in the coherent window: the
 /// next run makes the window that large (this one has the size it was made with).
 pub fn note_coherent_need(bytes: usize) {
@@ -776,6 +783,14 @@ pub fn get() -> Option<&'static Uma> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window is sized to what is held at once, not to the sum of every allocation.
+    #[test]
+    fn coherent_need_counts_live_bytes_not_every_ask() {
+        // 3 GB asked in total over time, 1 GB live (plus XCL's pool) when the next 256 MB comes
+        assert_eq!(coherent_live((1 << 30) + POOL, 256 << 20), (1 << 30) + (256 << 20));
+        assert_eq!(coherent_live(0, 256 << 20), 256 << 20);
+    }
 
     /// Arena blocks come from XCL's pool while the title holds the rest of window 0, and go
     /// back to it when freed.
