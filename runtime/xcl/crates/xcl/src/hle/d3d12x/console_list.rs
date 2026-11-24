@@ -440,6 +440,8 @@ unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_v
         return;
     }
     let words: [u32; 7] = std::ptr::read((pso as usize + 0x10) as *const [u32; 7]);
+    // its build starts now, so a list's pipelines build side by side before its first dispatch waits
+    super::pso_async::prefetch((*(pso as *const ConsolePso)).pc);
     push(this as usize, &words);
 }
 unsafe extern "system" fn cl_set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {

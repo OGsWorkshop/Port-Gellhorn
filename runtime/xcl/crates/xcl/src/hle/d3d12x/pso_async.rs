@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -74,27 +74,80 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+/// Builds go through a priority queue: a pipeline a bind waits for jumps ahead (front), the rest
+/// go in order behind it. `XCL_PSO_PARALLEL=0`: the old behaviour (a waiting bind builds the
+/// pipeline on the title's own thread, as many workers as DXC threads).
+pub fn parallel() -> bool {
+    static P: OnceLock<bool> = OnceLock::new();
+    *P.get_or_init(|| enabled() && std::env::var("XCL_PSO_PARALLEL").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Workers that run driver compiles at once (`XCL_PSO_BUILD_THREADS`, default 4: a huge compute
+/// pipeline takes ~1 GB in the driver).
+fn build_threads() -> usize {
+    if !parallel() {
+        return crate::gpu::recomp::dxc::compile_threads();
+    }
+    std::env::var("XCL_PSO_BUILD_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(4).clamp(1, 64)
+}
+
+struct WorkQ {
+    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
+    cv: Condvar,
+}
+
+fn queue() -> &'static WorkQ {
+    static Q: OnceLock<WorkQ> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
-        let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        for k in 0..n {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // (None: a bind took it and builds it itself)
-                let job = p.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    complete(&p, job());
+        for k in 0..build_threads() {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
+                let q = queue();
+                loop {
+                    let p = {
+                        let mut g = q.list.lock().unwrap();
+                        loop {
+                            if let Some(p) = g.pop_front() {
+                                break p;
+                            }
+                            g = q.cv.wait(g).unwrap();
+                        }
+                    };
+                    // (None: somebody else took it)
+                    let job = p.job.lock().unwrap().take();
+                    if let Some(job) = job {
+                        complete(&p, job());
+                    }
                 }
             });
         }
-        Mutex::new(tx)
+        WorkQ { list: Mutex::new(Default::default()), cv: Condvar::new() }
     })
+}
+
+/// To the workers; `front`: ahead of everything queued (a bind is waiting for it).
+fn enqueue(p: Arc<Pending>, front: bool) {
+    let q = queue();
+    let mut g = q.list.lock().unwrap();
+    if front {
+        g.push_front(p);
+    } else {
+        g.push_back(p);
+    }
+    drop(g);
+    q.cv.notify_one();
+}
+
+/// The title is about to bind `pso`: a pipeline still to be built goes to the workers now, so
+/// that the builds of a list's pipelines run side by side before its first dispatch waits.
+pub fn prefetch(pso: usize) {
+    if !parallel() {
+        return;
+    }
+    let Some(p) = entry(pso) else { return };
+    if p.real.load(Ordering::Acquire) == 0 && !p.sent.swap(true, Ordering::AcqRel) {
+        enqueue(p, false);
+    }
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -144,7 +197,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
+        enqueue(p, false);
     } else if used::known(key) {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
@@ -315,6 +368,39 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    /// Prefetched pipelines build side by side on the workers, and a waiting bind does not build
+    /// on its own thread.
+    #[test]
+    fn prefetched_pipelines_build_in_parallel_on_the_workers() {
+        if !parallel() {
+            return;
+        }
+        let ids: Vec<usize> = (0..3).map(|i| 0x7E57_9000usize + i).collect();
+        let on_worker = Arc::new(AtomicUsize::new(0));
+        for &id in &ids {
+            let w = on_worker.clone();
+            submit_lazy(id, true, Box::new(move || {
+                if std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")) {
+                    w.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                id + 1
+            }), 0);
+        }
+        let t = std::time::Instant::now();
+        for &id in &ids {
+            prefetch(id);
+        }
+        for &id in &ids {
+            assert_eq!(resolve_wait_for(id, None), id + 1);
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(1000), "serial? {:?}", t.elapsed());
+        assert_eq!(on_worker.load(Ordering::Relaxed), 3, "built by workers, not the waiting thread");
+        for &id in &ids {
+            released(id);
+        }
+    }
+
     #[test]
     fn the_keys_of_a_file_are_read_and_other_lines_passed_over() {
         let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
@@ -358,7 +444,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                enqueue(p, false);
             }
             pso
         }
@@ -379,9 +465,17 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        complete(&p, job());
+    if parallel() {
+        // wait for a worker; if none has started it, it goes to the front of the queue
+        if p.job.lock().unwrap().is_some() {
+            p.sent.store(true, Ordering::Release);
+            enqueue(p.clone(), true);
+        }
+    } else {
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            complete(&p, job());
+        }
     }
     let mut done = p.done.lock().unwrap();
     while !*done {
@@ -414,7 +508,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return built(p);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
+        enqueue(p.clone(), false);
     }
     if p.late.load(Ordering::Acquire) {
         return pso;
@@ -436,6 +530,11 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
+        // (parallel: a dispatch waits for it; binding only starts its build)
+        Some(p) if p.compute && parallel() => {
+            prefetch(pso);
+            resolve(pso)
+        }
         Some(p) if p.compute => resolve_wait(pso),
         Some(_) => resolve(pso),
         None => pso,

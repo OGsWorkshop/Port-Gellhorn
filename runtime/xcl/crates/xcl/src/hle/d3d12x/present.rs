@@ -90,9 +90,12 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
         return;
     }
-    let res = (list as *const usize).read_unaligned();
+    let mut res = (list as *const usize).read_unaligned();
     if res == 0 {
         return;
+    }
+    if let Some(target) = take_frame_targets() {
+        res = target;
     }
     {
         let mut p = PRESENTED.lock().unwrap();
@@ -214,6 +217,108 @@ pub fn note_rt0(list: usize, handle: usize) {
     }
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, handle);
 }
+
+/// `XCL_PRESENT_TARGET=<width>x<height>:<dxgi_format>[:<n>]` presents the n-th (0-based, first-use
+/// order) render target of that size and format the frame binds instead of the title's image;
+/// `list` logs the distinct render targets (size, format, count per frame) every ~5 s.
+enum TargetSpec {
+    Pick(u64, u32, i32, usize),
+    List,
+}
+
+fn target_spec() -> Option<&'static TargetSpec> {
+    static SPEC: std::sync::OnceLock<Option<TargetSpec>> = std::sync::OnceLock::new();
+    SPEC.get_or_init(|| {
+        let v = std::env::var("XCL_PRESENT_TARGET").ok()?;
+        let v = v.trim();
+        if v.eq_ignore_ascii_case("list") {
+            return Some(TargetSpec::List);
+        }
+        let mut parts = v.split(':');
+        let (w, h) = parts.next()?.split_once(['x', 'X'])?;
+        let fmt = parts.next()?.trim().parse().ok()?;
+        let n = parts.next().map_or(Some(0), |n| n.trim().parse().ok())?;
+        Some(TargetSpec::Pick(w.trim().parse().ok()?, h.trim().parse().ok()?, fmt, n))
+    })
+    .as_ref()
+}
+
+pub fn target_wanted() -> bool {
+    target_spec().is_some()
+}
+
+/// render targets bound in the frame being built, first-use order (AddRef'd)
+static FRAME_TARGETS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// `res` was bound as a render target (`XCL_PRESENT_TARGET`).
+pub unsafe fn note_target(res: usize) {
+    if target_spec().is_none() {
+        return;
+    }
+    let mut g = FRAME_TARGETS.lock().unwrap();
+    if !g.contains(&res) {
+        add_ref(res);
+        g.push(res);
+    }
+}
+
+/// At a present: the frame's render targets are consumed; the one `XCL_PRESENT_TARGET` picks (AddRef'd
+/// for the frame's presentation, so it stays alive until `present_now` copies it) or None.
+unsafe fn take_frame_targets() -> Option<usize> {
+    let spec = target_spec()?;
+    let targets = std::mem::take(&mut *FRAME_TARGETS.lock().unwrap());
+    let desc = |r: usize| {
+        let raw = r as *mut c_void;
+        ID3D12Resource::from_raw_borrowed(&raw).map(|r| r.GetDesc())
+    };
+    let mut picked = None;
+    match *spec {
+        TargetSpec::List => {
+            static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+            let mut last = LAST.lock().unwrap();
+            if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+                *last = Some(Instant::now());
+                let mut counts: Vec<((u64, u32, i32), u32)> = Vec::new();
+                for d in targets.iter().filter_map(|&r| desc(r)) {
+                    let key = (d.Width, d.Height, d.Format.0);
+                    match counts.iter_mut().find(|c| c.0 == key) {
+                        Some(c) => c.1 += 1,
+                        None => counts.push((key, 1)),
+                    }
+                }
+                let text: Vec<String> = counts.iter().map(|((w, h, f), n)| format!("{w}x{h}:{f} x{n}")).collect();
+                crate::xlog_info!("XCL_PRESENT_TARGET: {} render targets this frame: {}", targets.len(), text.join(", "));
+            }
+        }
+        TargetSpec::Pick(w, h, fmt, n) => {
+            picked = targets.iter().copied().filter(|&r| desc(r).is_some_and(|d| d.Width == w && d.Height == h && d.Format.0 == fmt)).nth(n);
+            if picked.is_none() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_info!("XCL_PRESENT_TARGET: no render target {w}x{h}:{fmt} #{n} in this frame yet"));
+            } else if backbuffer_like(picked.unwrap()).is_none() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_info!("XCL_PRESENT_TARGET: {w}x{h}:{fmt} cannot be presented (the swap chain takes 8/10-bit and fp16 colour, 640x360 or larger, no MSAA); showing the title's image"));
+                picked = None;
+            }
+        }
+    }
+    // keep the pick alive for this frame's copy; the previous frame's pick is released
+    let mut held = PICKED.lock().unwrap();
+    for r in held.drain(..) {
+        release(r);
+    }
+    if let Some(r) = picked {
+        add_ref(r);
+        held.push(r);
+    }
+    for r in targets {
+        release(r);
+    }
+    picked
+}
+
+/// picks held for presentation; the oldest are released as newer ones arrive
+static PICKED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Format the swap chain uses for a back buffer of `f` (None = not presentable).
 pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {

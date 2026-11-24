@@ -3399,10 +3399,19 @@ index e0c1518..ab75aee 100644
          Ok(()) => count(DISPATCHES),
          Err(e) => {
 diff --git a/crates/xcl/src/hle/d3d12x/console_list.rs b/crates/xcl/src/hle/d3d12x/console_list.rs
-index 8619941..d591bb9 100644
+index 8619941..cd47c6b 100644
 --- a/crates/xcl/src/hle/d3d12x/console_list.rs
 +++ b/crates/xcl/src/hle/d3d12x/console_list.rs
-@@ -809,7 +809,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
+@@ -440,6 +440,8 @@ unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_v
+         return;
+     }
+     let words: [u32; 7] = std::ptr::read((pso as usize + 0x10) as *const [u32; 7]);
++    // its build starts now, so a list's pipelines build side by side before its first dispatch waits
++    super::pso_async::prefetch((*(pso as *const ConsolePso)).pc);
+     push(this as usize, &words);
+ }
+ unsafe extern "system" fn cl_set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
+@@ -809,7 +811,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                          // the background translation failed, skip instead of binding XCL's
                          // ABI root signature onto the stand-in
                          let real = super::pso_async::resolve_wait((*p).pc);
@@ -4183,10 +4192,134 @@ index 2995f05..2cde570 100644
      ///   q_compute list O_c: Write64(cell_A, frame) -> Wait64(cell_B >= frame) -> Write64(cell_C, frame)
      ///   q_direct  list O_d: Wait64(cell_A >= frame) -> Write64(cell_B, frame)
 diff --git a/crates/xcl/src/hle/d3d12x/present.rs b/crates/xcl/src/hle/d3d12x/present.rs
-index 01b3c92..fb24191 100644
+index 01b3c92..5cdeb6d 100644
 --- a/crates/xcl/src/hle/d3d12x/present.rs
 +++ b/crates/xcl/src/hle/d3d12x/present.rs
-@@ -398,7 +398,7 @@ unsafe fn show_compiling(hwnd: HWND) {
+@@ -90,10 +90,13 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
+     if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
+         return;
+     }
+-    let res = (list as *const usize).read_unaligned();
++    let mut res = (list as *const usize).read_unaligned();
+     if res == 0 {
+         return;
+     }
++    if let Some(target) = take_frame_targets() {
++        res = target;
++    }
+     {
+         let mut p = PRESENTED.lock().unwrap();
+         if !p.contains(&res) {
+@@ -215,6 +218,108 @@ pub fn note_rt0(list: usize, handle: usize) {
+     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, handle);
+ }
+ 
++/// `XCL_PRESENT_TARGET=<width>x<height>:<dxgi_format>[:<n>]` presents the n-th (0-based, first-use
++/// order) render target of that size and format the frame binds instead of the title's image;
++/// `list` logs the distinct render targets (size, format, count per frame) every ~5 s.
++enum TargetSpec {
++    Pick(u64, u32, i32, usize),
++    List,
++}
++
++fn target_spec() -> Option<&'static TargetSpec> {
++    static SPEC: std::sync::OnceLock<Option<TargetSpec>> = std::sync::OnceLock::new();
++    SPEC.get_or_init(|| {
++        let v = std::env::var("XCL_PRESENT_TARGET").ok()?;
++        let v = v.trim();
++        if v.eq_ignore_ascii_case("list") {
++            return Some(TargetSpec::List);
++        }
++        let mut parts = v.split(':');
++        let (w, h) = parts.next()?.split_once(['x', 'X'])?;
++        let fmt = parts.next()?.trim().parse().ok()?;
++        let n = parts.next().map_or(Some(0), |n| n.trim().parse().ok())?;
++        Some(TargetSpec::Pick(w.trim().parse().ok()?, h.trim().parse().ok()?, fmt, n))
++    })
++    .as_ref()
++}
++
++pub fn target_wanted() -> bool {
++    target_spec().is_some()
++}
++
++/// render targets bound in the frame being built, first-use order (AddRef'd)
++static FRAME_TARGETS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
++
++/// `res` was bound as a render target (`XCL_PRESENT_TARGET`).
++pub unsafe fn note_target(res: usize) {
++    if target_spec().is_none() {
++        return;
++    }
++    let mut g = FRAME_TARGETS.lock().unwrap();
++    if !g.contains(&res) {
++        add_ref(res);
++        g.push(res);
++    }
++}
++
++/// At a present: the frame's render targets are consumed; the one `XCL_PRESENT_TARGET` picks (AddRef'd
++/// for the frame's presentation, so it stays alive until `present_now` copies it) or None.
++unsafe fn take_frame_targets() -> Option<usize> {
++    let spec = target_spec()?;
++    let targets = std::mem::take(&mut *FRAME_TARGETS.lock().unwrap());
++    let desc = |r: usize| {
++        let raw = r as *mut c_void;
++        ID3D12Resource::from_raw_borrowed(&raw).map(|r| r.GetDesc())
++    };
++    let mut picked = None;
++    match *spec {
++        TargetSpec::List => {
++            static LAST: Mutex<Option<Instant>> = Mutex::new(None);
++            let mut last = LAST.lock().unwrap();
++            if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
++                *last = Some(Instant::now());
++                let mut counts: Vec<((u64, u32, i32), u32)> = Vec::new();
++                for d in targets.iter().filter_map(|&r| desc(r)) {
++                    let key = (d.Width, d.Height, d.Format.0);
++                    match counts.iter_mut().find(|c| c.0 == key) {
++                        Some(c) => c.1 += 1,
++                        None => counts.push((key, 1)),
++                    }
++                }
++                let text: Vec<String> = counts.iter().map(|((w, h, f), n)| format!("{w}x{h}:{f} x{n}")).collect();
++                crate::xlog_info!("XCL_PRESENT_TARGET: {} render targets this frame: {}", targets.len(), text.join(", "));
++            }
++        }
++        TargetSpec::Pick(w, h, fmt, n) => {
++            picked = targets.iter().copied().filter(|&r| desc(r).is_some_and(|d| d.Width == w && d.Height == h && d.Format.0 == fmt)).nth(n);
++            if picked.is_none() {
++                static ONCE: std::sync::Once = std::sync::Once::new();
++                ONCE.call_once(|| crate::xlog_info!("XCL_PRESENT_TARGET: no render target {w}x{h}:{fmt} #{n} in this frame yet"));
++            } else if backbuffer_like(picked.unwrap()).is_none() {
++                static ONCE: std::sync::Once = std::sync::Once::new();
++                ONCE.call_once(|| crate::xlog_info!("XCL_PRESENT_TARGET: {w}x{h}:{fmt} cannot be presented (the swap chain takes 8/10-bit and fp16 colour, 640x360 or larger, no MSAA); showing the title's image"));
++                picked = None;
++            }
++        }
++    }
++    // keep the pick alive for this frame's copy; the previous frame's pick is released
++    let mut held = PICKED.lock().unwrap();
++    for r in held.drain(..) {
++        release(r);
++    }
++    if let Some(r) = picked {
++        add_ref(r);
++        held.push(r);
++    }
++    for r in targets {
++        release(r);
++    }
++    picked
++}
++
++/// picks held for presentation; the oldest are released as newer ones arrive
++static PICKED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
++
+ /// Format the swap chain uses for a back buffer of `f` (None = not presentable).
+ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+     Some(match f {
+@@ -398,7 +503,7 @@ unsafe fn show_compiling(hwnd: HWND) {
          }
          last.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
      };
@@ -4195,7 +4328,7 @@ index 01b3c92..fb24191 100644
      let text = if recent {
          let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
          let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-@@ -434,7 +434,7 @@ fn window_thread() {
+@@ -434,7 +539,7 @@ fn window_thread() {
          let hwnd = CreateWindowExW(
              WINDOW_EX_STYLE(0),
              class,
@@ -4205,9 +4338,18 @@ index 01b3c92..fb24191 100644
              x,
              y,
 diff --git a/crates/xcl/src/hle/d3d12x/pso_async.rs b/crates/xcl/src/hle/d3d12x/pso_async.rs
-index b303cf5..33a85cf 100644
+index b303cf5..a070e64 100644
 --- a/crates/xcl/src/hle/d3d12x/pso_async.rs
 +++ b/crates/xcl/src/hle/d3d12x/pso_async.rs
+@@ -9,7 +9,7 @@
+ 
+ use std::collections::HashMap;
+ use std::sync::atomic::{AtomicUsize, Ordering};
+-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
++use std::sync::{Arc, Condvar, Mutex, OnceLock};
+ 
+ struct Pending {
+     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
 @@ -27,6 +27,8 @@ struct Pending {
      used: std::sync::atomic::AtomicBool,
      /// the stand-in was released before the real pipeline was built
@@ -4217,7 +4359,105 @@ index b303cf5..33a85cf 100644
  }
  
  impl Pending {
-@@ -134,6 +136,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+@@ -72,29 +74,82 @@ pub fn enabled() -> bool {
+ /// Builds the real pipeline: its raw pointer, 0 = failed.
+ pub type Job = Box<dyn FnOnce() -> usize + Send>;
+ 
+-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
++/// Builds go through a priority queue: a pipeline a bind waits for jumps ahead (front), the rest
++/// go in order behind it. `XCL_PSO_PARALLEL=0`: the old behaviour (a waiting bind builds the
++/// pipeline on the title's own thread, as many workers as DXC threads).
++pub fn parallel() -> bool {
++    static P: OnceLock<bool> = OnceLock::new();
++    *P.get_or_init(|| enabled() && std::env::var("XCL_PSO_PARALLEL").map_or(true, |v| v.trim() != "0"))
++}
++
++/// Workers that run driver compiles at once (`XCL_PSO_BUILD_THREADS`, default 4: a huge compute
++/// pipeline takes ~1 GB in the driver).
++fn build_threads() -> usize {
++    if !parallel() {
++        return crate::gpu::recomp::dxc::compile_threads();
++    }
++    std::env::var("XCL_PSO_BUILD_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(4).clamp(1, 64)
++}
++
++struct WorkQ {
++    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
++    cv: Condvar,
++}
++
++fn queue() -> &'static WorkQ {
++    static Q: OnceLock<WorkQ> = OnceLock::new();
+     Q.get_or_init(|| {
+-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+-        let rx = Arc::new(Mutex::new(rx));
+         // translation recurses deeply on big programs; DXC itself runs on its own pool
+-        let n = crate::gpu::recomp::dxc::compile_threads();
+-        for k in 0..n {
+-            let rx = rx.clone();
+-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+-                let next = rx.lock().unwrap().recv();
+-                let Ok(p) = next else { return };
+-                // (None: a bind took it and builds it itself)
+-                let job = p.job.lock().unwrap().take();
+-                if let Some(job) = job {
+-                    complete(&p, job());
++        for k in 0..build_threads() {
++            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
++                let q = queue();
++                loop {
++                    let p = {
++                        let mut g = q.list.lock().unwrap();
++                        loop {
++                            if let Some(p) = g.pop_front() {
++                                break p;
++                            }
++                            g = q.cv.wait(g).unwrap();
++                        }
++                    };
++                    // (None: somebody else took it)
++                    let job = p.job.lock().unwrap().take();
++                    if let Some(job) = job {
++                        complete(&p, job());
++                    }
+                 }
+             });
+         }
+-        Mutex::new(tx)
++        WorkQ { list: Mutex::new(Default::default()), cv: Condvar::new() }
+     })
+ }
+ 
++/// To the workers; `front`: ahead of everything queued (a bind is waiting for it).
++fn enqueue(p: Arc<Pending>, front: bool) {
++    let q = queue();
++    let mut g = q.list.lock().unwrap();
++    if front {
++        g.push_front(p);
++    } else {
++        g.push_back(p);
++    }
++    drop(g);
++    q.cv.notify_one();
++}
++
++/// The title is about to bind `pso`: a pipeline still to be built goes to the workers now, so
++/// that the builds of a list's pipelines run side by side before its first dispatch waits.
++pub fn prefetch(pso: usize) {
++    if !parallel() {
++        return;
++    }
++    let Some(p) = entry(pso) else { return };
++    if p.real.load(Ordering::Acquire) == 0 && !p.sent.swap(true, Ordering::AcqRel) {
++        enqueue(p, false);
++    }
++}
++
+ /// Release a pipeline state XCL owns (raw pointer, 0 = none).
+ pub fn release(p: usize) {
+     if p != 0 {
+@@ -134,6 +189,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
          key,
          used: Default::default(),
          orphan: Default::default(),
@@ -4225,7 +4465,16 @@ index b303cf5..33a85cf 100644
      });
      PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
      static ONCE: std::sync::Once = std::sync::Once::new();
-@@ -288,6 +291,30 @@ fn preload() -> Option<&'static Preload> {
+@@ -141,7 +197,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
+     });
+     if send {
+-        let _ = queue().lock().unwrap().send(p);
++        enqueue(p, false);
+     } else if used::known(key) {
+         if let Some(q) = preload() {
+             q.list.lock().unwrap().push_back(p);
+@@ -288,6 +344,63 @@ fn preload() -> Option<&'static Preload> {
  mod used_tests {
      use super::*;
  
@@ -4253,10 +4502,52 @@ index b303cf5..33a85cf 100644
 +        let _ = released(standin);
 +    }
 +
++    /// Prefetched pipelines build side by side on the workers, and a waiting bind does not build
++    /// on its own thread.
++    #[test]
++    fn prefetched_pipelines_build_in_parallel_on_the_workers() {
++        if !parallel() {
++            return;
++        }
++        let ids: Vec<usize> = (0..3).map(|i| 0x7E57_9000usize + i).collect();
++        let on_worker = Arc::new(AtomicUsize::new(0));
++        for &id in &ids {
++            let w = on_worker.clone();
++            submit_lazy(id, true, Box::new(move || {
++                if std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")) {
++                    w.fetch_add(1, Ordering::Relaxed);
++                }
++                std::thread::sleep(std::time::Duration::from_millis(400));
++                id + 1
++            }), 0);
++        }
++        let t = std::time::Instant::now();
++        for &id in &ids {
++            prefetch(id);
++        }
++        for &id in &ids {
++            assert_eq!(resolve_wait_for(id, None), id + 1);
++        }
++        assert!(t.elapsed() < std::time::Duration::from_millis(1000), "serial? {:?}", t.elapsed());
++        assert_eq!(on_worker.load(Ordering::Relaxed), 3, "built by workers, not the waiting thread");
++        for &id in &ids {
++            released(id);
++        }
++    }
++
      #[test]
      fn the_keys_of_a_file_are_read_and_other_lines_passed_over() {
          let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
-@@ -342,8 +369,16 @@ pub fn resolve(pso: usize) -> usize {
+@@ -331,7 +444,7 @@ pub fn resolve(pso: usize) -> usize {
+         0 => {
+             // a lazy one is wanted now: to the workers
+             if !p.sent.swap(true, Ordering::AcqRel) {
+-                let _ = queue().lock().unwrap().send(p);
++                enqueue(p, false);
+             }
+             pso
+         }
+@@ -342,11 +455,27 @@ pub fn resolve(pso: usize) -> usize {
  /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
  /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
  pub fn resolve_wait(pso: usize) -> usize {
@@ -4267,13 +4558,27 @@ index b303cf5..33a85cf 100644
 +fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
      let Some(p) = entry(pso) else { return pso };
      p.note_use();
+-    let job = p.job.lock().unwrap().take();
+-    if let Some(job) = job {
+-        complete(&p, job());
 +    if let Some(budget) = budget {
 +        return resolve_within(&p, pso, budget);
 +    }
-     let job = p.job.lock().unwrap().take();
-     if let Some(job) = job {
-         complete(&p, job());
-@@ -358,6 +393,46 @@ pub fn resolve_wait(pso: usize) -> usize {
++    if parallel() {
++        // wait for a worker; if none has started it, it goes to the front of the queue
++        if p.job.lock().unwrap().is_some() {
++            p.sent.store(true, Ordering::Release);
++            enqueue(p.clone(), true);
++        }
++    } else {
++        let job = p.job.lock().unwrap().take();
++        if let Some(job) = job {
++            complete(&p, job());
++        }
+     }
+     let mut done = p.done.lock().unwrap();
+     while !*done {
+@@ -358,9 +487,54 @@ pub fn resolve_wait(pso: usize) -> usize {
      }
  }
  
@@ -4298,7 +4603,7 @@ index b303cf5..33a85cf 100644
 +        return built(p);
 +    }
 +    if !p.sent.swap(true, Ordering::AcqRel) {
-+        let _ = queue().lock().unwrap().send(p.clone());
++        enqueue(p.clone(), false);
 +    }
 +    if p.late.load(Ordering::Acquire) {
 +        return pso;
@@ -4320,8 +4625,16 @@ index b303cf5..33a85cf 100644
  /// For binding: compute pipelines are waited for, graphics ones are not.
  pub fn resolve_for_bind(pso: usize) -> usize {
      match entry(pso) {
++        // (parallel: a dispatch waits for it; binding only starts its build)
++        Some(p) if p.compute && parallel() => {
++            prefetch(pso);
++            resolve(pso)
++        }
+         Some(p) if p.compute => resolve_wait(pso),
+         Some(_) => resolve(pso),
+         None => pso,
 diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
-index 5b01e85..15a8502 100644
+index 5b01e85..e9fe6b0 100644
 --- a/crates/xcl/src/hle/d3d12x/real.rs
 +++ b/crates/xcl/src/hle/d3d12x/real.rs
 @@ -3463,6 +3463,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
@@ -4355,6 +4668,21 @@ index 5b01e85..15a8502 100644
  /// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
  ///
  /// `COMPUTE_BLOBS` saves the second build of a program in one run; the first build of every
+@@ -4776,6 +4793,14 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
+     }
+     if n > 0 && !rtvs.is_null() {
+         super::present::note_rt0(this as usize, *rtvs);
++        if super::present::target_wanted() {
++            for k in 0..n as usize {
++                let h = if single != 0 { *rtvs + k * 32 } else { *rtvs.add(k) };
++                if let Some(r) = super::present::rtv_resource(h) {
++                    super::present::note_target(r);
++                }
++            }
++        }
+         if super::present::trace_frame() {
+             for k in 0..n as usize {
+                 let h = if single != 0 { *rtvs + k * 32 } else { *rtvs.add(k) };
 diff --git a/crates/xcl/src/hle/d3d12x/title_list.rs b/crates/xcl/src/hle/d3d12x/title_list.rs
 index 05de94b..01fce5c 100644
 --- a/crates/xcl/src/hle/d3d12x/title_list.rs

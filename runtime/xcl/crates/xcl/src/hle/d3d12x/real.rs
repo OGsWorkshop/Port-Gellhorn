@@ -4793,6 +4793,14 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     }
     if n > 0 && !rtvs.is_null() {
         super::present::note_rt0(this as usize, *rtvs);
+        if super::present::target_wanted() {
+            for k in 0..n as usize {
+                let h = if single != 0 { *rtvs + k * 32 } else { *rtvs.add(k) };
+                if let Some(r) = super::present::rtv_resource(h) {
+                    super::present::note_target(r);
+                }
+            }
+        }
         if super::present::trace_frame() {
             for k in 0..n as usize {
                 let h = if single != 0 { *rtvs + k * 32 } else { *rtvs.add(k) };
