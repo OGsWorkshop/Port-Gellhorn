@@ -166,6 +166,36 @@ const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// a pool tile given back is not reused before this (the GPU may still be at work on what the
 /// title released)
 const COOL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Page budget (`XCL_PAGE_BUDGET_MB`): a texture the CPU fills is not evicted before this
+/// long after it was placed, remapped or used in a transition.
+const EVICT_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Page budget: textures smaller than this are never evicted (UI, fonts, small lookups).
+const EVICT_MIN_TILES: u32 = 4;
+/// Page budget: tiles freed per eviction round once the pools are at the budget.
+const EVICT_BATCH: usize = 512;
+/// Page budget: after a round that found nothing to evict, pools grow past the budget for this
+/// long instead of trying again for every tile.
+const EVICT_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Page budget: pool heaps the pages may take, from `XCL_PAGE_BUDGET_MB` (0: no limit).
+fn pool_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let mb: usize = std::env::var("XCL_PAGE_BUDGET_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        if mb == 0 {
+            return 0;
+        }
+        let pools = (mb << 20).div_ceil(POOL_PAGES as usize * PAGE).max(1);
+        crate::xlog_info!("D3D12.X: page budget {mb} MB ({pools} pools of 64 MB): CPU-filled textures are evicted least recently used first beyond it");
+        pools
+    })
+}
+
+/// Page budget: textures whose tiles were evicted; the next upload or transition maps
+/// them again and uploads them whole.
+static EVICTED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REMAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A pool tile: (pool heap, tile in it).
 type Tile = (u32, u32);
@@ -218,6 +248,10 @@ struct Target {
     mapped: bool,
     used: Vec<usize>,
     used_extra: Vec<(usize, usize)>,
+    /// a texture the CPU fills (its texels can be uploaded again from the title's memory)
+    evictable: bool,
+    /// placed, remapped or transitioned last
+    touched: std::time::Instant,
 }
 
 /// The title's pages of video memory for tiled textures (see the module's comment).
@@ -241,6 +275,8 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// page budget: no eviction round before this (the last one found nothing to evict)
+    evict_idle_until: Option<std::time::Instant>,
 }
 
 // D3D12 objects are free-threaded
@@ -273,6 +309,7 @@ impl Pages {
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            evict_idle_until: None,
         })
     }
 
@@ -287,6 +324,23 @@ impl Pages {
         }
         if self.cooling.front().is_some_and(|(_, at)| at.elapsed() >= COOL) {
             return self.cooling.pop_front().map(|(t, _)| t);
+        }
+        let cap = pool_cap();
+        if cap > 0 && self.pools.len() >= cap {
+            // a round that found nothing to evict is not repeated for a second: each one walks
+            // every target, and a texture of many tiles asks once per tile
+            let now = std::time::Instant::now();
+            if self.evict_idle_until.is_none_or(|t| now >= t) && self.evict_lru(EVICT_BATCH) == 0 {
+                self.evict_idle_until = Some(now + EVICT_IDLE);
+            }
+            if let Some(t) = self.free.pop() {
+                return Some(t);
+            }
+            // at the budget a tile is reused before it cooled: a draw still in flight may read
+            // the newer texels there for a frame
+            if let Some((t, _)) = self.cooling.pop_front() {
+                return Some(t);
+            }
         }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
@@ -390,6 +444,49 @@ impl Pages {
         }
     }
 
+    /// Page budget: unmap CPU-filled textures, least recently touched first, until `want`
+    /// tiles came back (pages other mapped textures still share stay). Each goes to `EVICTED`.
+    unsafe fn evict_lru(&mut self, want: usize) -> usize {
+        let now = std::time::Instant::now();
+        let before = self.free.len() + self.cooling.len();
+        let mut order: Vec<(std::time::Instant, usize)> = self
+            .targets
+            .iter()
+            .filter(|(_, t)| t.evictable && t.mapped && t.total >= EVICT_MIN_TILES && now.duration_since(t.touched) >= EVICT_MIN_AGE)
+            .map(|(&k, t)| (t.touched, k))
+            .collect();
+        order.sort_unstable();
+        let mut evicted = Vec::new();
+        for (_, key) in order {
+            if self.free.len() + self.cooling.len() - before >= want {
+                break;
+            }
+            let Some(t) = self.targets.get_mut(&key) else { continue };
+            let total = t.total;
+            let used = std::mem::take(&mut t.used);
+            let used_extra = std::mem::take(&mut t.used_extra);
+            t.mapped = false;
+            let raw = key as *mut c_void;
+            if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
+                self.unmap(res, total);
+            }
+            self.release_tiles(used, used_extra, now, true);
+            evicted.push(key);
+        }
+        if !evicted.is_empty() {
+            let n = EVICTIONS.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed) + evicted.len() as u64;
+            let freed = self.free.len() + self.cooling.len() - before;
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let step = LOGGED.load(std::sync::atomic::Ordering::Relaxed);
+            if n >= step {
+                LOGGED.store(n.max(1) * 2, std::sync::atomic::Ordering::Relaxed);
+                crate::xlog_info!("D3D12.X: page budget: {} textures evicted ({} MB back) this round, {n} so far", evicted.len(), (freed * PAGE) >> 20);
+            }
+            EVICTED.lock().unwrap().get_or_insert_with(HashSet::new).extend(evicted);
+        }
+        self.free.len() + self.cooling.len() - before
+    }
+
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
@@ -476,6 +573,32 @@ fn owned_pages(va: usize, console_bytes: Option<u64>, total: usize) -> Option<(u
     }
 }
 
+/// A reserved texture needs TILED in the format's support (`support2`) and, multisampled, a
+/// tiled quality level at its sample count.
+fn can_reserve(support2: i32, samples: u32, tiled_msaa_levels: u32) -> bool {
+    support2 & D3D12_FORMAT_SUPPORT2_TILED.0 != 0 && (samples <= 1 || tiled_msaa_levels > 0)
+}
+
+/// Whether the device can make `desc` a reserved texture, asked before CreateReservedResource:
+/// refused, it is an error in the debug layer (#940: R32G8X24_TYPELESS depth, 1 and 4 samples).
+/// A query that fails says yes, and creation decides.
+unsafe fn reservable(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
+    let mut f = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: desc.Format, ..Default::default() };
+    if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut f as *mut _ as *mut c_void, std::mem::size_of_val(&f) as u32).is_err() {
+        return true;
+    }
+    // a format without TILED is not reservable whatever the sample count's query says
+    if !can_reserve(f.Support2.0, 1, 0) {
+        return false;
+    }
+    let samples = desc.SampleDesc.Count;
+    let mut m = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS { Format: desc.Format, SampleCount: samples, Flags: D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, NumQualityLevels: 0 };
+    if samples > 1 && dev.CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mut m as *mut _ as *mut c_void, std::mem::size_of_val(&m) as u32).is_err() {
+        return true;
+    }
+    can_reserve(f.Support2.0, samples, m.NumQualityLevels)
+}
+
 /// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
 /// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
 /// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
@@ -498,18 +621,23 @@ unsafe fn place_on_pages(
     if (require_aligned || console_bytes.is_none()) && va % PAGE != 0 {
         return None;
     }
-    let mut g = PAGES.lock().unwrap();
-    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
     // reserved textures have the PC's 64 KiB tiles
     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let log = |why: &str| {
+        if require_aligned && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_info!("D3D12.X: GPU-owned texture at {va:#x} ({}x{}, format {}, {} samples) not reserved ({why}): in an arena", desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count);
+        }
+    };
+    if !reservable(dev, &tiled) {
+        log("no tiled support for its format or sample count");
+        return None;
+    }
+    let mut g = PAGES.lock().unwrap();
+    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
     let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
-        if require_aligned {
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-                crate::xlog_info!("D3D12.X: GPU-owned texture at {va:#x} ({}x{}, format {}, {} samples) not reserved ({hr:#x}): in an arena", desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count);
-            }
-        }
+        log(&format!("{hr:#x}"));
         return None;
     }
     let raw = *ppv;
@@ -522,7 +650,7 @@ unsafe fn place_on_pages(
         *ppv = std::ptr::null_mut();
         return None;
     };
-    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });
+    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: !require_aligned, touched: std::time::Instant::now() });
     drop(g);
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
@@ -572,8 +700,56 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.used = used;
         t.used_extra = used_extra;
         t.mapped = true;
+        t.touched = std::time::Instant::now();
     }
     true
+}
+
+/// Page budget: `res` was evicted by the page budget; true once, and the caller maps it
+/// again (`remap_if_unmapped`) and uploads it whole.
+pub(super) fn take_evicted(res: usize) -> bool {
+    let mut g = EVICTED.lock().unwrap();
+    let hit = g.as_mut().is_some_and(|s| s.remove(&res));
+    if hit {
+        REMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    hit
+}
+
+/// Page budget: whether any texture is evicted (callers skip the lookup otherwise).
+pub(super) fn any_evicted() -> bool {
+    EVICTED.lock().unwrap().as_ref().is_some_and(|s| !s.is_empty())
+}
+
+/// Page budget: `res` was used (a transition the title submitted): later to be evicted.
+pub(super) fn touch(res: usize) {
+    if pool_cap() == 0 {
+        return;
+    }
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        if let Some(t) = pages.targets.get_mut(&res) {
+            t.touched = std::time::Instant::now();
+            return;
+        }
+    }
+}
+
+/// Page budget: the GPU wrote `res`; its texels are not in the title's memory, so it is
+/// never evicted.
+pub(super) fn pin(res: usize) {
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        if let Some(t) = pages.targets.get_mut(&res) {
+            t.evictable = false;
+            return;
+        }
+    }
+}
+
+/// Page budget: (textures evicted, textures mapped again) so far.
+pub fn eviction_counts() -> (u64, u64) {
+    (EVICTIONS.load(std::sync::atomic::Ordering::Relaxed), REMAPS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// A resource released: its pages are no longer its.
@@ -584,6 +760,10 @@ fn forget_pages(resource: usize) {
         let Some(t) = pages.targets.remove(&resource) else { continue };
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
+        }
+        drop(g);
+        if let Some(s) = EVICTED.lock().unwrap().as_mut() {
+            s.remove(&resource);
         }
         return;
     }
@@ -782,6 +962,50 @@ mod tests {
         }
     }
 
+    /// Reserved only with TILED support, and for MSAA a tiled sample count (#940: the driver
+    /// refused R32G8X24_TYPELESS reserved, at 1 and 4 samples, and the debug layer said so).
+    #[test]
+    fn reserved_needs_tiled_format_and_tiled_msaa() {
+        let tiled = D3D12_FORMAT_SUPPORT2_TILED.0;
+        assert!(can_reserve(tiled, 1, 0));
+        assert!(!can_reserve(0, 1, 0), "format without TILED");
+        assert!(can_reserve(tiled, 4, 1));
+        assert!(!can_reserve(tiled, 4, 0), "no tiled quality level at 4 samples");
+        assert!(!can_reserve(0, 4, 1));
+    }
+
+    /// The device's answer agrees with CreateReservedResource: what `reservable` turns away the
+    /// driver refuses, what it lets through the driver makes (WARP or a hardware adapter).
+    #[test]
+    fn reservable_agrees_with_the_driver() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory4 = windows::Win32::Graphics::Dxgi::CreateDXGIFactory1().expect("DXGI factory");
+                let Ok(warp) = factory.EnumWarpAdapter::<windows::Win32::Graphics::Dxgi::IDXGIAdapter>() else { return };
+                let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            }
+            let Some(dev) = dev else { return };
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_err() || o.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0 {
+                return;
+            }
+            for (format, samples) in [(DXGI_FORMAT_R32G8X24_TYPELESS, 1), (DXGI_FORMAT_R32G8X24_TYPELESS, 4), (DXGI_FORMAT_R32_TYPELESS, 1), (DXGI_FORMAT_R8G8B8A8_UNORM, 1)] {
+                let flags = if format == DXGI_FORMAT_R8G8B8A8_UNORM { D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET } else { D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 128, Height: 128, DepthOrArraySize: 1, MipLevels: 1, Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, Flags: flags, ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                let made = dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_ok() && r.is_some();
+                assert_eq!(reservable(&dev, &desc), made, "format {} x{samples}: reservable vs CreateReservedResource", format.0);
+            }
+        }
+    }
+
     /// A placement's arena id, with heaps numbered as they are made.
     fn take(a: &mut Arenas<u32>, va: usize, bytes: usize, align: usize, now: Instant) -> u64 {
         let n = a.list.len() as u32;
@@ -955,6 +1179,67 @@ mod tests {
             let small_size = dev.GetResourceAllocationInfo(0, &[small]).SizeInBytes as usize;
             assert_eq!(arena_bytes().0 - arenas0, small_size.next_multiple_of(PAGE));
             drop(last);
+        }
+    }
+
+    /// Page budget: the least recently touched CPU-filled texture gives its
+    /// pages back first, a GPU-written one never does, and an evicted one maps again.
+    #[test]
+    fn page_budget_evicts_the_least_recently_touched_cpu_filled_texture() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            let (Some(old), Some(newer), Some(written)) = (place_at(0x60_0000_0000), place_at(0x60_1000_0000), place_at(0x60_2000_0000)) else {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            };
+            let key = |r: &ID3D12Resource| r.as_raw() as usize;
+            pin(key(&written));
+            let dev_key = dev.as_raw() as usize;
+            let now = Instant::now();
+            {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                for (r, age) in [(&old, 30), (&newer, 20), (&written, 40)] {
+                    pages.targets.get_mut(&key(r)).unwrap().touched = now - Duration::from_secs(age);
+                }
+                let used_before = pages.pages.len();
+                assert!(pages.evict_lru(1) > 0, "tiles came back");
+                assert!(!pages.targets[&key(&old)].mapped, "the oldest CPU-filled texture is evicted");
+                assert!(pages.targets[&key(&newer)].mapped, "one is enough for one tile");
+                assert!(pages.targets[&key(&written)].mapped, "a GPU-written texture is never evicted");
+                assert!(pages.pages.len() < used_before, "its pages went back");
+                // nothing left to evict: the round says so (take_tile then waits before the next)
+                pages.targets.get_mut(&key(&newer)).unwrap().evictable = false;
+                assert_eq!(pages.evict_lru(1), 0, "nothing evictable");
+            }
+            assert!(take_evicted(key(&old)));
+            assert!(!take_evicted(key(&old)), "true once");
+            assert!(remap_if_unmapped(&old));
+            assert!(PAGES.lock().unwrap().get(&dev_key).unwrap().as_ref().unwrap().targets[&key(&old)].mapped, "mapped again");
+            drop((old, newer, written));
         }
     }
 }

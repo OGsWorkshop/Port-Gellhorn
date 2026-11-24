@@ -1,5 +1,49 @@
+diff --git a/crates/xcl/build.rs b/crates/xcl/build.rs
+index ebb5b45..caf2ef4 100644
+--- a/crates/xcl/build.rs
++++ b/crates/xcl/build.rs
+@@ -28,6 +28,13 @@ fn add(h: &mut u64, bytes: &[u8]) {
+ }
+ 
+ fn main() {
++    // xcl.exe without high-entropy ASLR: the title's memory then lies under 2^40, which a
++    // retail title's BVH builder requires of its GPU addresses (#585, PR #631)
++    match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
++        Ok("msvc") => println!("cargo:rustc-link-arg-bin=xcl=/HIGHENTROPYVA:NO"),
++        Ok("gnu") => println!("cargo:rustc-link-arg-bin=xcl=-Wl,--disable-high-entropy-va"),
++        _ => {}
++    }
+     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+     let mut h = 0xcbf2_9ce4_8422_2325u64;
+     add(&mut h, b"xcl-translator-source-v1\0");
+diff --git a/crates/xcl/src/gpu/desc.rs b/crates/xcl/src/gpu/desc.rs
+index 157bb1e..32b8477 100644
+--- a/crates/xcl/src/gpu/desc.rs
++++ b/crates/xcl/src/gpu/desc.rs
+@@ -125,7 +125,9 @@ pub fn dxgi_format(f: u32) -> Option<(DXGI_FORMAT, [u32; 4])> {
+         130 => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+         132 => DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+         133 => return Some((DXGI_FORMAT_B5G6R5_UNORM, BGRA)),
+-        135 => return Some((DXGI_FORMAT_B5G5R5A1_UNORM, BGRA)),
++        // 1_5_5_5 (names list the fields from the top bit down): x in bits 0-4, w in bit 15.
++        // 5_5_5_1 (135) keeps its 1-bit field in bit 0, which no DXGI format has
++        134 => return Some((DXGI_FORMAT_B5G5R5A1_UNORM, BGRA)),
+         136 => return Some((DXGI_FORMAT_B4G4R4A4_UNORM, BGRA)),
+         169 => DXGI_FORMAT_BC1_UNORM,
+         170 => DXGI_FORMAT_BC1_UNORM_SRGB,
+@@ -413,6 +415,10 @@ mod tests {
+         assert_eq!(component_mapping([4, 5, 6, 1], [2, 1, 0, 3]), 2 | 1 << 3 | 0 << 6 | 5 << 9 | 1 << 12);
+         assert_eq!(dxgi_format(181).map(|x| x.0), Some(DXGI_FORMAT_BC7_UNORM));
+         assert!(dxgi_format(44).is_none()); // 2_10_10_10: no DXGI equivalent
++        // 1_5_5_5 is B5G5R5A1 (and the format XCL writes into its views' T#s); 5_5_5_1 has none
++        assert_eq!(dxgi_format(134), Some((DXGI_FORMAT_B5G5R5A1_UNORM, [2, 1, 0, 3])));
++        assert!(dxgi_format(135).is_none());
++        assert_eq!(gfx10_format(DXGI_FORMAT_B5G5R5A1_UNORM), Some(134));
+     }
+ 
+     #[test]
 diff --git a/crates/xcl/src/gpu/recomp/emit.rs b/crates/xcl/src/gpu/recomp/emit.rs
-index 216240b..cb24182 100644
+index 216240b..a7ca8f3 100644
 --- a/crates/xcl/src/gpu/recomp/emit.rs
 +++ b/crates/xcl/src/gpu/recomp/emit.rs
 @@ -851,6 +851,150 @@ impl Em {
@@ -205,7 +249,56 @@ index 216240b..cb24182 100644
                      let _ = writeln!(h, "        uint xcl_emitted = 0u, xcl_strip = 0u, xcl_ntri = 0u, xcl_gs_base = 0xFFFFFFFFu;\n        uint xcl_tri[{maxt}];");
                      load_sgprs(h);
                      if sg.contains(&2) {
-@@ -5429,7 +5584,7 @@ bool xcl_x_meet() {
+@@ -4838,8 +4993,13 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>)
+         let _ = writeln!(fill, "        o.p{k} = {v};");
+     }
+     let tri_base = MESH_HEADER + mv as usize * vd;
++    // The declaration is chosen by the vertex budget, the dispatch group count separately:
++    // a record over the budget in whole vertices can still fit one compact group (its few
++    // triangles' own copies fit) – declaring verts[mv] there is refused by DXC (80 vertices
++    // with 22 float4 rows are accounted as 96: 33792 B > 32768).
++    let cap = passthrough_max_vertices(16 * (1 + elems.len() as u32));
+     let split = passthrough_split(ms, elems.len());
+-    if split == 1 {
++    if mv <= cap {
+         let _ = writeln!(
+             h,
+             "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
+@@ -4885,15 +5045,28 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>)
+ /// D3D12's limit on what one mesh shader group outputs (vertex + primitive attributes).
+ const MESH_OUTPUT_BYTES: u32 = 32768;
+ 
+-/// Mesh groups the pass-through spends on one record: 1 when the record's vertices fit the
+-/// mesh output limit as they are, else the triangles are split into runs whose own vertex
+-/// copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
++/// Vertices the pass-through puts in one mesh group: the vertex output budget divided by the
++/// stride, and DXC accounts whole chunks of 32 vertices even when fewer are declared (78
++/// vertices with 22 rows are accounted as 96). Measured with dxc 1.8.2502 (ms_6_6): the
++/// formula gives DXC's exact boundary for 1 to 32 float4 rows, up to 256 primitives
++/// (NathanTheophile's 96-case bisect in this PR); narrower clip/cull rows count as full rows
++/// here, which can only overestimate.
++fn passthrough_max_vertices(vbytes: u32) -> u32 {
++    (MESH_OUTPUT_BYTES / vbytes).min(256) / 32 * 32
++}
++
++/// Mesh groups the pass-through spends on one record: the record's vertices fit the mesh
++/// output limit as they are, or the triangles go out in runs whose own vertex copies (3 per
++/// triangle) fit. The layout choice in `mesh_passthrough_for` is by the vertex budget alone;
++/// this count is the dispatch's, and one compact group can carry a record whose whole
++/// declaration would be refused. `elements`: output elements besides SV_Position.
+ pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
+     let vbytes = 16 * (1 + elements as u32);
+-    if vbytes * ms.max_vertices <= MESH_OUTPUT_BYTES {
++    let cap = passthrough_max_vertices(vbytes);
++    if ms.max_vertices <= cap {
+         return 1;
+     }
+-    let ppg = (MESH_OUTPUT_BYTES / (3 * vbytes)).max(1);
++    let ppg = (cap / 3).max(1);
+     ms.max_primitives.max(1).div_ceil(ppg)
+ }
+ 
+@@ -5429,7 +5602,7 @@ bool xcl_x_meet() {
              uint c;
              InterlockedAdd(XCL_XC(xcl_cw * 2u + (xcl_half ^ 1u)), 0u, c);
              if ((int)(c - need) >= 0) break;
@@ -214,7 +307,7 @@ index 216240b..cb24182 100644
          }
      }
      if (WaveReadLaneFirst(ok) == 0u) { xcl_x_dead = true; return false; }
-@@ -5518,7 +5673,7 @@ void xcl_s_barrier() {
+@@ -5518,7 +5691,7 @@ void xcl_s_barrier() {
                  InterlockedCompareExchange(XCL_BAR_STATE, _s, _next, _orig);
                  if (_orig == _s) break;
              }
@@ -223,7 +316,7 @@ index 216240b..cb24182 100644
                  _ok = 0u;
                  uint _orig;
                  InterlockedAdd(XCL_BAR_ALIVE, 0xFFFFFFFFu, _orig);
-@@ -5535,7 +5690,7 @@ void xcl_s_barrier() {
+@@ -5535,7 +5708,7 @@ void xcl_s_barrier() {
  const PRELUDE: &str = r#"
  static uint lane_id;
  // loop iterations a lane may run (`LOOP_GUARD`): far above what a working program needs
@@ -285,10 +378,118 @@ index 7a6641b..3aa3ac0 100644
          blocks = 1;
      } else {
 diff --git a/crates/xcl/src/gpu/recomp/tests.rs b/crates/xcl/src/gpu/recomp/tests.rs
-index 4e032b6..00691d3 100644
+index 4e032b6..d1ca135 100644
 --- a/crates/xcl/src/gpu/recomp/tests.rs
 +++ b/crates/xcl/src/gpu/recomp/tests.rs
-@@ -5683,6 +5683,124 @@ fn mesh_split_wave64_form() {
+@@ -2899,6 +2899,107 @@ fn gpu_mesh_mode_two_passes() {
+     assert!(px16 == px, "split pass-through draws the same pixels");
+ }
+ 
++/// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
++/// when fewer are declared, so 78 vertices with 22 float4 rows are accounted as 96 (33792 B >
++/// 32768) and the record must go out in split groups. A retail title's NGG transform programs
++/// have this shape (128 vertices / 128 primitives, 21 params + SV_ClipDistance0); the previous
++/// budget (32768 / stride) emitted verts[78] and DXC refused every one of them.
++#[test]
++fn mesh_split_accounts_vertex_chunks() {
++    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
++    use super::MsInterface;
++    if super::dxc::location().is_err() {
++        println!("no DXC – skipping");
++        runner::skip_test("no DXC");
++        return;
++    }
++    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
++        name: name.into(),
++        index,
++        system_value: sv,
++        component_type: 3,
++        register: reg,
++        mask: 0xF,
++        rw_mask: 0xF,
++        stream: 0,
++    };
++    let mut outputs = vec![sig("SV_Position", 1, 0, 0)];
++    for k in 0..20u32 {
++        outputs.push(sig("TEXCOORD", 0, k + 1, k));
++    }
++    outputs.push(sig("SV_ClipDistance", 2, 21, 0));
++    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128 };
++    let elems = passthrough_elements(&ms, None);
++    assert_eq!(elems, 21);
++    // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit (96 would be 33792 B), so at
++    // most 21 triangles' worth of copies per group, ceil(128/21) = 7 groups of 19
++    let split = passthrough_split(&ms, elems);
++    assert_eq!(split, 7, "chunks of 32: 78 verts are accounted as 96 and refused");
++    let pass = mesh_passthrough(&ms);
++    assert!(pass.contains("verts[57]"), "19 triangles per group:\n{pass}");
++    super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
++    // 20 rows * 16 B = 320 B/vertex: 96 accounted vertices fit (30720 B), but a whole record
++    // is 128 vertices (40960 B) – 4 groups of 32 triangles, 96 vertices each
++    let mut ms20 = ms.clone();
++    ms20.outputs.pop();
++    assert_eq!(passthrough_split(&ms20, passthrough_elements(&ms20, None)), 4);
++    let pass20 = mesh_passthrough(&ms20);
++    assert!(pass20.contains("verts[96]"), "96 vertices per group:\n{pass20}");
++    super::dxc::compile(&pass20, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass20}"));
++    // 8 rows * 16 B = 128 B/vertex: 128 vertices are 16384 B – the record stays whole
++    let mut ms8 = ms.clone();
++    ms8.outputs.truncate(8);
++    assert_eq!(passthrough_split(&ms8, passthrough_elements(&ms8, None)), 1);
++    let pass8 = mesh_passthrough(&ms8);
++    assert!(pass8.contains("verts[128]"), "whole record:\n{pass8}");
++    super::dxc::compile(&pass8, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass8}"));
++}
++
++/// The layout and the dispatch count are chosen separately: a record of 80 vertices with 22
++/// float4 rows does not fit the mesh output budget as a whole (DXC accounts 96 vertices:
++/// 33792 B > 32768 B), but its single triangle's copies fit one compact group. The pass-
++/// through must then declare the compact layout while `passthrough_split` returns 1, and DXC
++/// accepts it (the whole-record declaration is refused).
++#[test]
++fn mesh_layout_independent_of_group_count() {
++    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
++    use super::MsInterface;
++    if super::dxc::location().is_err() {
++        println!("no DXC – skipping");
++        runner::skip_test("no DXC");
++        return;
++    }
++    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
++        name: name.into(),
++        index,
++        system_value: sv,
++        component_type: 3,
++        register: reg,
++        mask: 0xF,
++        rw_mask: 0xF,
++        stream: 0,
++    };
++    let mut outputs = vec![sig("SV_Position", 1, 0, 0)];
++    for k in 0..20u32 {
++        outputs.push(sig("TEXCOORD", 0, k + 1, k));
++    }
++    outputs.push(sig("SV_ClipDistance", 2, 21, 0));
++    // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit; 80 declared do not
++    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1 };
++    let elems = passthrough_elements(&ms, None);
++    assert_eq!(elems, 21);
++    // one triangle: its 3 copies fit one compact group, so the dispatch count is 1
++    assert_eq!(passthrough_split(&ms, elems), 1, "one triangle fits one compact group");
++    let pass = mesh_passthrough(&ms);
++    assert!(pass.contains("verts[3]"), "the compact layout is chosen, not verts[80]:\n{pass}");
++    super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
++    // the whole-record form is what DXC refuses at this width: the same record declared whole
++    // (verts[80], accounted as 96: 33792 B) does not validate
++    let whole = pass.replace("verts[3]", "verts[80]");
++    assert!(whole.contains("verts[80]"), "the whole-record declaration for the refusal check:\n{whole}");
++    assert!(super::dxc::compile(&whole, "main", "ms_6_6", &[]).is_err(), "DXC refuses 96 accounted vertices of 352 B");
++}
++
+ /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
+ #[test]
+ #[ignore]
+@@ -5683,6 +5784,124 @@ fn mesh_split_wave64_form() {
      assert!(super::translate_mesh(&lane, ms, true, true, 1).unwrap().hlsl.contains("xcl_x_rla_uniform("));
  }
  
@@ -413,7 +614,7 @@ index 4e032b6..00691d3 100644
  /// Operations whose result spans both 32-lane halves of a wave64 – what the split form
  /// exchanges: masks with bits in either half (counted, scanned, branched on), readlane /
  /// readfirstlane of a lane in the other half, ds_bpermute across the halves, a GLC scalar
-@@ -5790,6 +5908,138 @@ fn gpu_split_wave64_lane_local_masks() {
+@@ -5790,6 +6009,138 @@ fn gpu_split_wave64_lane_local_masks() {
      }
  }
  
@@ -552,6 +753,29 @@ index 4e032b6..00691d3 100644
  /// Masks that are read whole after a write `x64_masks` must not take for an overwrite (an
  /// SDWA compare into its SDST, `s_bitset1`, `s_movreld`) or through a read the operand
  /// tables do not show (`s_movrels`, an SMEM register offset, an SDWA scalar src1): each is
+diff --git a/crates/xcl/src/gpu/uma.rs b/crates/xcl/src/gpu/uma.rs
+index 82eac9e..5fec87e 100644
+--- a/crates/xcl/src/gpu/uma.rs
++++ b/crates/xcl/src/gpu/uma.rs
+@@ -603,6 +603,18 @@ impl Uma {
+         true
+     }
+ 
++    /// Whether `p` is a block handed out and not freed since (tests).
++    #[cfg(test)]
++    pub fn is_allocated(&self, p: usize) -> bool {
++        {
++            let g = self.pool.lock().unwrap();
++            if p >= g.0 && p < g.1 {
++                return !g.2.contains(&p);
++            }
++        }
++        p.checked_sub(self.base).is_some_and(|off| self.inner.lock().unwrap().used.contains_key(&off))
++    }
++
+     /// Bytes handed out.
+     pub fn used(&self) -> usize {
+         self.inner.lock().unwrap().used.values().sum()
 diff --git a/crates/xcl/src/hle/bcpack/mod.rs b/crates/xcl/src/hle/bcpack/mod.rs
 new file mode 100644
 index 0000000..0862564
@@ -2332,13 +2556,82 @@ index 0000000..cd1ced8
 +];
 diff --git a/crates/xcl/src/hle/bcpack/tests.rs b/crates/xcl/src/hle/bcpack/tests.rs
 new file mode 100644
-index 0000000..e49e33d
+index 0000000..396c0f4
 --- /dev/null
 +++ b/crates/xcl/src/hle/bcpack/tests.rs
-@@ -0,0 +1,46 @@
-+//! Stream tests: truncated input and the modes that have no decoder.
+@@ -0,0 +1,115 @@
++//! Stream tests: truncated input and the modes that have no decoder, and the lane stage against
++//! the synthetic fixtures of `tests/data/bcpack` (built by its `generate.py`, an encoder written
++//! from the format notes, not from this decoder).
 +
 +use super::{can_decode, decode, Error};
++
++fn data(name: &str) -> Option<Vec<u8>> {
++    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/bcpack").join(name)).ok()
++}
++
++/// `bc<mode>-<units>-<seed>`, units of 8 bytes of output: (mode, units)
++const FIXTURES: [&str; 14] = [
++    "bc1-1-8", "bc1-2-0", "bc1-16-1", "bc1-16-9", "bc1-700-2", "bc1-8192-3", "bc3-16-1", "bc4-16-1", "bc5-16-1", "bc6-16-1", "bc7-2-0", "bc7-16-1",
++    "bc7-700-2", "bc7-8192-3",
++];
++
++/// The symbols of the two 64 KiB fixtures, which have no `.lanes` file (`generate.py`), lane-major.
++fn large_fixture_symbols(mode: u8, lanes: usize) -> Vec<u8> {
++    let mut s = vec![0u8; 8192 * lanes];
++    if mode == 1 {
++        for i in (0..8192).step_by(511) {
++            s[2 * 8192 + i] = 30;
++            s[8 * 8192 + i] = 5;
++        }
++        for i in (31..8192).step_by(31) {
++            s[i] = 2;
++        }
++    }
++    s
++}
++
++#[test]
++fn fixtures_decode_to_their_lanes() {
++    for stem in FIXTURES {
++        let mut p = stem.strip_prefix("bc").unwrap().split('-');
++        let (mode, units): (u8, usize) = (p.next().unwrap().parse().unwrap(), p.next().unwrap().parse().unwrap());
++        let bin = data(&format!("{stem}.bin")).unwrap();
++        let per = if matches!(mode, 1 | 4) { 1 } else { 2 };
++        let got = super::victory::records(mode, &bin, units / per);
++        // bc1-1-8 has states cut to fewer bytes than an encoder that starts at 2^24 can drop
++        if stem == "bc1-1-8" {
++            assert!(got.is_err(), "{stem}");
++            continue;
++        }
++        let (records, lanes, per) = got.unwrap_or_else(|e| panic!("{stem}: {e}"));
++        let want = data(&format!("{stem}.lanes")).unwrap_or_else(|| large_fixture_symbols(mode, lanes));
++        assert_eq!(want.len(), units * lanes, "{stem}");
++        // `.lanes`: all of lane 0, then lane 1 …; a record: per lane, its symbols of the block
++        for (u, unit) in (0..units).map(|u| (u, u / per * lanes * per + u % per)) {
++            for j in 0..lanes {
++                assert_eq!(records[unit + j * per], want[j * units + u], "{stem}: unit {u}, lane {j}");
++            }
++        }
++    }
++}
++
++/// The 8-bit model 11 as US 11,234,023 prints it (its `base_table[8][12]`, counted from 1), and
++/// every model's frequencies sum to 65536.
++#[test]
++fn model_matches_the_patent_excerpt() {
++    use super::tables::{FREQ, MODELS};
++    let base = [0u32, 7575, 14276, 25440, 41008, 56352, 64256, 65344, 65408];
++    let freq = [7575u32, 6701, 5582, 3892, 1918, 494, 34, 1, 1];
++    assert_eq!(FREQ[7 * 16 + 11], freq);
++    assert_eq!(super::victory::Tables::builtin().start[7 * 16 + 11], base);
++    for (m, f) in FREQ.iter().enumerate().take(MODELS) {
++        let total: u32 = (0..9).map(|k| f[k] << k.saturating_sub(1)).sum();
++        assert_eq!(total, 65536, "model {m}");
++        let used = m / 16 + 2;
++        assert!(f[..used].iter().all(|&v| v >= 1) && f[used..].iter().all(|&v| v == 0), "model {m}");
++    }
++}
 +
 +#[test]
 +fn truncated_and_empty_streams_fail() {
@@ -2384,13 +2677,15 @@ index 0000000..e49e33d
 +}
 diff --git a/crates/xcl/src/hle/bcpack/victory.rs b/crates/xcl/src/hle/bcpack/victory.rs
 new file mode 100644
-index 0000000..fe3675b
+index 0000000..20b8fa5
 --- /dev/null
 +++ b/crates/xcl/src/hle/bcpack/victory.rs
-@@ -0,0 +1,995 @@
+@@ -0,0 +1,1012 @@
 +//! BCPack: lossless packing of BC1-BC7 block streams, as the console's
 +//! DirectStorage hardware unpacks them. Decode only; BC2 is left out (no
-+//! title data uses it). Ported from VIctory's victory-formats/src/bcpack.rs on 2026-11-23.
++//! title data uses it). Ported from VIctory's victory-formats/src/bcpack.rs on 2026-11-23
++//! (https://github.com/Marvisak/VIctory, GPL-3.0; used here under GPL-2.0-only with its
++//! author's permission, see THIRD_PARTY.md).
 +//!
 +//! A packed stream has no header. It is 12 or 16 interleaved rANS *lanes*;
 +//! each lane is a run of fragments (header byte, length, payload) coded with
@@ -2495,14 +2790,7 @@ index 0000000..fe3675b
 +        return Err(Error("destination is not a whole number of blocks"));
 +    }
 +    let blocks = dst.len() / block;
-+    let (widths, per): (&[u8], usize) = match bc {
-+        1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
-+        3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
-+        4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
-+        5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
-+        6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
-+        _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
-+    };
++    let (widths, per) = lane_layout(bc);
 +    let stride = widths.len() * per;
 +    let mut records = vec![0u8; blocks * stride];
 +    let mut next = src.iter().copied();
@@ -2521,6 +2809,28 @@ index 0000000..fe3675b
 +}
 +
 +// Lanes.
++
++/// Format `bc`'s lanes (symbol bits - 1 of each) and the symbols each lane gives per block.
++fn lane_layout(bc: u8) -> (&'static [u8], usize) {
++    match bc {
++        1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
++        3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
++        4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
++        5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
++        6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
++        _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
++    }
++}
++
++/// The lane stage alone (tests): the records of `blocks` blocks of format `bc` in `src`.
++#[cfg(test)]
++pub(super) fn records(bc: u8, src: &[u8], blocks: usize) -> Result<(Vec<u8>, usize, usize), Error> {
++    let (widths, per) = lane_layout(bc);
++    let mut records = vec![0u8; blocks * widths.len() * per];
++    let mut next = src.iter().copied();
++    lanes(Tables::builtin(), widths, per, blocks, |_| next.next(), &mut records)?;
++    Ok((records, widths.len(), per))
++}
 +
 +#[derive(Clone, Copy, Default)]
 +struct Lane {
@@ -3383,6 +3693,241 @@ index 0000000..fe3675b
 +    Ok(())
 +}
 +
+diff --git a/crates/xcl/src/hle/d3d12x/alloc_pool.rs b/crates/xcl/src/hle/d3d12x/alloc_pool.rs
+index 4815766..f5ed20c 100644
+--- a/crates/xcl/src/hle/d3d12x/alloc_pool.rs
++++ b/crates/xcl/src/hle/d3d12x/alloc_pool.rs
+@@ -72,20 +72,38 @@ fn move_list(s: &mut State, list: usize, backing: usize) {
+     s.backings.entry(backing).or_default().users.insert(list);
+ }
+ 
+-/// `list` (of type `ty`; negative: not known) is reset on the title's allocator `alloc`: the
+-/// PC allocator to give the PC list.
+-pub fn for_list(list: usize, alloc: usize, ty: i32) -> usize {
+-    if !enabled() || alloc == 0 {
+-        return alloc;
++/// The PC list's final Release ended its recording. Submitted work still holds the backing
++/// through `marks`; removing the list must not remove those fences or the other users.
++pub(super) fn forget_list(list: usize) {
++    let mut g = STATE.lock().unwrap();
++    let Some(s) = g.as_mut() else { return };
++    if let Some(backing) = s.of_list.remove(&list) {
++        if let Some(b) = s.backings.get_mut(&backing) {
++            b.users.remove(&list);
++        }
++    }
++}
++
++/// Reset `list` on the title's allocator `alloc`, committing its new recording association
++/// only after native Reset succeeds. No pool lock is held across the driver call.
++pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
++    let backing = current(alloc);
++    let hr = reset(backing);
++    if hr < 0 || !enabled() || alloc == 0 {
++        return hr;
+     }
+     let mut g = STATE.lock().unwrap();
+     let s = g.get_or_insert_with(State::default);
+     if ty >= 0 {
+         s.types.insert(alloc, ty);
+     }
+-    let backing = s.cur.get(&alloc).copied().unwrap_or(alloc);
+     move_list(s, list, backing);
+-    backing
++    hr
++}
++
++#[cfg(test)]
++pub(super) fn recording_backing_for_test(list: usize) -> Option<usize> {
++    STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
+ }
+ 
+ /// The PC allocator the title's allocator `alloc` stands for now.
+@@ -178,9 +196,14 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+     if !enabled() {
+         return None;
+     }
+-    let a = alloc as usize;
+     let mut g = STATE.lock().unwrap();
+     let s = g.get_or_insert_with(State::default);
++    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
++}
++
++/// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
++unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<HRESULT> {
++    let a = alloc as usize;
+     let c = s.cur.get(&a).copied().unwrap_or(a);
+     if s.backings.get(&c).is_none_or(|b| b.free()) {
+         if let Some(b) = s.backings.get_mut(&c) {
+@@ -189,21 +212,22 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+         if c == a {
+             return None;
+         }
+-        return Some(super::real::reset_pc_allocator(c as *mut c_void));
++        return Some(reset(c as *mut c_void));
+     }
+     let ty = *s.types.get(&a)?;
+     // one put aside earlier that nothing uses any more, or a new one
+     let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
+     let next = match reuse {
+         Some(f) => {
++            // Keep ownership until Reset succeeds so a failure can be retried.
++            let hr = reset(f as *mut c_void);
++            if hr < 0 {
++                return Some(hr);
++            }
+             s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
+             if let Some(b) = s.backings.get_mut(&f) {
+                 b.marks.clear();
+             }
+-            let hr = super::real::reset_pc_allocator(f as *mut c_void);
+-            if hr < 0 {
+-                return Some(hr);
+-            }
+             f
+         }
+         None => {
+@@ -238,6 +262,112 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn a_spare_whose_reset_fails_stays_available_for_retry() {
++        let (alloc, spare, list) = (0x1000usize, 0x2000usize, 0x3000usize);
++        let mut s = State::default();
++        s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
++        move_list(&mut s, list, alloc);
++        s.aside.insert(alloc, vec![spare]);
++        s.backings.insert(spare, Backing::default());
++        let mut calls = Vec::new();
++
++        for _ in 0..2 {
++            let hr = unsafe {
++                title_reset_in(&mut s, alloc as *mut c_void, |raw| {
++                    calls.push(raw as usize);
++                    crate::util::E_FAIL
++                })
++            };
++            assert_eq!(hr, Some(crate::util::E_FAIL));
++            assert_eq!(s.aside.get(&alloc), Some(&vec![spare]), "the failed candidate is still owned and reusable");
++            assert!(!s.cur.contains_key(&alloc), "the current backing did not change");
++            assert_eq!(s.of_list.get(&list), Some(&alloc));
++            assert!(s.backings[&alloc].users.contains(&list), "the old recording is still held");
++            assert_eq!((s.made, s.swaps), (0, 0));
++        }
++
++        let hr = unsafe {
++            title_reset_in(&mut s, alloc as *mut c_void, |raw| {
++                calls.push(raw as usize);
++                0
++            })
++        };
++        assert_eq!(hr, Some(0));
++        assert_eq!(calls, vec![spare; 3], "all attempts used the same spare without creating another");
++        assert_eq!(s.cur.get(&alloc), Some(&spare));
++        assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
++        assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
++        assert_eq!((s.made, s.swaps), (0, 1));
++    }
++
++    /// Final-release cleanup drops only the recording's hold: another live list and a pending
++    /// GPU fence each still prevent reuse, then completion makes the backing reusable.
++    #[test]
++    fn released_lists_leave_only_live_recordings_and_gpu_work_holding_the_backing() {
++        use std::cell::Cell;
++        use std::mem::{offset_of, size_of};
++
++        #[repr(C)]
++        struct Fence {
++            vtable: *const usize,
++            value: Cell<u64>,
++            releases: Cell<u32>,
++        }
++        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
++            (*this.cast::<Fence>()).value.get()
++        }
++        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
++            let f = &*this.cast::<Fence>();
++            f.releases.set(f.releases.get() + 1);
++            0
++        }
++        extern "system" fn unexpected_call() { std::process::abort(); }
++
++        const SLOT: usize = size_of::<usize>();
++        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
++        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
++        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
++        let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), releases: Cell::new(0) };
++        let mut ids = Box::new([0u8; 3]);
++        let alloc = ids.as_mut_ptr() as usize;
++        let (first, second) = (alloc + 1, alloc + 2);
++        created_on(first, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
++        created_on(second, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
++        {
++            let mut g = STATE.lock().unwrap();
++            let b = g.as_mut().unwrap().backings.get_mut(&alloc).unwrap();
++            // The map owns one synthetic fence reference, dropped by forget below.
++            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) };
++            b.marks.insert(1, (f, 7));
++        }
++
++        super::super::list_x::on_release(first);
++        let first_removed = {
++            let g = STATE.lock().unwrap();
++            let s = g.as_ref().unwrap();
++            !s.of_list.contains_key(&first) && s.of_list.get(&second) == Some(&alloc)
++                && s.backings[&alloc].users == HashSet::from([second])
++                && !unsafe { s.backings[&alloc].free() }
++        };
++        super::super::list_x::on_release(second);
++        super::super::list_x::on_release(first); // duplicate cleanup is harmless
++        let pending_still_held = {
++            let g = STATE.lock().unwrap();
++            let s = g.as_ref().unwrap();
++            !s.of_list.contains_key(&second) && s.backings[&alloc].users.is_empty()
++                && s.backings[&alloc].marks.len() == 1 && !unsafe { s.backings[&alloc].free() }
++        };
++        fence.value.set(7);
++        let reusable = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].free() };
++        // Clean up the synthetic COM pointer before assertions, including on the old code.
++        unsafe { forget(alloc) };
++        assert!(first_removed, "another live recording must remain while the released list goes");
++        assert!(pending_still_held, "final list Release must retain the submitted-work fence");
++        assert!(reusable, "a released list cannot keep a completed backing busy");
++        assert_eq!(fence.releases.get(), 1);
++    }
++
+     /// A list recorded once and submitted again after the title reset its allocator: the
+     /// recording is still there (the device is not removed), the title's allocator goes on with
+     /// another PC allocator, and the first one is used again once the list has moved on.
+@@ -283,10 +413,11 @@ mod tests {
+             assert!(dev.GetDeviceRemovedReason().is_ok(), "the recording was still there");
+ 
+             // the list is reset on the title's allocator: it records on the PC allocator in use
+-            let pc = for_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+-            assert_eq!(pc, second);
+             let second_alloc = ID3D12CommandAllocator::from_raw_borrowed(&(second as *mut c_void)).unwrap().clone();
+-            list.Reset(&second_alloc, None).unwrap();
++            assert_eq!(reset_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
++                assert_eq!(pc, second);
++                list.Reset(&second_alloc, None).map_or_else(|e| e.code().0, |_| 0)
++            }), 0);
+             list.Close().unwrap();
+             queue.ExecuteCommandLists(&lists);
+             executed(queue.as_raw(), &[l]);
+@@ -299,8 +430,10 @@ mod tests {
+ 
+             // the title's allocator goes while another PC allocator stands for it: nothing of
+             // it stays (the next allocator at its address is its own)
+-            list.Reset(&alloc, None).unwrap();
+-            for_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
++            assert_eq!(reset_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
++                assert_eq!(pc, a as usize);
++                list.Reset(&alloc, None).map_or_else(|e| e.code().0, |_| 0)
++            }), 0);
+             list.Close().unwrap();
+             alloc.Reset().unwrap();
+             assert_ne!(current(a as usize), a as usize);
 diff --git a/crates/xcl/src/hle/d3d12x/bind.rs b/crates/xcl/src/hle/d3d12x/bind.rs
 index e0c1518..ab75aee 100644
 --- a/crates/xcl/src/hle/d3d12x/bind.rs
@@ -3922,11 +4467,127 @@ index aea8e59..99174fd 100644
 +        }
 +    }
  }
+diff --git a/crates/xcl/src/hle/d3d12x/late_release.rs b/crates/xcl/src/hle/d3d12x/late_release.rs
+index 18ddc68..c2cbf68 100644
+--- a/crates/xcl/src/hle/d3d12x/late_release.rs
++++ b/crates/xcl/src/hle/d3d12x/late_release.rs
+@@ -21,8 +21,12 @@ const SEAL_EVERY: Duration = Duration::from_millis(10);
+ /// how often the thread here looks for batches that can go
+ const TICK: Duration = Duration::from_millis(4);
+ 
++/// A held resource and the unified-memory or sparse-VRAM block XCL placed under it (given back
++/// when it goes: until then the queues may still use it).
++type Dead = (usize, Option<usize>);
++
+ struct Batch {
+-    dead: Vec<usize>,
++    dead: Vec<Dead>,
+     /// (fence, value) a queue: all reached = nothing submitted before the batch closed is left
+     marks: Vec<(ID3D12Fence, u64)>,
+ }
+@@ -31,7 +35,7 @@ struct Batch {
+ struct Held {
+     /// queue → its fence here and the last value signalled on it
+     fences: HashMap<usize, (ID3D12Fence, u64)>,
+-    open: Vec<usize>,
++    open: Vec<Dead>,
+     sealed: VecDeque<Batch>,
+     last_seal: Option<Instant>,
+ }
+@@ -46,7 +50,7 @@ impl Held {
+ 
+     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
+     /// and take out the batches every queue is past: the resources to release now.
+-    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
++    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<Dead> {
+         if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
+             let mut marks = Vec::with_capacity(queues.len());
+             let mut ok = true;
+@@ -98,9 +102,10 @@ const IDLE_WAIT: Duration = Duration::from_micros(300);
+ /// `res` (an adopted resource) holds one reference that is now this module's. With no work in
+ /// flight it goes before this returns (the queues pass a fence value at once): a title that
+ /// frees the memory under a resource right after its last `Release` finds it unpinned, as
+-/// before. Otherwise the thread here lets it go.
+-pub unsafe fn hold(res: usize) {
+-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
++/// before. Otherwise the thread here lets it go. `memory`: the block XCL placed under it,
++/// given back (and its sparse tiles unpinned) only when it goes.
++pub unsafe fn hold(res: usize, memory: Option<usize>) {
++    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push((res, memory));
+     let start = Instant::now();
+     drain_known(true);
+     while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
+@@ -142,9 +147,15 @@ pub unsafe fn drain_known(seal_now: bool) {
+         None => return,
+     };
+     // (outside the lock: a release may end other objects, whose releases come back here)
+-    for res in gone {
++    for (res, memory) in gone {
++        // the queues are past the work that used it: its tiles and memory can go now (the
++        // tiles while it is still alive, so its address is no other resource's yet)
++        super::sparse::forget_buffer(res);
+         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
+         f(res as *mut c_void);
++        if let Some(p) = memory {
++            super::real::free_backing(p);
++        }
+     }
+ }
+ 
+@@ -180,7 +191,7 @@ mod tests {
+             let raw = res.unwrap().into_raw() as usize;
+ 
+             let mut held = Held::default();
+-            held.open.push(raw);
++            held.open.push((raw, None));
+             let queues = [queue.clone()];
+             assert!(held.drain(&queues, false).is_empty(), "the queue has not passed the batch's fence value");
+             std::thread::sleep(Duration::from_millis(100));
+@@ -194,7 +205,7 @@ mod tests {
+                 std::thread::sleep(Duration::from_millis(5));
+                 gone = held.drain(&queues, false);
+             }
+-            assert_eq!(gone, vec![raw], "released once the queue is past the batch");
++            assert_eq!(gone, vec![(raw, None)], "released once the queue is past the batch");
+             assert!(held.is_empty());
+             drop(ID3D12Resource::from_raw(raw as *mut c_void));
+         }
+@@ -204,8 +215,8 @@ mod tests {
+     #[test]
+     fn without_queues_a_batch_goes_at_once() {
+         let mut held = Held::default();
+-        held.open.push(0x1000);
+-        assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
++        held.open.push((0x1000, Some(0x2000)));
++        assert_eq!(unsafe { held.drain(&[], false) }, vec![(0x1000, Some(0x2000))]);
+         assert!(held.is_empty());
+     }
+ }
 diff --git a/crates/xcl/src/hle/d3d12x/list_x.rs b/crates/xcl/src/hle/d3d12x/list_x.rs
-index 2995f05..2cde570 100644
+index 2995f05..c566a82 100644
 --- a/crates/xcl/src/hle/d3d12x/list_x.rs
 +++ b/crates/xcl/src/hle/d3d12x/list_x.rs
-@@ -691,6 +691,7 @@ pub(super) fn on_queue_release(queue: usize) {
+@@ -64,6 +64,19 @@ const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
+ /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
+ const MAX_WRITTEN_RANGES: usize = 256;
+ 
++/// `GPU_WAIT_WATCHDOG_TIMEOUT`, or `XCL_GPU_WAIT_RELEASE_MS` (a value above 0). A release on the
++/// CPU lets the waiting queue go on before its producer has written the value: when the producer
++/// is only late (its list held while a pipeline is built), the consumer reads what was not
++/// written yet.
++fn gpu_wait_watchdog_timeout() -> Duration {
++    static T: OnceLock<Duration> = OnceLock::new();
++    *T.get_or_init(|| release_after(std::env::var("XCL_GPU_WAIT_RELEASE_MS").ok().as_deref()))
++}
++
++fn release_after(ms: Option<&str>) -> Duration {
++    ms.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map_or(GPU_WAIT_WATCHDOG_TIMEOUT, Duration::from_millis)
++}
++
+ fn wait_timeout() -> Duration {
+     static T: OnceLock<Duration> = OnceLock::new();
+     *T.get_or_init(|| {
+@@ -691,6 +704,7 @@ pub(super) fn on_queue_release(queue: usize) {
              }
          }
      }
@@ -3934,7 +4595,33 @@ index 2995f05..2cde570 100644
  }
  
  #[cfg(test)]
-@@ -1902,6 +1903,17 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
+@@ -766,6 +780,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
+ 
+ /// Clean up all tracked state when a command list is released for good.
+ pub(super) fn on_release(list: usize) {
++    super::alloc_pool::forget_list(list);
+     super::title_textures::list_reset(list);
+     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
+     if let Some(old) = old {
+@@ -1388,7 +1403,7 @@ fn wake_sync_watchdog() {
+                         let mut waiter_ty = -1i32;
+                         let before = cell.armed_waits.len();
+                         cell.armed_waits.retain(|aw| {
+-                            if aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
++                            if aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout() {
+                                 if aw.val >= max_exp {
+                                     max_exp = aw.val;
+                                     waiter_q = aw.waiting_queue;
+@@ -1438,7 +1453,7 @@ fn wake_sync_watchdog() {
+                 let pq = prod_q.map(queue_id);
+                 crate::xlog_warn!(
+                     "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
+-                    GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
++                    gpu_wait_watchdog_timeout().as_millis()
+                 );
+             }
+             if had_expired {
+@@ -1902,6 +1917,17 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
      super::cpu_writes::after(queue, writes);
  }
  
@@ -3952,7 +4639,7 @@ index 2995f05..2cde570 100644
  /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
  /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
  /// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
-@@ -2079,7 +2091,12 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
+@@ -2079,7 +2105,12 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
          // the title's own memory: written by the CPU once the GPU is there
          if super::cpu_writes::writable(va as usize, n as usize) {
              if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
@@ -3966,7 +4653,7 @@ index 2995f05..2cde570 100644
                  return;
              }
          }
-@@ -2216,22 +2233,17 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
+@@ -2216,22 +2247,17 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
      write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
  }
  
@@ -3995,7 +4682,19 @@ index 2995f05..2cde570 100644
          return None;
      }
      let ty = list_type(list);
-@@ -2407,7 +2419,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
+@@ -2293,8 +2319,9 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
+     let mut next_pc: Option<*mut c_void> = None;
+     if let Some(spare) = super::title_list::pop_spare(wrapper) {
+         let ext_spare = *(spare as *const usize);
+-        let pc_alloc = super::alloc_pool::for_list(spare as usize, alloc, ty.0);
+-        let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso);
++        let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
++            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
++        });
+         real::preserve_vtable(spare, ext_spare);
+         if reset_hr >= 0 {
+             next_pc = Some(spare);
+@@ -2407,7 +2434,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
      static SPLITS: AtomicU64 = AtomicU64::new(0);
      let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
      if n <= 4 || (n.is_power_of_two() && n <= 256) {
@@ -4004,7 +4703,7 @@ index 2995f05..2cde570 100644
      }
      Some(next_pc)
  }
-@@ -2417,8 +2429,8 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
+@@ -2417,8 +2444,8 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
  /// If an earlier write in the same open list already targeted an overlapping UMA range, the
  /// `COMMON -> COPY_DEST -> COMMON` barrier around that write already orders subsequent work
  /// on the GPU, so we do not stall before submission (which would deadlock waiting on our own
@@ -4015,7 +4714,7 @@ index 2995f05..2cde570 100644
  unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, value: u64, mask: u64, what: &str) {
      static N: AtomicU64 = AtomicU64::new(0);
      let n = width as u64;
-@@ -2438,19 +2450,21 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
+@@ -2438,19 +2465,21 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
      if comparison == D3D12_COMPARISON_FUNC_NEVER.0 as u32 {
          return warn(&N, what, format_args!("NEVER comparison at {va:#x} (skipped to avoid hang)"));
      }
@@ -4041,7 +4740,16 @@ index 2995f05..2cde570 100644
      let mut g = LISTS.lock().unwrap();
      let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
      let after_write64 = !s.write64_signals.is_empty();
-@@ -2839,6 +2853,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
+@@ -2833,12 +2862,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
+ 
+     let ext_closed = *(target as *const usize);
+     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
+-    let pc_alloc = super::alloc_pool::for_list(target as usize, alloc, list_type(target).0);
+-    let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso);
++    let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
++        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
++    });
+     real::preserve_vtable(target, ext_closed);
      if reset_hr < 0 {
          return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
      }
@@ -4049,7 +4757,34 @@ index 2995f05..2cde570 100644
      let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
      if let Some(b) = bindings {
          restore_bindings(target, &b, ty);
-@@ -3380,6 +3395,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
+@@ -3064,7 +3095,16 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
+         return t;
+     }
+     // in a window by number: a PC resource's GPU address
+-    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
++    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) {
++        return t;
++    }
++    // a buffer bound before has its mirror: no `readable` (a `VirtualQuery` walk of the title's
++    // memory when it is not resident – most of a retail title's render thread at a bind per
++    // draw); `sync_title_buffers` checks what it reads
++    if let Some(p) = mirror.then(|| mirrored(va, bytes)).flatten() {
++        return pc_va(p as u64);
++    }
++    if !crate::gpu::shader::readable(va as usize, bytes) {
+         return t;
+     }
+     if mirror {
+@@ -3374,12 +3414,14 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
+     let resolved = super::pso_async::resolve_for_bind(pso);
+     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
+     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
+-    let pc_alloc = super::alloc_pool::for_list(this as usize, alloc, ty);
+-    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved);
++    let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
++        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
++    });
+     real::preserve_vtable(this, ext);
      if hr < 0 {
          return hr;
      }
@@ -4057,7 +4792,61 @@ index 2995f05..2cde570 100644
  
      let is_bundle = {
          let mut g = LISTS.lock().unwrap();
-@@ -4976,6 +4992,7 @@ mod tests {
+@@ -3835,6 +3877,15 @@ mod tests {
+     use super::*;
+     use std::sync::Arc;
+ 
++    #[test]
++    fn a_gpu_wait_is_released_after_xcl_gpu_wait_release_ms_or_the_default() {
++        assert_eq!(release_after(None), GPU_WAIT_WATCHDOG_TIMEOUT);
++        assert_eq!(release_after(Some("180000")), Duration::from_secs(180));
++        assert_eq!(release_after(Some(" 750 ")), Duration::from_millis(750));
++        assert_eq!(release_after(Some("0")), GPU_WAIT_WATCHDOG_TIMEOUT, "0 keeps the default");
++        assert_eq!(release_after(Some("soon")), GPU_WAIT_WATCHDOG_TIMEOUT);
++    }
++
+     static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
+     static RESET_TEST_REPLACEMENT_VT: AtomicU64 = AtomicU64::new(0);
+ 
+@@ -3877,7 +3928,7 @@ mod tests {
+         let list = object.as_mut_ptr() as *mut c_void;
+         let key = list as usize;
+ 
+-        unsafe { on_create(list, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
++        unsafe { on_create(list, 0x111, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+         {
+             let mut g = LISTS.lock().unwrap();
+             let s = g.as_mut().unwrap().get_mut(&key).unwrap();
+@@ -3900,6 +3951,7 @@ mod tests {
+ 
+         RESET_TEST_HR.store(0x8000_4005, Ordering::SeqCst);
+         assert!(unsafe { reset_x(list, 0x333, 0x555) } < 0);
++        let failed_backing = super::super::alloc_pool::recording_backing_for_test(key);
+         assert_eq!(object[0], ext);
+         {
+             let g = LISTS.lock().unwrap();
+@@ -3920,6 +3972,7 @@ mod tests {
+ 
+         RESET_TEST_HR.store(0, Ordering::SeqCst);
+         assert_eq!(unsafe { reset_x(list, 0x333, 0x555) }, 0);
++        let successful_backing = super::super::alloc_pool::recording_backing_for_test(key);
+         assert_eq!(object[0], ext);
+         {
+             let g = LISTS.lock().unwrap();
+@@ -3936,6 +3989,12 @@ mod tests {
+ 
+         LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
+         super::super::bind::remove_state_for_test(list);
++        unsafe {
++            super::super::alloc_pool::forget(0x111);
++            super::super::alloc_pool::forget(0x333);
++        }
++        assert_eq!(failed_backing, Some(0x111), "failed Reset must keep holding the old recording's allocator");
++        assert_eq!(successful_backing, Some(0x333), "only successful Reset moves the recording to its new allocator");
+     }
+ 
+     #[test]
+@@ -4976,6 +5035,7 @@ mod tests {
              assert_ne!(*bottom_ts, 0);
  
              on_release(list_ptr as usize);
@@ -4065,7 +4854,7 @@ index 2995f05..2cde570 100644
          }
      }
  
-@@ -5665,6 +5682,125 @@ mod tests {
+@@ -5665,6 +5725,125 @@ mod tests {
          }
      }
  
@@ -4191,6 +4980,42 @@ index 2995f05..2cde570 100644
      /// Reproduces the exact intra-list fork-join pattern seen on retail compute queues:
      ///   q_compute list O_c: Write64(cell_A, frame) -> Wait64(cell_B >= frame) -> Write64(cell_C, frame)
      ///   q_direct  list O_d: Wait64(cell_A >= frame) -> Write64(cell_B, frame)
+@@ -5818,4 +5997,35 @@ mod tests {
+             }
+         }
+     }
++
++    /// A buffer outside unified memory that has a mirror is bound at its mirror again without
++    /// asking whether the title's memory is readable: the source made unreadable after the first
++    /// bind still binds the same mirror (before, the bind asked `readable` first and gave the
++    /// title's address back, which the PC's GPU has no address for).
++    #[test]
++    fn a_mirrored_buffer_binds_its_mirror_without_asking_readable() {
++        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
++        if crate::gpu::uma::get().is_none() {
++            crate::gpu::recomp::runner::skip_test("no unified memory");
++            return;
++        }
++        unsafe {
++            let len = 0x1_0000usize;
++            let src = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
++            assert!(!src.is_null());
++            for k in 0..len {
++                *src.add(k) = k as u8;
++            }
++            let (va, bytes) = (src as u64 + 0x100, 0x400usize);
++            let first = gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true);
++            assert_ne!(first, va, "the first bind makes a mirror");
++            assert!(mirrored(va, bytes).is_some());
++            let mut old = 0u32;
++            assert_ne!(VirtualProtect(src as *const _, len, PAGE_NOACCESS, &mut old), 0);
++            assert!(!crate::gpu::shader::readable(va as usize, bytes));
++            assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
++            // the range stays reserved (and unreadable): the mirror table is never emptied, so its
++            // address must not come back for another test's memory
++        }
++    }
+ }
 diff --git a/crates/xcl/src/hle/d3d12x/present.rs b/crates/xcl/src/hle/d3d12x/present.rs
 index 01b3c92..5cdeb6d 100644
 --- a/crates/xcl/src/hle/d3d12x/present.rs
@@ -4338,7 +5163,7 @@ index 01b3c92..5cdeb6d 100644
              x,
              y,
 diff --git a/crates/xcl/src/hle/d3d12x/pso_async.rs b/crates/xcl/src/hle/d3d12x/pso_async.rs
-index b303cf5..a070e64 100644
+index b303cf5..cdbd1d6 100644
 --- a/crates/xcl/src/hle/d3d12x/pso_async.rs
 +++ b/crates/xcl/src/hle/d3d12x/pso_async.rs
 @@ -9,7 +9,7 @@
@@ -4359,7 +5184,7 @@ index b303cf5..a070e64 100644
  }
  
  impl Pending {
-@@ -72,29 +74,82 @@ pub fn enabled() -> bool {
+@@ -72,29 +74,105 @@ pub fn enabled() -> bool {
  /// Builds the real pipeline: its raw pointer, 0 = failed.
  pub type Job = Box<dyn FnOnce() -> usize + Send>;
  
@@ -4382,8 +5207,34 @@ index b303cf5..a070e64 100644
 +    std::env::var("XCL_PSO_BUILD_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(4).clamp(1, 64)
 +}
 +
++/// The queued builds in three lanes, taken in this order: `urgent` (a bind is waiting), graphics,
++/// compute. Graphics pipelines go ahead of queued compute ones: a compute pipeline is waited for
++/// at its first bind anyway, while a graphics pipeline draws nothing until it is built.
++#[derive(Default)]
++struct Lanes {
++    urgent: std::collections::VecDeque<Arc<Pending>>,
++    gfx: std::collections::VecDeque<Arc<Pending>>,
++    compute: std::collections::VecDeque<Arc<Pending>>,
++}
++
++impl Lanes {
++    fn push(&mut self, compute: bool, front: bool, p: Arc<Pending>) {
++        if front {
++            self.urgent.push_back(p);
++        } else if compute {
++            self.compute.push_back(p);
++        } else {
++            self.gfx.push_back(p);
++        }
++    }
++
++    fn pop_next(&mut self) -> Option<Arc<Pending>> {
++        self.urgent.pop_front().or_else(|| self.gfx.pop_front()).or_else(|| self.compute.pop_front())
++    }
++}
++
 +struct WorkQ {
-+    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
++    list: Mutex<Lanes>,
 +    cv: Condvar,
 +}
 +
@@ -4410,7 +5261,7 @@ index b303cf5..a070e64 100644
 +                    let p = {
 +                        let mut g = q.list.lock().unwrap();
 +                        loop {
-+                            if let Some(p) = g.pop_front() {
++                            if let Some(p) = g.pop_next() {
 +                                break p;
 +                            }
 +                            g = q.cv.wait(g).unwrap();
@@ -4429,15 +5280,12 @@ index b303cf5..a070e64 100644
      })
  }
  
-+/// To the workers; `front`: ahead of everything queued (a bind is waiting for it).
++/// To the workers; `front`: ahead of everything queued (a bind is waiting for it); otherwise
++/// graphics pipelines are taken before compute ones.
 +fn enqueue(p: Arc<Pending>, front: bool) {
 +    let q = queue();
 +    let mut g = q.list.lock().unwrap();
-+    if front {
-+        g.push_front(p);
-+    } else {
-+        g.push_back(p);
-+    }
++    g.push(p.compute, front, p);
 +    drop(g);
 +    q.cv.notify_one();
 +}
@@ -4457,7 +5305,7 @@ index b303cf5..a070e64 100644
  /// Release a pipeline state XCL owns (raw pointer, 0 = none).
  pub fn release(p: usize) {
      if p != 0 {
-@@ -134,6 +189,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+@@ -134,6 +212,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
          key,
          used: Default::default(),
          orphan: Default::default(),
@@ -4465,7 +5313,7 @@ index b303cf5..a070e64 100644
      });
      PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
      static ONCE: std::sync::Once = std::sync::Once::new();
-@@ -141,7 +197,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+@@ -141,7 +220,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
          crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
      });
      if send {
@@ -4474,7 +5322,7 @@ index b303cf5..a070e64 100644
      } else if used::known(key) {
          if let Some(q) = preload() {
              q.list.lock().unwrap().push_back(p);
-@@ -288,6 +344,63 @@ fn preload() -> Option<&'static Preload> {
+@@ -288,6 +367,93 @@ fn preload() -> Option<&'static Preload> {
  mod used_tests {
      use super::*;
  
@@ -4500,6 +5348,36 @@ index b303cf5..a070e64 100644
 +        }
 +        assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
 +        let _ = released(standin);
++    }
++
++    /// Graphics builds are taken ahead of queued compute ones; a build a bind waits for, ahead of both.
++    #[test]
++    fn graphics_builds_dequeue_ahead_of_queued_compute_builds() {
++        let mk = |compute: bool| {
++            Arc::new(Pending {
++                job: Mutex::new(None),
++                sent: Default::default(),
++                real: AtomicUsize::new(0),
++                done: Mutex::new(false),
++                cv: Condvar::new(),
++                compute,
++                key: 0,
++                used: Default::default(),
++                orphan: Default::default(),
++                late: Default::default(),
++            })
++        };
++        let (c1, c2, g1, g2, u) = (mk(true), mk(true), mk(false), mk(false), mk(true));
++        let mut l = Lanes::default();
++        l.push(true, false, c1.clone());
++        l.push(true, false, c2.clone());
++        l.push(false, false, g1.clone());
++        l.push(false, false, g2.clone());
++        l.push(true, true, u.clone());
++        for want in [&u, &g1, &g2, &c1, &c2] {
++            assert!(Arc::ptr_eq(&l.pop_next().unwrap(), want));
++        }
++        assert!(l.pop_next().is_none());
 +    }
 +
 +    /// Prefetched pipelines build side by side on the workers, and a waiting bind does not build
@@ -4538,7 +5416,7 @@ index b303cf5..a070e64 100644
      #[test]
      fn the_keys_of_a_file_are_read_and_other_lines_passed_over() {
          let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
-@@ -331,7 +444,7 @@ pub fn resolve(pso: usize) -> usize {
+@@ -331,7 +497,7 @@ pub fn resolve(pso: usize) -> usize {
          0 => {
              // a lazy one is wanted now: to the workers
              if !p.sent.swap(true, Ordering::AcqRel) {
@@ -4547,7 +5425,7 @@ index b303cf5..a070e64 100644
              }
              pso
          }
-@@ -342,11 +455,27 @@ pub fn resolve(pso: usize) -> usize {
+@@ -342,11 +508,27 @@ pub fn resolve(pso: usize) -> usize {
  /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
  /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
  pub fn resolve_wait(pso: usize) -> usize {
@@ -4578,7 +5456,7 @@ index b303cf5..a070e64 100644
      }
      let mut done = p.done.lock().unwrap();
      while !*done {
-@@ -358,9 +487,54 @@ pub fn resolve_wait(pso: usize) -> usize {
+@@ -358,9 +540,54 @@ pub fn resolve_wait(pso: usize) -> usize {
      }
  }
  
@@ -4634,10 +5512,76 @@ index b303cf5..a070e64 100644
          Some(_) => resolve(pso),
          None => pso,
 diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
-index 5b01e85..e9fe6b0 100644
+index 5b01e85..54b4965 100644
 --- a/crates/xcl/src/hle/d3d12x/real.rs
 +++ b/crates/xcl/src/hle/d3d12x/real.rs
-@@ -3463,6 +3463,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
+@@ -138,6 +138,9 @@ static FALLBACK_PSO: AtomicU64 = AtomicU64::new(0);
+ static FAILED_PSO: AtomicU64 = AtomicU64::new(0);
+ static FALLBACK_RS: AtomicU64 = AtomicU64::new(0);
+ static TRANSLATED_PSO: AtomicU64 = AtomicU64::new(0);
++/// console MS containers moved from the AS slot and translated (logged sparsely: a title
++/// creates tens of thousands of these pipelines during boot)
++static AS_SLOT_MS: AtomicU64 = AtomicU64::new(0);
+ static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+ /// XCL shader ABI root signature on the backend device (raw, kept for the process lifetime)
+ static ABI_RS: AtomicUsize = AtomicUsize::new(0);
+@@ -1563,6 +1566,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+     } else {
+         f(this)
+     };
++    let mut memory = None;
+     if n == 0 {
+         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+             s.remove(&(this as usize));
+@@ -1576,24 +1580,38 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+             m.remove(&(this as usize));
+         }
+-        super::sparse::forget_buffer(this as usize);
++        // a held resource's tiles stay pinned until it goes (`late_release`)
++        if !held {
++            super::sparse::forget_buffer(this as usize);
++        }
+         super::vram::forget(this as usize);
+         super::title_textures::forget(this as usize);
+         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
+-        if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
+-            if u.is_sparse(p) {
+-                super::sparse::free(p);
+-            } else {
+-                u.free(p);
+-            }
+-        }
++        // the block XCL placed under it (not the title's own memory)
++        memory = match gone {
++            Some((p, _, true)) => Some(p),
++            _ => None,
++        };
+     }
+     if held {
+-        super::late_release::hold(this as usize);
++        // its memory goes with it: a queue may still be using it
++        super::late_release::hold(this as usize, memory);
++    } else if let Some(p) = memory {
++        free_backing(p);
+     }
+     n
+ }
+ 
++/// Give back the unified-memory or sparse-VRAM block XCL placed under a resource that is gone.
++pub(super) unsafe fn free_backing(p: usize) {
++    let Some(u) = crate::gpu::uma::get() else { return };
++    if u.is_sparse(p) {
++        super::sparse::free(p);
++    } else {
++        u.free(p);
++    }
++}
++
+ /// A stand-in pipeline released for good takes its background-built real pipeline with it.
+ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
+     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+@@ -3463,6 +3481,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
          PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
      }
      note_translated_compute(hr, ppv);
@@ -4648,7 +5592,7 @@ index 5b01e85..e9fe6b0 100644
      crate::xlog_info!(
          "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
          dxil.len(),
-@@ -3472,6 +3476,19 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
+@@ -3472,6 +3494,19 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
      Some(Ok(hr))
  }
  
@@ -4668,7 +5612,370 @@ index 5b01e85..e9fe6b0 100644
  /// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
  ///
  /// `COMPUTE_BLOBS` saves the second build of a program in one run; the first build of every
-@@ -4776,6 +4793,14 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
+@@ -3482,7 +3517,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
+ /// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
+ /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
+ /// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
+-mod driver_cache {
++pub(crate) mod driver_cache {
+     use std::path::{Path, PathBuf};
+     use std::sync::atomic::{AtomicU64, Ordering};
+ 
+@@ -3523,16 +3558,36 @@ mod driver_cache {
+         }
+     }
+ 
++    fn create_staging_file(p: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
++        static NEXT: AtomicU64 = AtomicU64::new(0);
++        create_staging_file_with(p, &NEXT)
++    }
++
++    fn create_staging_file_with(p: &Path, next: &AtomicU64) -> std::io::Result<(PathBuf, std::fs::File)> {
++        loop {
++            let tmp = p.with_extension(format!("tmp{}-{}", std::process::id(), next.fetch_add(1, Ordering::Relaxed)));
++            match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
++                Ok(file) => return Ok((tmp, file)),
++                // A prior process with this PID may have left a file behind. It is not ours.
++                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
++                Err(e) => return Err(e),
++            }
++        }
++    }
++
+     /// `bytes` to `p`, under another name first: a run that is cut short leaves no half file.
+     pub fn write(p: &Path, bytes: &[u8]) -> bool {
++        use std::io::Write;
+         if bytes.is_empty() {
+             return false;
+         }
+         if let Some(dir) = p.parent() {
+             let _ = std::fs::create_dir_all(dir);
+         }
+-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+-        let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, p).is_ok();
++        let Ok((tmp, mut file)) = create_staging_file(p) else { return false };
++        let written = file.write_all(bytes).is_ok();
++        drop(file);
++        let ok = written && std::fs::rename(&tmp, p).is_ok();
+         if !ok {
+             let _ = std::fs::remove_file(&tmp);
+         }
+@@ -3553,6 +3608,11 @@ mod driver_cache {
+     mod tests {
+         use super::*;
+ 
++        struct Directory(PathBuf);
++        impl Drop for Directory {
++            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
++        }
++
+         #[test]
+         fn a_file_is_named_after_its_dxil_and_flags() {
+             assert_eq!(name(b"abc", 0), name(b"abc", 0));
+@@ -3581,6 +3641,44 @@ mod driver_cache {
+             assert_eq!(load(&p), None);
+             let _ = std::fs::remove_dir_all(&dir);
+         }
++
++        #[test]
++        fn an_overlapping_writer_cannot_modify_the_published_blob() {
++            use std::io::Write;
++            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-overlap-{}", std::process::id()));
++            std::fs::create_dir(&dir).unwrap();
++            let _directory = Directory(dir.clone());
++            let p = dir.join("program.pso");
++            // Another writer, paused after the production staging-file creation step.
++            let (_other_tmp, mut other) = create_staging_file(&p).unwrap();
++            let complete = b"complete second blob";
++            assert!(write(&p, complete));
++            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()));
++            // Resuming the older writer must not change a file already published by this
++            // invocation, even when the older payload is shorter than the newer one.
++            other.write_all(b"old").unwrap();
++            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()), "published bytes must not alias another writer's staging file");
++        }
++
++        #[test]
++        fn an_abandoned_staging_file_is_skipped_and_preserved() {
++            use std::io::Write;
++            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-stale-{}", std::process::id()));
++            std::fs::create_dir(&dir).unwrap();
++            let _directory = Directory(dir.clone());
++            let p = dir.join("program.pso");
++            let occupied = p.with_extension(format!("tmp{}-0", std::process::id()));
++            std::fs::write(&occupied, b"not ours").unwrap();
++            let next = AtomicU64::new(0);
++            let (tmp, mut file) = create_staging_file_with(&p, &next).unwrap();
++            assert_eq!(next.load(Ordering::Relaxed), 2, "the occupied candidate was passed over");
++            assert_ne!(tmp, occupied);
++            file.write_all(b"ours").unwrap();
++            drop(file);
++            std::fs::rename(&tmp, &p).unwrap();
++            assert_eq!(load(&p).as_deref(), Some(b"ours".as_slice()));
++            assert_eq!(std::fs::read(&occupied).unwrap(), b"not ours");
++        }
+     }
+ }
+ 
+@@ -4265,6 +4363,149 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
+     hr
+ }
+ 
++/// The mesh and amplification shaders of a stream, as XCL translates them: a console MS
++/// container in the AS slot with no MS subobject (a retail game's minimap pipelines) is the
++/// mesh shader it says it is. It used to be refused – translated, the title rendered nothing
++/// from then on, which was the translated mesh shaders failing their output budget (ms_6_6),
++/// not the slot. With the chunk budget fixed they translate and the title keeps rendering.
++/// Returns (MS to translate, AS left): the moved shader is not an AS any more.
++fn mesh_shader_slots<'a>(ms_slot: Option<&'a [u8]>, as_slot: Option<&'a [u8]>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
++    use crate::gpu::recomp::pso::is_console;
++    match (ms_slot, as_slot) {
++        (None, Some(a)) if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") => (Some(a), None),
++        (ms, a) => (ms, a),
++    }
++}
++
++#[cfg(test)]
++mod mesh_slot_tests {
++    use super::{console_ms_in_as_slot, fallback_stream, mesh_shader_slots};
++    use crate::gpu::xbox::tests::{sample, fssm, CODE};
++
++    /// A stream subobject: its type, then the payload at 4 (align 4) or 8 (align 8).
++    fn sub(ty: u32, payload: &[u8]) -> Vec<u8> {
++        let (_, palign) = super::super::null::subobject_payload(ty).unwrap();
++        let poff = if palign == 8 { 8 } else { 4 };
++        let mut b = vec![0u8; (poff + payload.len() + 7) & !7];
++        b[..4].copy_from_slice(&ty.to_le_bytes());
++        b[poff..poff + payload.len()].copy_from_slice(payload);
++        b
++    }
++
++    fn bytecode(s: &[u8]) -> Vec<u8> {
++        let mut b = Vec::new();
++        b.extend_from_slice(&(s.as_ptr() as u64).to_le_bytes());
++        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
++        b
++    }
++
++    /// The stream the retail title's AS-slot MS pipelines have: a console MS container in the
++    /// AS subobject, no MS subobject, a PS and the graphics state (`mesh_shader_slots` moves it).
++    fn as_slot_ms_stream(ms: &[u8], ps: &[u8]) -> Vec<u8> {
++        let mut s = sub(0, &0u64.to_le_bytes()); // ROOT_SIGNATURE: null
++        s.extend_from_slice(&sub(24, &bytecode(ms)));
++        s.extend_from_slice(&sub(2, &bytecode(ps)));
++        s.extend_from_slice(&sub(8, &vec![0u8; 328])); // BLEND
++        s.extend_from_slice(&sub(9, &u32::MAX.to_le_bytes())); // SAMPLE_MASK
++        s.extend_from_slice(&sub(10, &vec![0u8; 44])); // RASTERIZER
++        s.extend_from_slice(&sub(11, &vec![0u8; 52])); // DEPTH_STENCIL
++        s.extend_from_slice(&sub(15, &vec![0u8; 36])); // RENDER_TARGET_FORMATS
++        s.extend_from_slice(&sub(17, &[1, 0, 0, 0, 0, 0, 0, 0])); // SAMPLE_DESC
++        s
++    }
++
++    /// The stand-in for a console MS alone in the AS slot is a mesh pipeline: the subobject is
++    /// retyped to MS with the dummy MS (as `translated_mesh_stream` reads the title's stream),
++    /// the PS is the dummy PS. Left an empty AS and a PS, the stream had neither an MS nor a VS
++    /// and the driver refused it (E_INVALIDARG, NishantParajuli's and Chrysana's runs).
++    #[test]
++    fn the_stand_in_of_a_moved_ms_is_a_mesh_pipeline() {
++        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
++        let ps = b"DXBC-a-pixel-shader".to_vec();
++        let stream = as_slot_ms_stream(&ms, &ps);
++        let desc = [stream.len(), stream.as_ptr() as usize];
++        let subs = super::stream_subobjects(&stream).unwrap();
++        assert!(unsafe { console_ms_in_as_slot(&subs) });
++        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
++        let out = super::stream_subobjects(&buf).unwrap();
++        assert!(!out.iter().any(|s| s.0 == 24), "no AS subobject left");
++        let m = out.iter().find(|s| s.0 == 25).expect("an MS subobject");
++        let dm = super::dummy_mesh().expect("DXC for the stand-in shaders");
++        let got = unsafe { super::payload_shader(m.1) }.unwrap();
++        assert_eq!(got, dm.0.as_slice(), "the dummy MS");
++        let p = out.iter().find(|s| s.0 == 2).unwrap();
++        assert_eq!(unsafe { super::payload_shader(p.1) }.unwrap(), dm.1.as_slice(), "the dummy PS");
++        // a real AS with no MS is not moved, and its stand-in keeps the AS slot empty
++        let as_ = sample(14, &[fssm(&CODE, &[(8, 14)])]);
++        let stream = as_slot_ms_stream(&as_, &ps);
++        let desc = [stream.len(), stream.as_ptr() as usize];
++        assert!(!unsafe { console_ms_in_as_slot(&super::stream_subobjects(&stream).unwrap()) });
++        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.unwrap();
++        let out = super::stream_subobjects(&buf).unwrap();
++        assert!(out.iter().any(|s| s.0 == 24) && !out.iter().any(|s| s.0 == 25));
++    }
++
++    /// The stand-in's target formats are the PC's, as the real pipeline's: the console's
++    /// D16_UNORM_S8_UINT (118) is D24_UNORM_S8_UINT (45) and a B4G4R4A4 target (115) is
++    /// R8G8B8A8 (28). With the console's the driver refuses the stand-in (the title's depth-only
++    /// mesh pipelines; NishantParajuli's follow-up, reproduced natively by thehollowedone).
++    #[test]
++    fn the_stand_in_of_a_stream_has_the_pcs_target_formats() {
++        let mut s = sub(15, &{
++            let mut p = Vec::new();
++            for f in [115u32, 28, 0, 0, 0, 0, 0, 0, 2] {
++                p.extend_from_slice(&f.to_le_bytes());
++            }
++            p
++        });
++        s.extend_from_slice(&sub(16, &118u32.to_le_bytes()));
++        let desc = [s.len(), s.as_ptr() as usize];
++        let (out, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
++        let subs = super::stream_subobjects(&out).unwrap();
++        let word = |p: &[u8], k: usize| u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap());
++        assert_eq!((subs[0].0, word(subs[0].1, 0), word(subs[0].1, 1), word(subs[0].1, 8)), (15, 28, 28, 2));
++        assert_eq!((subs[1].0, word(subs[1].1, 0)), (16, 45));
++    }
++
++    /// A console MS container alone in the AS slot becomes the MS; a real AS (console or PC),
++    /// an MS already present, or a PC shader in the AS slot are left as they are.
++    #[test]
++    fn a_console_ms_in_the_as_slot_is_the_mesh_shader() {
++        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
++        let as_ = sample(14, &[fssm(&CODE, &[(8, 14)])]);
++        let pc = b"DXBC-not-a-console-container".to_vec();
++        // MS in the AS slot, no MS: moved, and not an AS any more
++        let (m, a) = mesh_shader_slots(None, Some(&ms));
++        assert!(m.is_some_and(|m| std::ptr::eq(m, ms.as_slice())) && a.is_none());
++        // an MS present: both slots untouched, whatever the AS holds
++        let (m, a) = mesh_shader_slots(Some(&ms), Some(&as_));
++        assert!(m.is_some_and(|m| std::ptr::eq(m, ms.as_slice())) && a.is_some_and(|a| std::ptr::eq(a, as_.as_slice())));
++        // a console AS (not an MS) stays in the AS slot
++        let (m, a) = mesh_shader_slots(None, Some(&as_));
++        assert!(m.is_none() && a.is_some_and(|a| std::ptr::eq(a, as_.as_slice())));
++        // a PC shader in the AS slot stays too
++        let (m, a) = mesh_shader_slots(None, Some(&pc));
++        assert!(m.is_none() && a.is_some());
++        // nothing: nothing
++        assert!(mesh_shader_slots(None, None) == (None, None));
++    }
++
++    /// The cached-only attempt defers a moved MS like a console compute pipeline: `defer`
++    /// marks the attempt missed, so `dev_create_pipeline_state` takes the background path
++    /// (stand-in now, translation on the worker / first bind) instead of translating on the
++    /// title's thread – tens of thousands of these pipelines during boot delayed the intro
++    /// by seconds on NVIDIA and past a minute on AMD wave64. Outside the attempt (the
++    /// worker's build) nothing is deferred.
++    #[test]
++    fn a_moved_ms_defers_in_the_attempt_only() {
++        let (_, missed) = crate::gpu::recomp::dxc::cached_only(|| {
++            assert!(crate::gpu::recomp::dxc::defer(), "inside the attempt: deferred");
++        });
++        assert!(missed, "the attempt is missed: the caller takes the background path");
++        assert!(!crate::gpu::recomp::dxc::defer(), "outside: the build translates");
++    }
++}
++
+ /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
+ /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
+ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+@@ -4279,17 +4520,11 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
+     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
+     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
+     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
+-    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
+-    // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
+-    // from then on (a black screen every run); refused, it goes on to its menus. What it
+-    // expects of them is not known yet.
+-    if let (None, Some(a)) = (ms_slot, as_slot) {
+-        if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
+-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
+-            return Some(E_INVALIDARG);
+-        }
+-    }
+-    let ms = ms_slot?;
++    // a console MS in the AS slot with no MS subobject: moved, and translated when first
++    // bound (below), not on the title's thread for each of tens of thousands
++    let moved = ms_slot.is_none();
++    let (ms, as_slot) = mesh_shader_slots(ms_slot, as_slot);
++    let Some(ms) = ms else { return None };
+     if !is_console(ms) {
+         return None;
+     }
+@@ -4302,6 +4537,21 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
+         ));
+         return Some(E_INVALIDARG);
+     }
++    // In the cached-only attempt (non-blocking creation) a moved MS is not translated here:
++    // the title creates tens of thousands of these during boot and uses few; translating each
++    // on the calling thread delayed the intro by seconds (NVIDIA) or past a minute (AMD wave64,
++    // the split path). Made when first bound (`pso_async::lazy`), like a console compute
++    // pipeline: the attempt defers, `go_background` hands the title a stand-in and the worker
++    // (or the bind) runs this path again outside cached-only.
++    if moved && super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
++        return Some(E_INVALIDARG);
++    }
++    if moved {
++        let n = AS_SLOT_MS.fetch_add(1, Ordering::Relaxed);
++        if n < 5 || n % 1000 == 0 {
++            crate::xlog_info!("D3D12.X: mesh pipeline with its MS {:016x} in the AS slot – translated as MS (#{})", crate::gpu::shader::fnv64(ms), n + 1);
++        }
++    }
+     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
+         (Ok(tp), Ok(ps)) => (tp, ps),
+@@ -4413,6 +4663,25 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
+     finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+ }
+ 
++/// The subobject type a retail game gives its console MS: the PC's AS slot (24).
++const CONSOLE_MS: u32 = 24;
++
++/// Index in `subs` of the MS of a stream that numbers it the console's way (`CONSOLE_MS`):
++/// a console MS container there and no PC MS (25) in the stream.
++unsafe fn console_numbered_ms(subs: &[(u32, &[u8])]) -> Option<usize> {
++    if subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32) {
++        return None;
++    }
++    let k = subs.iter().position(|s| s.0 == CONSOLE_MS)?;
++    let b = payload_shader(subs[k].1)?;
++    (crate::gpu::recomp::pso::is_console(b) && crate::gpu::xbox::parse(b).is_some_and(|sh| sh.stage == "MS")).then_some(k)
++}
++
++/// A console MS container in the stream's AS subobject and no MS subobject (`mesh_shader_slots`).
++unsafe fn console_ms_in_as_slot(subs: &[(u32, &[u8])]) -> bool {
++    console_numbered_ms(subs).is_some()
++}
++
+ /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
+ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
+     let size = *(desc as *const usize);
+@@ -4422,7 +4691,12 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
+     }
+     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
+     let d = dummy();
+-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
++    // A console MS alone in the AS slot is the stream's mesh shader (`mesh_shader_slots`), so its
++    // stand-in is a mesh pipeline too, with the dummy MS in that subobject as an MS. Left an AS
++    // without a shader, the stream had a PS and neither an MS nor a VS: the driver refused it
++    // (E_INVALIDARG) and every such pipeline was built in the title's call (NishantParajuli).
++    let ms_in_as = stream_subobjects(&buf).is_some_and(|subs| console_ms_in_as_slot(&subs));
++    let mesh = ms_in_as || stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+     let dm = if mesh { Some(dummy_mesh()?) } else { None };
+     let mut off = 0usize;
+     while off + 8 <= size {
+@@ -4441,8 +4715,22 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
+             1 => put(&mut buf, &d.vs),
+             2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
+             6 => put(&mut buf, &d.cs),
++            24 if ms_in_as => {
++                buf[off..off + 4].copy_from_slice(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).to_le_bytes());
++                put(&mut buf, &dm?.0)
++            }
+             3 | 4 | 5 | 24 => put(&mut buf, &[]),
+             25 => put(&mut buf, &dm?.0),
++            // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's, as
++            // the real pipeline gets them (`translated_mesh_stream`) – with a console-only one
++            // (a retail game's depth-only mesh pipelines: D16_UNORM_S8_UINT) the driver refuses
++            // the stand-in (E_INVALIDARG) and the pipeline is built in the title's call
++            15 | 16 => {
++                for k in 0..if ty == 15 { 8 } else { 1 } {
++                    let f = super::device_x::pc_target_format(u32::from_le_bytes(buf[at + 4 * k..at + 4 * k + 4].try_into().ok()?));
++                    buf[at + 4 * k..at + 4 * k + 4].copy_from_slice(&f.to_le_bytes());
++                }
++            }
+             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
+             7 => buf[at..at + 32].fill(0),        // stream output
+             _ => {}
+@@ -4776,6 +5064,14 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
      }
      if n > 0 && !rtvs.is_null() {
          super::present::note_rt0(this as usize, *rtvs);
@@ -4683,6 +5990,525 @@ index 5b01e85..e9fe6b0 100644
          if super::present::trace_frame() {
              for k in 0..n as usize {
                  let h = if single != 0 { *rtvs + k * 32 } else { *rtvs.add(k) };
+@@ -5307,6 +5603,79 @@ mod rect_list_pso_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod console_ms_stream_tests {
++    use super::*;
++    use crate::gpu::xbox::tests::{fssm, sample, CODE};
++
++    /// A console MS container (DXIL kind 13, NGG hardware stage, API stage MS).
++    fn console_ms() -> Vec<u8> {
++        sample(13, &[fssm(&CODE, &[(7, 6)])])
++    }
++
++    /// The title's mesh stream layout: RS, the MS at `ms_type`, PS, null DS / HS / GS, sample mask.
++    fn stream(ms_type: u32, ms: &[u8], extra_pc_ms: Option<&[u8]>) -> StreamOut {
++        let mut s = StreamOut::default();
++        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &0usize);
++        s.raw(ms_type, &[(ms.as_ptr() as u64).to_le_bytes(), (ms.len() as u64).to_le_bytes()].concat(), true);
++        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &[]);
++        for ty in [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS] {
++            s.put(ty, &D3D12_SHADER_BYTECODE::default());
++        }
++        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &u32::MAX);
++        if let Some(m) = extra_pc_ms {
++            s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, m);
++        }
++        s
++    }
++
++    /// An MS container at 24 in a stream without a 25 is the stream's MS; one at 24 next to a PC
++    /// MS (25) is not, and neither is another console stage or a PC shader at 24.
++    #[test]
++    fn a_console_ms_at_24_without_a_pc_ms_is_the_streams_ms() {
++        let ms = console_ms();
++        let ps = sample(0, &[fssm(&CODE, &[(5, 1)])]);
++        let pc = vec![0x44u8; 64];
++        unsafe {
++            let s = stream(CONSOLE_MS, &ms, None);
++            let subs = stream_subobjects(&s.0).expect("a stream XCL can read");
++            assert_eq!(console_numbered_ms(&subs), Some(1));
++            assert_eq!(payload_shader(subs[1].1), Some(&ms[..]));
++            let both = stream(CONSOLE_MS, &ms, Some(&ms));
++            assert_eq!(console_numbered_ms(&stream_subobjects(&both.0).unwrap()), None);
++            for other in [&ps, &pc] {
++                let s = stream(CONSOLE_MS, other, None);
++                assert_eq!(console_numbered_ms(&stream_subobjects(&s.0).unwrap()), None);
++            }
++            let at_25 = stream(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32, &ms, None);
++            assert_eq!(console_numbered_ms(&stream_subobjects(&at_25.0).unwrap()), None);
++        }
++    }
++
++    /// The stand-in of such a stream is a PC mesh stream: the stand-in MS at 25, nothing at 24
++    /// (before, 24 was emptied and the stream had no shader stage: the driver refused it, and the
++    /// title's pipelines were all built in the call).
++    #[test]
++    fn the_stand_in_of_a_console_numbered_stream_has_a_pc_ms() {
++        if crate::gpu::recomp::dxc::location().is_err() {
++            crate::gpu::recomp::runner::skip_test("no DXC");
++            return;
++        }
++        let ms = console_ms();
++        let s = stream(CONSOLE_MS, &ms, None);
++        let desc: [usize; 2] = [s.0.len(), s.0.as_ptr() as usize];
++        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
++        let subs = stream_subobjects(&buf).unwrap();
++        let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
++        assert_eq!(types, [0, 25, 2, 3, 4, 5, 9]);
++        let dm = dummy_mesh().expect("stand-in mesh shaders");
++        unsafe {
++            assert_eq!(payload_shader(subs[1].1), Some(&dm.0[..]));
++            assert_eq!(payload_shader(subs[2].1), Some(&dm.1[..]));
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod this_first_tests {
+     use super::*;
+@@ -5765,3 +6134,63 @@ mod console_format_query_tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod held_release_tests {
++    use super::*;
++    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
++
++    /// A resource whose last `Release` is held (a queue still has work) keeps the unified memory
++    /// XCL placed under it until the hold ends: given back at the title's `Release`, the block
++    /// could go to the next allocation while the GPU still used it.
++    #[test]
++    fn a_held_resource_keeps_its_unified_memory_until_it_goes() {
++        unsafe {
++            if !super::super::late_release::enabled() {
++                return;
++            }
++            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
++                return crate::gpu::recomp::runner::skip_test("no GPU");
++            };
++            let Some(u) = crate::gpu::uma::get() else {
++                return crate::gpu::recomp::runner::skip_test("no GPU");
++            };
++            // a queue with work in flight (it waits for a fence nobody has signalled yet) that
++            // the title has submitted to: late release waits for the queues it knows
++            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
++            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
++            queue.Wait(&gate, 1).unwrap();
++            super::super::present::note_execute(queue.as_raw(), &[]);
++
++            let desc = D3D12_RESOURCE_DESC {
++                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++                Width: 4096,
++                Height: 1,
++                DepthOrArraySize: 1,
++                MipLevels: 1,
++                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++                ..Default::default()
++            };
++            let mut res: Option<ID3D12Resource> = None;
++            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
++            let raw = res.unwrap().into_raw();
++            adopt(raw, Kind::Resource);
++            // the block XCL placed under it, recorded as `place_console_buffer` does
++            let p = u.alloc(0x1_0000, crate::gpu::uma::GRAIN).expect("unified memory") as usize;
++            UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(raw as usize, (p, 0x1_0000, true));
++
++            // the title's last Release, while the queue still has work
++            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw as *const *const usize)).add(2));
++            assert_eq!(release(raw), 0);
++            assert!(u.is_allocated(p), "the block under a held resource went back while a queue still had work");
++
++            gate.Signal(1).unwrap();
++            let start = std::time::Instant::now();
++            while u.is_allocated(p) && start.elapsed() < std::time::Duration::from_secs(10) {
++                std::thread::sleep(std::time::Duration::from_millis(5));
++            }
++            assert!(!u.is_allocated(p), "the block goes back once the held resource goes");
++        }
++    }
++}
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index c6b600b..91b8a2e 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -34,6 +34,9 @@ use windows_sys::Win32::System::Memory::{
+ const TILE: usize = 0x1_0000;
+ /// tiles of a video-memory pool heap (64 MiB)
+ const POOL_TILES: u32 = 1024;
++/// tiles decommitted while no title work was submitted that stay mapped (`State::parked`) before
++/// they are unmapped together: 256 MB of video memory
++const PARKED_MAX: usize = 4096;
+ /// bytes of the ring-buffered upload staging buffer
+ const STAGING: usize = 64 << 20;
+ /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
+@@ -216,6 +219,13 @@ struct State {
+     mapped: FxHashMap<usize, TileEntry>,
+     /// pool tiles also used by placed buffers (not freed while they are)
+     pinned: FxHashMap<(u32, u32), u32>,
++    /// tile address → pool tile of tiles decommitted since the last title submit, still mapped
++    /// in their window: unmapped together (`flush_parked`) before the next submit, when the free
++    /// list runs out, or past `PARKED_MAX`; a commit there before that takes its tile back with
++    /// no new mapping. (A retail title moving physical pages one at a time while it loads
++    /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
++    /// took ~0.15 ms.)
++    parked: FxHashMap<usize, (u32, u32)>,
+     /// placed buffers → the pool tiles they use
+     buffers: FxHashMap<usize, Vec<(u32, u32)>>,
+     /// reused tiles / decommitted partial pages to clear: (address, bytes)
+@@ -529,6 +539,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
+             retired: Vec::new(),
+             mapped: FxHashMap::default(),
+             pinned: FxHashMap::default(),
++            parked: FxHashMap::default(),
+             buffers: FxHashMap::default(),
+             to_zero: Vec::new(),
+             staging: None,
+@@ -574,6 +585,9 @@ impl State {
+     }
+ 
+     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
++        if self.free.is_empty() {
++            self.flush_parked();
++        }
+         if let Some(t) = self.free.pop() {
+             return Some((t, true));
+         }
+@@ -741,16 +755,25 @@ impl State {
+         let first = a & !(TILE - 1);
+         let end = a.saturating_add(n);
+         let mut new: Vec<(usize, (u32, u32))> = Vec::new();
++        let mut unparked = false;
+         let mut t = first;
+         while t < end {
+             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
+-                let Some((tile, reused)) = self.take_tile() else { break };
+-                self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
+-                self.runs = None;
+-                if reused {
++                // still mapped there: no new mapping, what it held is cleared
++                if let Some(tile) = self.parked.remove(&t) {
++                    self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
++                    self.runs = None;
+                     self.to_zero.push((t, TILE));
++                    unparked = true;
++                } else {
++                    let Some((tile, reused)) = self.take_tile() else { break };
++                    self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
++                    self.runs = None;
++                    if reused {
++                        self.to_zero.push((t, TILE));
++                    }
++                    new.push((t, tile));
+                 }
+-                new.push((t, tile));
+             }
+             match t.checked_add(TILE) {
+                 Some(next) => t = next,
+@@ -758,6 +781,9 @@ impl State {
+             }
+         }
+         if new.is_empty() {
++            if unparked {
++                MAPPED_GEN.fetch_add(1, Ordering::Release);
++            }
+             return;
+         }
+         MAPPED_GEN.fetch_add(1, Ordering::Release);
+@@ -1282,24 +1308,7 @@ pub unsafe fn committed(a: usize, n: usize) {
+         early_add(&mut EARLY.lock().unwrap(), start, end);
+         return;
+     };
+-    s.ensure_mapped(a, n, |_| 0xFFFF);
+-    let mut pg = a & !(PAGE - 1);
+-    let end = a.saturating_add(n);
+-    while pg < end {
+-        let t = pg & !(TILE - 1);
+-        let tile_end = t.saturating_add(TILE).min(end);
+-        if let Some(entry) = s.mapped.get_mut(&t) {
+-            let mut p = pg;
+-            while p < tile_end {
+-                entry.holes &= !(1u16 << ((p - t) / PAGE));
+-                p += PAGE;
+-            }
+-        }
+-        if tile_end <= pg {
+-            break;
+-        }
+-        pg = tile_end;
+-    }
++    s.commit_range(a, n);
+ }
+ 
+ /// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
+@@ -1315,33 +1324,93 @@ pub unsafe fn decommitted(a: usize, n: usize) {
+         early_remove(&mut EARLY.lock().unwrap(), start, end);
+         return;
+     };
+-    let tiles = decommit_tiles(&mut s.mapped, &s.pinned, &mut s.free, &mut s.to_zero, a, n);
+-    if tiles.is_empty() {
+-        return;
+-    }
+-    s.runs = None;
+-    let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+-    for &t in &tiles {
+-        if let Some(wi) = s.window_index(t) {
+-            by_window.entry(wi).or_default().push(t);
++    s.decommit_range(a, n);
++}
++
++impl State {
++    /// `committed` with the state locked
++    unsafe fn commit_range(&mut self, a: usize, n: usize) {
++        self.ensure_mapped(a, n, |_| 0xFFFF);
++        let mut pg = a & !(PAGE - 1);
++        let end = a.saturating_add(n);
++        while pg < end {
++            let t = pg & !(TILE - 1);
++            let tile_end = t.saturating_add(TILE).min(end);
++            if let Some(entry) = self.mapped.get_mut(&t) {
++                let mut p = pg;
++                while p < tile_end {
++                    entry.holes &= !(1u16 << ((p - t) / PAGE));
++                    p += PAGE;
++                }
++            }
++            if tile_end <= pg {
++                break;
++            }
++            pg = tile_end;
+         }
+     }
+-    for (wi, ts) in by_window {
+-        let (b, r) = (s.windows[wi].0, s.windows[wi].1.clone());
+-        s.unmap_tiles(&r, b, &ts);
++
++    /// `decommitted` with the state locked: the tiles that go are parked (`flush_parked` unmaps
++    /// them and frees their pool tiles)
++    unsafe fn decommit_range(&mut self, a: usize, n: usize) {
++        let mut pools: Vec<(usize, (u32, u32))> = Vec::new();
++        let mut t = a & !(TILE - 1);
++        let end = a.saturating_add(n);
++        while t < end {
++            if let Some(e) = self.mapped.get(&t) {
++                pools.push((t, e.pool));
++            }
++            match t.checked_add(TILE) {
++                Some(next) => t = next,
++                None => break,
++            }
++        }
++        let tiles = decommit_tiles(&mut self.mapped, &self.pinned, &mut Vec::new(), &mut self.to_zero, a, n);
++        if tiles.is_empty() {
++            return;
++        }
++        self.runs = None;
++        for &t in &tiles {
++            if let Ok(i) = pools.binary_search_by_key(&t, |p| p.0) {
++                self.parked.insert(t, pools[i].1);
++            }
++        }
++        MAPPED_GEN.fetch_add(1, Ordering::Release);
++        if self.parked.len() >= PARKED_MAX && self.flush_parked() {
++            self.retire_free_pools();
++        }
+     }
+-    MAPPED_GEN.fetch_add(1, Ordering::Release);
+-    s.signal();
+-    s.retire_free_pools();
+-}
+ 
+-impl State {
+-    /// a pool tile no window maps and no buffer uses goes back to the free list
++    /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
+     fn release_if_unused(&mut self, tile: (u32, u32)) {
+-        if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) {
++        if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) && !self.parked.values().any(|&p| p == tile) {
+             self.free.push(tile);
+         }
+     }
++
++    /// The parked tiles unmapped from their windows (one call per window) and their pool tiles
++    /// free (but those of placed buffers). Pools left all free are not retired here: callers do
++    /// that (`retire_free_pools`) unless they take a tile right away.
++    unsafe fn flush_parked(&mut self) -> bool {
++        if self.parked.is_empty() {
++            return false;
++        }
++        let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
++        for (t, tile) in std::mem::take(&mut self.parked) {
++            if let Some(wi) = self.window_index(t) {
++                by_window.entry(wi).or_default().push(t);
++            }
++            if !self.pinned.contains_key(&tile) {
++                self.free.push(tile);
++            }
++        }
++        for (wi, ts) in by_window {
++            let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
++            self.unmap_tiles(&r, b, &ts);
++        }
++        self.signal();
++        true
++    }
+ }
+ 
+ /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
+@@ -1381,6 +1450,10 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page:
+     let t0 = std::time::Instant::now();
+     let mut g = STATE.lock().unwrap();
+     let Some(s) = g.as_mut() else { return };
++    // the title's work sees what was decommitted unmapped, as it was
++    if s.flush_parked() {
++        s.retire_free_pools();
++    }
+     let t_locked = std::time::Instant::now();
+     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
+     let zero_runs = std::mem::take(&mut s.to_zero);
+@@ -1581,6 +1654,7 @@ mod tests {
+                 pools: Vec::new(),
+                 free: Vec::new(),
+                 retired: Vec::new(),
++                parked: FxHashMap::default(),
+                 mapped: FxHashMap::default(),
+                 pinned: FxHashMap::default(),
+                 buffers: FxHashMap::default(),
+@@ -1788,6 +1862,7 @@ mod tests {
+                 retired: Vec::new(),
+                 mapped: FxHashMap::default(),
+                 pinned: FxHashMap::default(),
++                parked: FxHashMap::default(),
+                 buffers: FxHashMap::default(),
+                 to_zero: Vec::new(),
+                 staging: None,
+@@ -1836,6 +1911,121 @@ mod tests {
+         }
+     }
+ 
++    /// A tile decommitted and committed again before the next submit gets its pool tile back
++    /// with no new tile mapping (cleared instead). One that is not is unmapped and freed by
++    /// `flush_parked` (before a submit), or when the free list runs out; a placed buffer's
++    /// release does not free it while it is parked.
++    #[test]
++    fn a_tile_decommitted_and_committed_again_keeps_its_video_memory() {
++        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
++        use windows::Win32::Graphics::Dxgi::*;
++        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
++
++        unsafe {
++            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
++            let mut dev: Option<ID3D12Device> = None;
++            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
++                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
++                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
++            }
++            let dev = dev.expect("D3D12 device");
++            let base = VirtualAlloc(std::ptr::null(), 2 * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
++            assert!(base != 0 && base % TILE == 0);
++            let mut reserved: Option<ID3D12Resource> = None;
++            dev.CreateReservedResource(&buffer_desc((2 * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved)
++                .expect("CreateReservedResource");
++            let reserved = reserved.expect("reserved buffer");
++            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
++            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
++            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
++            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
++            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
++            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
++            rb_list.Close().expect("rb_list close");
++
++            let mut s = State {
++                dev,
++                queue,
++                fence,
++                value: 0,
++                event,
++                rb_fence,
++                rb_value: 0,
++                windows: vec![(base, reserved)],
++                pools: Vec::new(),
++                free: Vec::new(),
++                retired: Vec::new(),
++                mapped: FxHashMap::default(),
++                pinned: FxHashMap::default(),
++                parked: FxHashMap::default(),
++                buffers: FxHashMap::default(),
++                to_zero: Vec::new(),
++                staging: None,
++                ring_write: 0,
++                ring_submitted: 0,
++                ring_free: 0,
++                inflight: VecDeque::new(),
++                zero_buf: None,
++                slots: Vec::new(),
++                next_slot: 0,
++                readback: None,
++                rb_alloc,
++                rb_list,
++                rb_last_fence: 0,
++                waited: FxHashMap::default(),
++                runs: None,
++                scratch_runs: Vec::new(),
++            };
++
++            s.commit_range(base, TILE);
++            let tile = s.mapped[&base].pool;
++            let v = s.value;
++            assert!(v > 0, "a new tile is mapped");
++
++            // decommitted: parked, still mapped, nothing sent to the GPU
++            s.decommit_range(base, TILE);
++            assert!(!s.mapped.contains_key(&base));
++            assert_eq!(s.parked.get(&base), Some(&tile));
++            assert!(!s.free.contains(&tile));
++            assert_eq!(s.value, v, "no tile mapping changed");
++            s.release_if_unused(tile);
++            assert!(!s.free.contains(&tile), "a parked tile is not free");
++
++            // committed again: the same tile, cleared, no new mapping
++            s.to_zero.clear();
++            let gen = mapped_gen();
++            s.commit_range(base, TILE);
++            assert_eq!(s.mapped[&base].pool, tile);
++            assert_eq!(s.mapped[&base].holes, 0);
++            assert!(s.parked.is_empty());
++            assert_eq!(s.to_zero, vec![(base, TILE)]);
++            assert_eq!(s.value, v, "no tile mapping changed");
++            assert!(mapped_gen() > gen, "readers of `mapped` see it changed");
++
++            // decommitted and flushed (as before a submit): unmapped and free
++            s.decommit_range(base, TILE);
++            assert!(s.flush_parked());
++            assert!(s.parked.is_empty());
++            assert!(s.free.contains(&tile));
++            assert!(s.value > v, "the unmapping is sent");
++            assert!(!s.flush_parked(), "nothing left to flush");
++
++            // no free tile left: the parked one is flushed and taken for the next commit
++            s.commit_range(base, TILE);
++            let tile = s.mapped[&base].pool;
++            s.decommit_range(base, TILE);
++            s.free.clear();
++            s.commit_range(base + TILE, TILE);
++            assert!(s.parked.is_empty());
++            assert_eq!(s.mapped[&(base + TILE)].pool, tile);
++            assert!(!s.mapped.contains_key(&base));
++
++            s.wait_for(s.value);
++            drop(s);
++            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
++        }
++    }
++
+     /// Sub-tile decommits (two 32 KiB halves, sixteen 4 KiB pages, or decommitting the last
+     /// remaining committed page) must unmap the tile and return unpinned pool tiles to `free`
+     /// once `holes` reaches `0xFFFF`, pruning stale `to_zero` entries for unmapped tiles.
 diff --git a/crates/xcl/src/hle/d3d12x/title_list.rs b/crates/xcl/src/hle/d3d12x/title_list.rs
 index 05de94b..01fce5c 100644
 --- a/crates/xcl/src/hle/d3d12x/title_list.rs
@@ -4769,6 +6595,559 @@ index 05de94b..01fce5c 100644
      {
          let mut sg = SEGMENTS.lock().unwrap();
          sg.get_or_insert_with(HashMap::new)
+diff --git a/crates/xcl/src/hle/d3d12x/title_textures.rs b/crates/xcl/src/hle/d3d12x/title_textures.rs
+index 7332fd3..16174fb 100644
+--- a/crates/xcl/src/hle/d3d12x/title_textures.rs
++++ b/crates/xcl/src/hle/d3d12x/title_textures.rs
+@@ -464,6 +464,9 @@ pub fn note_gpu_write(res: usize) {
+             GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+         }
+     }
++    drop(t);
++    // page budget: its texels are not in the title's memory, so the page budget keeps it
++    super::vram::pin(res);
+ }
+ 
+ static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
+@@ -570,7 +573,31 @@ pub fn submitted(lists: &[*mut c_void]) {
+     if notes.is_empty() {
+         return;
+     }
++    // page budget: a texture the title uses is recent; an evicted one is
++    // mapped again and uploaded whole at the next submit
++    let mut revive = Vec::new();
++    for &(res, _, _) in &notes {
++        super::vram::touch(res);
++        if super::vram::any_evicted() && super::vram::take_evicted(res) {
++            revive.push(res);
++        }
++    }
++    for &res in &revive {
++        let p = res as *mut c_void;
++        if let Some(r) = unsafe { ID3D12Resource::from_raw_borrowed(&p) } {
++            unsafe { super::vram::remap_if_unmapped(r) };
++        }
++        forget_content(res);
++    }
+     let mut t = TEXTURES.lock().unwrap();
++    for res in revive {
++        if let Some(e) = t.get_mut(res) {
++            if !e.pending {
++                e.pending = true;
++                PENDING.fetch_add(1, Ordering::Relaxed);
++            }
++        }
++    }
+     for (res, sub, after) in notes {
+         if let Some(e) = t.get_mut(res) {
+             let n = subresource_count(&e.tex);
+@@ -776,6 +803,16 @@ unsafe fn refresh_once(queue: *mut c_void) {
+             })
+             .collect()
+     });
++    // page budget: a texture the CPU wrote again is mapped again before its
++    // whole upload
++    if super::vram::any_evicted() {
++        for (r, _) in &todo {
++            if super::vram::take_evicted(r.as_raw() as usize) {
++                super::vram::remap_if_unmapped(r);
++                forget_content(r.as_raw() as usize);
++            }
++        }
++    }
+     upload_all(todo);
+ }
+ 
+@@ -795,6 +832,12 @@ fn same_as_last_upload(res: usize, h: u64) -> bool {
+     LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+ }
+ 
++/// Page budget: `res` was mapped again on fresh tiles, so its next upload
++/// must not be left out as unchanged.
++fn forget_content(res: usize) {
++    LAST_CONTENT.lock().unwrap().remove(&res);
++}
++
+ /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
+ /// 8-byte words: gigabytes a second; not for anything adversarial).
+ fn content_hash(b: &[u8]) -> u64 {
+@@ -1010,9 +1053,12 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
+     Ok(made)
+ }
+ 
+-/// Ranges closer than this are scanned as one (a gap costs little to scan; a call per texture –
+-/// thousands of them – a lot)
+-const WATCH_GAP: usize = 1 << 20;
++/// Ranges closer than this are scanned as one. A write-watch call costs ~3.5 µs however little it
++/// covers, while one call over 2 GiB of committed pages takes ~1.3 ms (measured on Windows 11): a
++/// retail game's intro video had its submitting thread at 42 % in GetWriteWatch with a 1 MiB gap
++/// (thousands of calls before each submit over its mapped sparse tiles). The pages of a gap are
++/// reported as written too; the uploads keep to what they track.
++const WATCH_GAP: usize = 64 << 20;
+ 
+ /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
+ /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
+@@ -1026,10 +1072,14 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) ->
+             _ => merged.push((a, b)),
+         }
+     }
++    // each region against the merged ranges it meets (sorted and disjoint: a binary search, not
++    // a pass over all of them – both lists run to thousands while a game streams)
+     let mut out = Vec::new();
+-    for (a, b) in merged {
+-        for &(base, size) in regions {
+-            let (lo, hi) = (a.max(base), b.min(base + size));
++    for &(base, size) in regions {
++        let end = base + size;
++        let first = merged.partition_point(|&(_, b)| b <= base);
++        for &(a, b) in merged[first..].iter().take_while(|&&(a, _)| a < end) {
++            let (lo, hi) = (a.max(base), b.min(end));
+             if lo < hi {
+                 out.push((lo, hi - lo));
+             }
+@@ -1212,6 +1262,19 @@ mod tests {
+         forget(b);
+     }
+ 
++    /// Page budget: a texture mapped again after an eviction sits on fresh
++    /// tiles, so unchanged memory is uploaded again.
++    #[test]
++    fn a_texture_mapped_again_after_eviction_is_uploaded_even_if_unchanged() {
++        let a = 0x7E57_0000_3000usize;
++        let h = content_hash(&[7u8; 4096]);
++        assert!(!same_as_last_upload(a, h));
++        assert!(same_as_last_upload(a, h), "unchanged: left out");
++        forget_content(a);
++        assert!(!same_as_last_upload(a, h), "mapped again: uploaded whole");
++        forget_content(a);
++    }
++
+     /// Real uploads, dirty-page detection and a source changing after registration:
+     /// bookkeeping alone cannot show that the bytes the GPU sees follow the mirror.
+     #[test]
+@@ -1538,9 +1601,15 @@ mod tests {
+         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
+         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
+         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
+-        // ranges a gap of under 1 MiB apart: one scan; further apart: two
+-        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
+-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
++        // ranges a gap of under WATCH_GAP apart: one scan; further apart: two
++        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000), (0x1800_0000, 0x1800_1000)];
++        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x100_1000), (0x1800_0000, 0x1000)]);
++        // a merged range over two regions: a piece in each, whatever order the regions come in
++        let regions = [(0x40000, 0x10000), (0x10000, 0x10000)];
++        assert_eq!(watch_ranges(&regions, vec![(0x18000, 0x48000)]), vec![(0x18000, 0x8000), (0x40000, 0x8000)]);
++        // a region between two merged ranges, and one past them all
++        let regions = [(0x2000_0000, 0x10_0000), (0x9000_0000, 0x1000)];
++        assert_eq!(watch_ranges(&regions, vec![(0x1000_0000, 0x1000_1000), (0x2008_0000, 0x2009_0000)]), vec![(0x2008_0000, 0x1_0000)]);
+     }
+ 
+     /// The textures of a batch detiled on several threads come back as on one: complete and in
+diff --git a/crates/xcl/src/hle/d3d12x/vram.rs b/crates/xcl/src/hle/d3d12x/vram.rs
+index 8b806d5..21a6bc6 100644
+--- a/crates/xcl/src/hle/d3d12x/vram.rs
++++ b/crates/xcl/src/hle/d3d12x/vram.rs
+@@ -166,6 +166,36 @@ const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+ /// a pool tile given back is not reused before this (the GPU may still be at work on what the
+ /// title released)
+ const COOL: std::time::Duration = std::time::Duration::from_secs(2);
++/// Page budget (`XCL_PAGE_BUDGET_MB`): a texture the CPU fills is not evicted before this
++/// long after it was placed, remapped or used in a transition.
++const EVICT_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
++/// Page budget: textures smaller than this are never evicted (UI, fonts, small lookups).
++const EVICT_MIN_TILES: u32 = 4;
++/// Page budget: tiles freed per eviction round once the pools are at the budget.
++const EVICT_BATCH: usize = 512;
++/// Page budget: after a round that found nothing to evict, pools grow past the budget for this
++/// long instead of trying again for every tile.
++const EVICT_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
++
++/// Page budget: pool heaps the pages may take, from `XCL_PAGE_BUDGET_MB` (0: no limit).
++fn pool_cap() -> usize {
++    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *CAP.get_or_init(|| {
++        let mb: usize = std::env::var("XCL_PAGE_BUDGET_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
++        if mb == 0 {
++            return 0;
++        }
++        let pools = (mb << 20).div_ceil(POOL_PAGES as usize * PAGE).max(1);
++        crate::xlog_info!("D3D12.X: page budget {mb} MB ({pools} pools of 64 MB): CPU-filled textures are evicted least recently used first beyond it");
++        pools
++    })
++}
++
++/// Page budget: textures whose tiles were evicted; the next upload or transition maps
++/// them again and uploads them whole.
++static EVICTED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
++static EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static REMAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
+ /// A pool tile: (pool heap, tile in it).
+ type Tile = (u32, u32);
+@@ -218,6 +248,10 @@ struct Target {
+     mapped: bool,
+     used: Vec<usize>,
+     used_extra: Vec<(usize, usize)>,
++    /// a texture the CPU fills (its texels can be uploaded again from the title's memory)
++    evictable: bool,
++    /// placed, remapped or transitioned last
++    touched: std::time::Instant,
+ }
+ 
+ /// The title's pages of video memory for tiled textures (see the module's comment).
+@@ -241,6 +275,8 @@ struct Pages {
+     targets: std::collections::HashMap<usize, Target>,
+     /// queue → the fence value it last waited for
+     waited: std::collections::HashMap<usize, u64>,
++    /// page budget: no eviction round before this (the last one found nothing to evict)
++    evict_idle_until: Option<std::time::Instant>,
+ }
+ 
+ // D3D12 objects are free-threaded
+@@ -273,6 +309,7 @@ impl Pages {
+             idle: std::collections::VecDeque::new(),
+             targets: std::collections::HashMap::new(),
+             waited: std::collections::HashMap::new(),
++            evict_idle_until: None,
+         })
+     }
+ 
+@@ -288,6 +325,23 @@ impl Pages {
+         if self.cooling.front().is_some_and(|(_, at)| at.elapsed() >= COOL) {
+             return self.cooling.pop_front().map(|(t, _)| t);
+         }
++        let cap = pool_cap();
++        if cap > 0 && self.pools.len() >= cap {
++            // a round that found nothing to evict is not repeated for a second: each one walks
++            // every target, and a texture of many tiles asks once per tile
++            let now = std::time::Instant::now();
++            if self.evict_idle_until.is_none_or(|t| now >= t) && self.evict_lru(EVICT_BATCH) == 0 {
++                self.evict_idle_until = Some(now + EVICT_IDLE);
++            }
++            if let Some(t) = self.free.pop() {
++                return Some(t);
++            }
++            // at the budget a tile is reused before it cooled: a draw still in flight may read
++            // the newer texels there for a frame
++            if let Some((t, _)) = self.cooling.pop_front() {
++                return Some(t);
++            }
++        }
+         let desc = D3D12_HEAP_DESC {
+             SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
+             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+@@ -390,6 +444,49 @@ impl Pages {
+         }
+     }
+ 
++    /// Page budget: unmap CPU-filled textures, least recently touched first, until `want`
++    /// tiles came back (pages other mapped textures still share stay). Each goes to `EVICTED`.
++    unsafe fn evict_lru(&mut self, want: usize) -> usize {
++        let now = std::time::Instant::now();
++        let before = self.free.len() + self.cooling.len();
++        let mut order: Vec<(std::time::Instant, usize)> = self
++            .targets
++            .iter()
++            .filter(|(_, t)| t.evictable && t.mapped && t.total >= EVICT_MIN_TILES && now.duration_since(t.touched) >= EVICT_MIN_AGE)
++            .map(|(&k, t)| (t.touched, k))
++            .collect();
++        order.sort_unstable();
++        let mut evicted = Vec::new();
++        for (_, key) in order {
++            if self.free.len() + self.cooling.len() - before >= want {
++                break;
++            }
++            let Some(t) = self.targets.get_mut(&key) else { continue };
++            let total = t.total;
++            let used = std::mem::take(&mut t.used);
++            let used_extra = std::mem::take(&mut t.used_extra);
++            t.mapped = false;
++            let raw = key as *mut c_void;
++            if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
++                self.unmap(res, total);
++            }
++            self.release_tiles(used, used_extra, now, true);
++            evicted.push(key);
++        }
++        if !evicted.is_empty() {
++            let n = EVICTIONS.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed) + evicted.len() as u64;
++            let freed = self.free.len() + self.cooling.len() - before;
++            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            let step = LOGGED.load(std::sync::atomic::Ordering::Relaxed);
++            if n >= step {
++                LOGGED.store(n.max(1) * 2, std::sync::atomic::Ordering::Relaxed);
++                crate::xlog_info!("D3D12.X: page budget: {} textures evicted ({} MB back) this round, {n} so far", evicted.len(), (freed * PAGE) >> 20);
++            }
++            EVICTED.lock().unwrap().get_or_insert_with(HashSet::new).extend(evicted);
++        }
++        self.free.len() + self.cooling.len() - before
++    }
++
+     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
+     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
+@@ -476,6 +573,32 @@ fn owned_pages(va: usize, console_bytes: Option<u64>, total: usize) -> Option<(u
+     }
+ }
+ 
++/// A reserved texture needs TILED in the format's support (`support2`) and, multisampled, a
++/// tiled quality level at its sample count.
++fn can_reserve(support2: i32, samples: u32, tiled_msaa_levels: u32) -> bool {
++    support2 & D3D12_FORMAT_SUPPORT2_TILED.0 != 0 && (samples <= 1 || tiled_msaa_levels > 0)
++}
++
++/// Whether the device can make `desc` a reserved texture, asked before CreateReservedResource:
++/// refused, it is an error in the debug layer (#940: R32G8X24_TYPELESS depth, 1 and 4 samples).
++/// A query that fails says yes, and creation decides.
++unsafe fn reservable(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
++    let mut f = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: desc.Format, ..Default::default() };
++    if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut f as *mut _ as *mut c_void, std::mem::size_of_val(&f) as u32).is_err() {
++        return true;
++    }
++    // a format without TILED is not reservable whatever the sample count's query says
++    if !can_reserve(f.Support2.0, 1, 0) {
++        return false;
++    }
++    let samples = desc.SampleDesc.Count;
++    let mut m = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS { Format: desc.Format, SampleCount: samples, Flags: D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, NumQualityLevels: 0 };
++    if samples > 1 && dev.CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mut m as *mut _ as *mut c_void, std::mem::size_of_val(&m) as u32).is_err() {
++        return true;
++    }
++    can_reserve(f.Support2.0, samples, m.NumQualityLevels)
++}
++
+ /// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
+ /// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
+ /// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
+@@ -498,18 +621,23 @@ unsafe fn place_on_pages(
+     if (require_aligned || console_bytes.is_none()) && va % PAGE != 0 {
+         return None;
+     }
+-    let mut g = PAGES.lock().unwrap();
+-    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
+     // reserved textures have the PC's 64 KiB tiles
+     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
++    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++    let log = |why: &str| {
++        if require_aligned && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
++            crate::xlog_info!("D3D12.X: GPU-owned texture at {va:#x} ({}x{}, format {}, {} samples) not reserved ({why}): in an arena", desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count);
++        }
++    };
++    if !reservable(dev, &tiled) {
++        log("no tiled support for its format or sample count");
++        return None;
++    }
++    let mut g = PAGES.lock().unwrap();
++    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
+     let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
+     if hr < 0 || (*ppv).is_null() {
+-        if require_aligned {
+-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+-                crate::xlog_info!("D3D12.X: GPU-owned texture at {va:#x} ({}x{}, format {}, {} samples) not reserved ({hr:#x}): in an arena", desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count);
+-            }
+-        }
++        log(&format!("{hr:#x}"));
+         return None;
+     }
+     let raw = *ppv;
+@@ -522,7 +650,7 @@ unsafe fn place_on_pages(
+         *ppv = std::ptr::null_mut();
+         return None;
+     };
+-    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });
++    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: !require_aligned, touched: std::time::Instant::now() });
+     drop(g);
+     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+     Some(hr)
+@@ -572,10 +700,58 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
+         t.used = used;
+         t.used_extra = used_extra;
+         t.mapped = true;
++        t.touched = std::time::Instant::now();
+     }
+     true
+ }
+ 
++/// Page budget: `res` was evicted by the page budget; true once, and the caller maps it
++/// again (`remap_if_unmapped`) and uploads it whole.
++pub(super) fn take_evicted(res: usize) -> bool {
++    let mut g = EVICTED.lock().unwrap();
++    let hit = g.as_mut().is_some_and(|s| s.remove(&res));
++    if hit {
++        REMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }
++    hit
++}
++
++/// Page budget: whether any texture is evicted (callers skip the lookup otherwise).
++pub(super) fn any_evicted() -> bool {
++    EVICTED.lock().unwrap().as_ref().is_some_and(|s| !s.is_empty())
++}
++
++/// Page budget: `res` was used (a transition the title submitted): later to be evicted.
++pub(super) fn touch(res: usize) {
++    if pool_cap() == 0 {
++        return;
++    }
++    let mut g = PAGES.lock().unwrap();
++    for pages in g.values_mut().flatten() {
++        if let Some(t) = pages.targets.get_mut(&res) {
++            t.touched = std::time::Instant::now();
++            return;
++        }
++    }
++}
++
++/// Page budget: the GPU wrote `res`; its texels are not in the title's memory, so it is
++/// never evicted.
++pub(super) fn pin(res: usize) {
++    let mut g = PAGES.lock().unwrap();
++    for pages in g.values_mut().flatten() {
++        if let Some(t) = pages.targets.get_mut(&res) {
++            t.evictable = false;
++            return;
++        }
++    }
++}
++
++/// Page budget: (textures evicted, textures mapped again) so far.
++pub fn eviction_counts() -> (u64, u64) {
++    (EVICTIONS.load(std::sync::atomic::Ordering::Relaxed), REMAPS.load(std::sync::atomic::Ordering::Relaxed))
++}
++
+ /// A resource released: its pages are no longer its.
+ fn forget_pages(resource: usize) {
+     let mut g = PAGES.lock().unwrap();
+@@ -585,6 +761,10 @@ fn forget_pages(resource: usize) {
+         if t.mapped {
+             pages.release_tiles(t.used, t.used_extra, now, false);
+         }
++        drop(g);
++        if let Some(s) = EVICTED.lock().unwrap().as_mut() {
++            s.remove(&resource);
++        }
+         return;
+     }
+ }
+@@ -782,6 +962,50 @@ mod tests {
+         }
+     }
+ 
++    /// Reserved only with TILED support, and for MSAA a tiled sample count (#940: the driver
++    /// refused R32G8X24_TYPELESS reserved, at 1 and 4 samples, and the debug layer said so).
++    #[test]
++    fn reserved_needs_tiled_format_and_tiled_msaa() {
++        let tiled = D3D12_FORMAT_SUPPORT2_TILED.0;
++        assert!(can_reserve(tiled, 1, 0));
++        assert!(!can_reserve(0, 1, 0), "format without TILED");
++        assert!(can_reserve(tiled, 4, 1));
++        assert!(!can_reserve(tiled, 4, 0), "no tiled quality level at 4 samples");
++        assert!(!can_reserve(0, 4, 1));
++    }
++
++    /// The device's answer agrees with CreateReservedResource: what `reservable` turns away the
++    /// driver refuses, what it lets through the driver makes (WARP or a hardware adapter).
++    #[test]
++    fn reservable_agrees_with_the_driver() {
++        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
++        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
++        use windows::Win32::Graphics::Dxgi::Common::*;
++        unsafe {
++            let mut dev: Option<ID3D12Device> = None;
++            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
++                let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory4 = windows::Win32::Graphics::Dxgi::CreateDXGIFactory1().expect("DXGI factory");
++                let Ok(warp) = factory.EnumWarpAdapter::<windows::Win32::Graphics::Dxgi::IDXGIAdapter>() else { return };
++                let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
++            }
++            let Some(dev) = dev else { return };
++            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
++            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_err() || o.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0 {
++                return;
++            }
++            for (format, samples) in [(DXGI_FORMAT_R32G8X24_TYPELESS, 1), (DXGI_FORMAT_R32G8X24_TYPELESS, 4), (DXGI_FORMAT_R32_TYPELESS, 1), (DXGI_FORMAT_R8G8B8A8_UNORM, 1)] {
++                let flags = if format == DXGI_FORMAT_R8G8B8A8_UNORM { D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET } else { D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL };
++                let desc = D3D12_RESOURCE_DESC {
++                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 128, Height: 128, DepthOrArraySize: 1, MipLevels: 1, Format: format,
++                    SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, Flags: flags, ..Default::default()
++                };
++                let mut r: Option<ID3D12Resource> = None;
++                let made = dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_ok() && r.is_some();
++                assert_eq!(reservable(&dev, &desc), made, "format {} x{samples}: reservable vs CreateReservedResource", format.0);
++            }
++        }
++    }
++
+     /// A placement's arena id, with heaps numbered as they are made.
+     fn take(a: &mut Arenas<u32>, va: usize, bytes: usize, align: usize, now: Instant) -> u64 {
+         let n = a.list.len() as u32;
+@@ -957,4 +1181,65 @@ mod tests {
+             drop(last);
+         }
+     }
++
++    /// Page budget: the least recently touched CPU-filled texture gives its
++    /// pages back first, a GPU-written one never does, and an evicted one maps again.
++    #[test]
++    fn page_budget_evicts_the_least_recently_touched_cpu_filled_texture() {
++        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
++        use windows::core::Interface;
++        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
++        use windows::Win32::Graphics::Dxgi::Common::*;
++        use windows::Win32::Graphics::Dxgi::*;
++        unsafe {
++            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
++            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
++            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
++                return;
++            }
++            let mut dev: Option<ID3D12Device> = None;
++            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
++            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
++            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
++            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
++            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
++            let place_at = |va: usize| {
++                let mut p = std::ptr::null_mut();
++                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
++                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
++                    return None;
++                }
++                Some(ID3D12Resource::from_raw(p))
++            };
++            let (Some(old), Some(newer), Some(written)) = (place_at(0x60_0000_0000), place_at(0x60_1000_0000), place_at(0x60_2000_0000)) else {
++                crate::gpu::recomp::runner::skip_test("no reserved textures");
++                return;
++            };
++            let key = |r: &ID3D12Resource| r.as_raw() as usize;
++            pin(key(&written));
++            let dev_key = dev.as_raw() as usize;
++            let now = Instant::now();
++            {
++                let mut g = PAGES.lock().unwrap();
++                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
++                for (r, age) in [(&old, 30), (&newer, 20), (&written, 40)] {
++                    pages.targets.get_mut(&key(r)).unwrap().touched = now - Duration::from_secs(age);
++                }
++                let used_before = pages.pages.len();
++                assert!(pages.evict_lru(1) > 0, "tiles came back");
++                assert!(!pages.targets[&key(&old)].mapped, "the oldest CPU-filled texture is evicted");
++                assert!(pages.targets[&key(&newer)].mapped, "one is enough for one tile");
++                assert!(pages.targets[&key(&written)].mapped, "a GPU-written texture is never evicted");
++                assert!(pages.pages.len() < used_before, "its pages went back");
++                // nothing left to evict: the round says so (take_tile then waits before the next)
++                pages.targets.get_mut(&key(&newer)).unwrap().evictable = false;
++                assert_eq!(pages.evict_lru(1), 0, "nothing evictable");
++            }
++            assert!(take_evicted(key(&old)));
++            assert!(!take_evicted(key(&old)), "true once");
++            assert!(remap_if_unmapped(&old));
++            assert!(PAGES.lock().unwrap().get(&dev_key).unwrap().as_ref().unwrap().targets[&key(&old)].mapped, "mapped again");
++            drop((old, newer, written));
++        }
++    }
+ }
 diff --git a/crates/xcl/src/hle/dstorage.rs b/crates/xcl/src/hle/dstorage.rs
 index 2a63005..6009ccb 100644
 --- a/crates/xcl/src/hle/dstorage.rs
@@ -5262,6 +7641,281 @@ index 402d4c7..e38e394 100644
  }
  
  #[link(name = "user32")]
+diff --git a/crates/xcl/src/hle/kernelx.rs b/crates/xcl/src/hle/kernelx.rs
+index 0c3db4f..8aa3bc2 100644
+--- a/crates/xcl/src/hle/kernelx.rs
++++ b/crates/xcl/src/hle/kernelx.rs
+@@ -925,16 +925,18 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
+ 
+ /// A page's data went from `home` to another address: a home in a sparse window is
+ /// decommitted at the end of the call or every 256 MB (`give_back_homes`; its GPU tiles go too: the GPU does
+-/// not see the page while it is away).
+-unsafe fn move_home_away(away: &mut Away, home: usize) {
++/// not see the page while it is away). True if homes were given back now.
++unsafe fn move_home_away(away: &mut Away, home: usize) -> bool {
+     if lazy_home(home) {
+         away.gone.push(home);
+         // (256 MB at a time: a call that maps gigabytes would otherwise hold them twice until
+         // it ends)
+         if away.gone.len() >= 4096 {
+             give_back_homes(away);
++            return true;
+         }
+     }
++    false
+ }
+ 
+ /// The homes `move_home_away` collected, decommitted in runs of neighbouring pages.
+@@ -1007,6 +1009,25 @@ fn committed_range(a: usize, len: usize) -> bool {
+ }
+ 
+ fn committed_page(a: usize) -> bool {
++    committed_page_in(a, &mut StateRun::default())
++}
++
++/// The run of pages around an address that one VirtualQuery found in one state. `map_pages`
++/// asks about the pages of a range one after the other and nothing it does in between (a page
++/// left lazy) changes that state: a run answers them without asking again (VirtualQuery walks
++/// the run to its end, and under Wine 98,304 fresh pages took 13 s).
++#[derive(Default)]
++struct StateRun {
++    start: usize,
++    end: usize,
++    committed: bool,
++}
++
++/// `committed_page`, remembering in `run` the state of the pages around `a`.
++fn committed_page_in(a: usize, run: &mut StateRun) -> bool {
++    if (run.start..run.end).contains(&a) {
++        return run.committed;
++    }
+     // A page in the working set is committed: asking for that is one entry, where VirtualQuery
+     // walks the page table to the end of the committed range the page is in (gigabytes of
+     // homes: 0.25 ms a page, and a scatter of pages from their homes grew with its square).
+@@ -1016,18 +1037,32 @@ fn committed_page(a: usize) -> bool {
+     {
+         return true;
+     }
++    #[cfg(test)]
++    VIRTUAL_QUERIES.with(|n| n.set(n.get() + 1));
+     let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+-    unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == mem::MEM_COMMIT }
++    if unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
++        return false;
++    }
++    let start = m.BaseAddress as usize;
++    *run = StateRun { start, end: start + m.RegionSize, committed: m.State == mem::MEM_COMMIT };
++    run.committed
++}
++
++#[cfg(test)]
++thread_local! {
++    /// The VirtualQuery calls `committed_page_in` made on this thread.
++    static VIRTUAL_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+ }
+ 
+ /// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted); the homes
+-/// in `committed` the caller has committed.
+-unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usize>) {
++/// in `committed` the caller has committed. True if memory was committed or decommitted (a page
++/// never used, or none mapped at `at`, leaves it as it was).
++unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usize>) -> bool {
+     if let Some(page) = away.at.remove(&at) {
+         away.page.remove(&page);
+         // never used where it was mapped: its home still holds the page (zeros)
+         if lazy::unmark(at) {
+-            return;
++            return false;
+         }
+         // (a home this call has not given back yet is still committed)
+         let own = page_home(page);
+@@ -1043,6 +1078,9 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
+         if !committed.contains(&at) {
+             release_at(at);
+         }
++        true
++    } else {
++        false
+     }
+ }
+ 
+@@ -1208,15 +1246,29 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
+         return std::ptr::null_mut();
+     }
+     let in_uma = |a: usize| crate::gpu::uma::get().is_some_and(|u| u.is_committed(a));
++    // the state of the addresses and homes asked about: dropped when `unmap_away` commits or
++    // decommits and when `move_home_away` gives homes back. The rest of a step changes only an
++    // address, or a home not asked about again (the addresses rise; a page mapped twice is
++    // unmapped first) – bar an address that is another page's home (a home in plain memory):
++    // that answer was wrong before the runs too.
++    let (mut at_run, mut home_run) = (StateRun::default(), StateRun::default());
+     for (i, &p) in pages.iter().enumerate() {
+         let at = base + i * PHYS_PAGE;
+-        unmap_away(away, at, &(0..0));
++        if unmap_away(away, at, &(0..0)) {
++            (at_run, home_run) = Default::default();
++        }
+         if p == 0 {
+             continue;
+         }
+         if let Some(&old) = away.page.get(&p) {
++            // (a move commits `at` and decommits `old`, which may lie in a run already answered:
++            // both runs go – #556)
+             match move_away(away, old, at, p, in_uma(at)) {
+-                Ok(true) => continue,
++                Ok(true) => {
++                    (at_run, home_run) = Default::default();
++                    continue;
++                }
++                // a lazy page is only unmarked: memory is as it was, the runs stay
+                 Ok(false) => {}
+                 Err(()) => {
+                     fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+@@ -1224,12 +1276,12 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
+                 }
+             }
+         }
+-        let fresh = !in_uma(at) && !committed_page(at);
++        let fresh = !in_uma(at) && !committed_page_in(at, &mut at_run);
+         let home = page_home(p).unwrap();
+         // a page never used (its home not committed) at the title's own reserved address space:
+         // committed on first use (`lazy`) – GPU-owned targets placed there are never touched
+         let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
+-        if fresh && plain && !committed_page(home) {
++        if fresh && plain && !committed_page_in(home, &mut home_run) {
+             lazy::mark(at);
+             away.at.insert(at, p);
+             away.page.insert(p, at);
+@@ -1241,7 +1293,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
+         }
+         if committed_page(home) {
+             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
+-            move_home_away(away, home);
++            if move_home_away(away, home) {
++                (at_run, home_run) = Default::default();
++            }
+         } else if !fresh {
+             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
+         }
+@@ -2099,6 +2153,118 @@ mod tests {
+         }
+     }
+ 
++    /// Fresh pages mapped into a reservation in one call are left lazy with a few VirtualQuery
++    /// calls, not two per page (13 s under Wine for a title's 98,304 pages); a committed page
++    /// among them is still told from the reserved ones.
++    #[test]
++    fn mapping_fresh_pages_does_not_query_each_page() {
++        const N: usize = 64;
++        unsafe {
++            let Some(u) = crate::gpu::uma::get() else { return };
++            let mut n = N;
++            let mut pages = [0usize; N];
++            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
++            let home = page_home(pages[0]).unwrap();
++            if !u.is_sparse(home) {
++                FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr());
++                return;
++            }
++            let r = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
++            let used = r + 3 * PHYS_PAGE;
++            assert!(!mem::VirtualAlloc(used as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
++            *(used as *mut u32) = 0xABAB_ABAB;
++            let before = VIRTUAL_QUERIES.with(|q| q.get());
++            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r);
++            let queries = VIRTUAL_QUERIES.with(|q| q.get()) - before;
++            assert!(queries <= 8, "{queries} VirtualQuery calls for {N} pages");
++            assert_eq!(*(used as *const u32), 0, "a committed page is told from the reserved ones: it is not left lazy");
++            assert!(!committed_page(r + 2 * PHYS_PAGE) && !committed_page(r + 4 * PHYS_PAGE), "the others are left lazy");
++            assert!(!committed_page(page_home(pages[N - 1]).unwrap()), "and their homes stay reserved");
++            assert_eq!(*((r + 4 * PHYS_PAGE) as *const u32), 0);
++            // back home: the pages left lazy are unmarked (a freed one stays marked, and the address
++            // is another test's later)
++            assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
++            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
++            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
++        }
++    }
++
++    /// `n` pages with a sparse home (None, with nothing allocated: not on this adapter).
++    unsafe fn sparse_pages(n: usize) -> Option<Vec<usize>> {
++        let u = crate::gpu::uma::get()?;
++        let (mut num, mut pages) = (n, vec![0usize; n]);
++        assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut num, pages.as_mut_ptr()), 1);
++        if u.is_sparse(page_home(pages[0]).unwrap()) {
++            return Some(pages);
++        }
++        FreeTitlePhysicalPages(std::ptr::null_mut(), n, pages.as_mut_ptr());
++        None
++    }
++
++    /// Pages mapped, half of them written, then all mapped again in one call – at another
++    /// address or the same one: the written ones keep their contents. The first pages of the
++    /// call are never-used (nothing to move), the ones after them are moved: what a run of
++    /// the pages asked about before says is no longer true (the home they moved to is committed
++    /// by now, the address they left decommitted).
++    unsafe fn remap_keeps_what_was_written(same_address: bool) {
++        const N: usize = 8;
++        let Some(mut pages) = sparse_pages(N) else { return };
++        let r1 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
++        let r2 = if same_address { r1 } else { mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize };
++        assert_eq!(MapTitlePhysicalPages(r1 as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r1);
++        for i in N / 2..N {
++            *((r1 + i * PHYS_PAGE) as *mut u32) = 0x100 + i as u32;
++        }
++        assert_eq!(MapTitlePhysicalPages(r2 as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r2);
++        for i in 0..N {
++            let want = if i >= N / 2 { 0x100 + i as u32 } else { 0 };
++            assert_eq!(*((r2 + i * PHYS_PAGE) as *const u32), want, "page {i} (same address: {same_address})");
++        }
++        // back home: the pages left lazy are unmarked (a freed one stays marked, and the address
++        // is another test's later)
++        assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
++        assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
++        mem::VirtualFree(r1 as *mut c_void, 0, mem::MEM_RELEASE);
++        if !same_address {
++            mem::VirtualFree(r2 as *mut c_void, 0, mem::MEM_RELEASE);
++        }
++    }
++
++    #[test]
++    fn pages_mapped_again_at_another_address_keep_what_was_written() {
++        unsafe { remap_keeps_what_was_written(false) }
++    }
++
++    #[test]
++    fn pages_mapped_again_at_the_same_address_keep_what_was_written() {
++        unsafe { remap_keeps_what_was_written(true) }
++    }
++
++    /// Pages never used, mapped again (they are only unmarked: memory is as it was) cost no
++    /// more queries than the first time.
++    #[test]
++    fn mapping_lazy_pages_again_does_not_query_each_page() {
++        const N: usize = 64;
++        unsafe {
++            let Some(mut pages) = sparse_pages(N) else { return };
++            let r1 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
++            let r2 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
++            assert_eq!(MapTitlePhysicalPages(r1 as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r1);
++            for to in [r1, r2] {
++                let before = VIRTUAL_QUERIES.with(|q| q.get());
++                assert_eq!(MapTitlePhysicalPages(to as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, to);
++                let queries = VIRTUAL_QUERIES.with(|q| q.get()) - before;
++                assert!(queries <= 8, "{queries} VirtualQuery calls for {N} pages mapped again");
++            }
++            // back home: the pages left lazy are unmarked (a freed one stays marked, and the address
++            // is another test's later)
++            assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
++            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
++            mem::VirtualFree(r1 as *mut c_void, 0, mem::MEM_RELEASE);
++            mem::VirtualFree(r2 as *mut c_void, 0, mem::MEM_RELEASE);
++        }
++    }
++
+     /// `XMemMapPhysicalPagesScatter` against a model of physical pages: random scatters of
+     /// pages to addresses (page 0: unmap), writes through the addresses and maps of the whole
+     /// allocation at its home. After each step every page reads what was last written to it
 diff --git a/crates/xcl/src/hle/mod.rs b/crates/xcl/src/hle/mod.rs
 index da0eafb..f64fa48 100644
 --- a/crates/xcl/src/hle/mod.rs
@@ -5461,6 +8115,21 @@ index 0eec7dc..330beca 100644
 +        }
 +    }
  }
+diff --git a/crates/xcl/src/host.rs b/crates/xcl/src/host.rs
+index ba5dcb4..7d80939 100644
+--- a/crates/xcl/src/host.rs
++++ b/crates/xcl/src/host.rs
+@@ -73,6 +73,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
+                     mb(pools as u64),
+                     mb(pools_mapped as u64)
+                 );
++                let (evicted, mapped_again) = crate::hle::d3d12x::vram::eviction_counts();
++                if evicted > 0 {
++                    crate::xlog_info!("page budget: {evicted} textures evicted, {mapped_again} mapped again");
++                }
+                 last = now;
+             }
+         });
 diff --git a/crates/xcl/src/loader.rs b/crates/xcl/src/loader.rs
 index 52c49af..40faa60 100644
 --- a/crates/xcl/src/loader.rs
@@ -5531,6 +8200,229 @@ index 378f4b3..d54f98b 100644
      /// `XCL_DSTORAGE_BCPACK_FILL`
      #[serde(default)]
      pub dstorage: crate::hle::dstorage::DStorageStats,
+diff --git a/crates/xcl/src/shaders.rs b/crates/xcl/src/shaders.rs
+index 5c3027d..db0c700 100644
+--- a/crates/xcl/src/shaders.rs
++++ b/crates/xcl/src/shaders.rs
+@@ -734,14 +734,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
+ /// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
+ /// mesh pass-through, which the runtime builds for its pixel shader.
+ /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
+-/// ABI root signature with its static samplers): the driver keeps what it compiled in its own
+-/// cache, which the title then finds – a retail game's 1 MB-DXIL programs kept its loading
+-/// waiting for the driver's compiler for minutes. Nothing runs on the GPU.
++/// ABI root signature with its static samplers). Save the driver's compiled blob in the same
++/// cache the runtime reads at startup. Nothing runs on the GPU.
+ struct Pipelines {
+     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
+     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
+     made: AtomicUsize,
+     refused: AtomicUsize,
++    reused: AtomicUsize,
+     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
+     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
+     running: (Mutex<usize>, std::sync::Condvar),
+@@ -761,7 +761,7 @@ impl Pipelines {
+             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
+-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
++            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+         }
+     }
+ 
+@@ -785,7 +785,7 @@ impl Pipelines {
+                 },
+             }
+         };
+-        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
++        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
+             ..Default::default()
+@@ -797,7 +797,30 @@ impl Pipelines {
+             }
+             *n += 1;
+         }
+-        let r: windows::core::Result<ID3D12PipelineState> = unsafe { self.dev.CreateComputePipelineState(&desc) };
++        use crate::hle::d3d12x::real::driver_cache;
++        let path = driver_cache::path(&c.dxil, desc.Flags.0);
++        let cached = path.as_deref().and_then(driver_cache::load);
++        let from_cache = cached.as_ref().and_then(|bytes| {
++            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
++            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
++        });
++        let r = if let Some(pso) = from_cache {
++            self.reused.fetch_add(1, Ordering::Relaxed);
++            Ok(pso)
++        } else {
++            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
++            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
++            if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
++                if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
++                    let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
++                    let len = unsafe { blob.GetBufferSize() };
++                    if !bytes.is_null() && len != 0 {
++                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
++                    }
++                }
++            }
++            pso
++        };
+         *self.running.0.lock().unwrap() -= 1;
+         self.running.1.notify_one();
+         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+@@ -934,6 +957,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
+     );
+     if let Some(p) = pipelines {
+         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
++        println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+     }
+     for e in errors.into_inner().unwrap() {
+         println!("  {e}");
+diff --git a/crates/xcl/src/vfs.rs b/crates/xcl/src/vfs.rs
+index 469e626..dd02bcb 100644
+--- a/crates/xcl/src/vfs.rs
++++ b/crates/xcl/src/vfs.rs
+@@ -632,6 +632,25 @@ impl Vfs {
+         Ok(())
+     }
+ 
++    fn check_original_dir_empty(&self, rel: &str) -> Result<(), u32> {
++        if self.is_whiteout(rel) {
++            return Ok(());
++        }
++        let entries = match std::fs::read_dir(self.original_path(rel)) {
++            Ok(entries) => entries,
++            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(()),
++            Err(e) => return Err(e.raw_os_error().map(|c| c as u32).unwrap_or(ERROR_ACCESS_DENIED)),
++        };
++        for entry in entries {
++            let entry = entry.map_err(|e| e.raw_os_error().map(|c| c as u32).unwrap_or(ERROR_ACCESS_DENIED))?;
++            let child = format!("{rel}\\{}", entry.file_name().to_string_lossy());
++            if !self.is_whiteout(&child) {
++                return Err(ERROR_DIR_NOT_EMPTY);
++            }
++        }
++        Ok(())
++    }
++
+     pub fn remove_dir(&self, rel: &str) -> Result<(), u32> {
+         if rel.is_empty() {
+             return Err(ERROR_ACCESS_DENIED);
+@@ -642,6 +661,7 @@ impl Vfs {
+             if !meta.is_dir() {
+                 return Err(ERROR_DIRECTORY);
+             }
++            self.check_original_dir_empty(rel)?;
+             std::fs::remove_dir(ov_path).map_err(|_| ERROR_DIR_NOT_EMPTY)?;
+             if Path::new(&self.original_path(rel)).exists() {
+                 self.add_whiteout(rel);
+@@ -655,6 +675,7 @@ impl Vfs {
+         if !Path::new(&self.original_path(rel)).is_dir() {
+             return Err(ERROR_DIRECTORY);
+         }
++        self.check_original_dir_empty(rel)?;
+         self.add_whiteout(rel);
+         self.record_write(rel);
+         Ok(())
+@@ -849,9 +870,52 @@ mod tests {
+         assert_eq!(v.create_dir("saves\\slot1"), Ok(()));
+         assert!(!f.game().join("saves").exists());
+         assert!(v.visible_in_overlay("saves\\slot1"));
++        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
++        assert!(!v.is_whiteout("data"));
++        assert!(v.visible_in_original("data\\hello.txt"));
++        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
++        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+         assert_eq!(v.remove_dir("data"), Ok(()));
+-        assert!(f.game().join("data").exists());
+-        assert!(v.is_whiteout("data\\hello.txt"), "children of a removed dir are hidden");
++        assert!(f.game().join("data").join("hello.txt").exists());
++        let reloaded = Vfs::new(&f.game(), &f.dir.join("xcldata"), vec![]);
++        assert!(!reloaded.exists("data"));
++        assert_eq!(v.remove_dir("saves\\slot1"), Ok(()));
++        assert!(!v.exists("saves\\slot1"));
++    }
++
++    #[test]
++    fn remove_dir_checks_both_layers_before_removing_overlay() {
++        let f = Fixture::new("remove_merged_dir");
++        let v = &f.vfs;
++        std::fs::create_dir_all(v.overlay_path("data")).unwrap();
++        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
++        assert!(v.visible_in_overlay("data"));
++        assert!(!v.is_whiteout("data"));
++        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
++        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
++
++        // Overlay entries remain visible even when their original names are whited out.
++        std::fs::write(v.overlay_path("data\\hello.txt"), b"overlay").unwrap();
++        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
++        assert!(v.visible_in_overlay("data\\hello.txt"));
++        assert!(!v.is_whiteout("data"));
++        std::fs::remove_file(v.overlay_path("data\\hello.txt")).unwrap();
++        assert_eq!(v.remove_dir("data"), Ok(()));
++        assert!(!v.exists("data"));
++        assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
++    }
++
++    #[test]
++    fn remove_dir_rejects_visible_subdirectories() {
++        let f = Fixture::new("remove_dir_child");
++        let v = &f.vfs;
++        std::fs::create_dir(f.game().join("data").join("sub")).unwrap();
++        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
++        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
++        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
++        assert_eq!(v.remove_dir("data\\sub"), Ok(()));
++        assert_eq!(v.remove_dir("data"), Ok(()));
++        assert!(f.game().join("data").join("sub").is_dir());
+     }
+ 
+     #[test]
+@@ -963,11 +1027,14 @@ mod tests {
+                     std::ptr::null_mut(),
+                 )
+             };
++            // (read at once: the first under_wine() looks up an export ntdll does not have on
++            // Windows, which sets the thread's last error to ERROR_PROC_NOT_FOUND)
++            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+             assert_eq!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+             // Windows' own codes are the reference; Wine answers a directory opened with
+             // FILE_FLAG_BACKUP_SEMANTICS and TRUNCATE_EXISTING with ERROR_FILE_EXISTS
+             if !crate::util::under_wine() {
+-                assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
++                assert_eq!(err, expected);
+             }
+             assert_eq!(v.open_decision("G:\\data", GENERIC_WRITE, TRUNCATE_EXISTING, flags), Decision::Fail(expected));
+         }
+@@ -1017,6 +1084,10 @@ mod tests {
+         std::fs::create_dir_all(f.game().join("data").join("sub")).unwrap();
+         std::fs::write(f.game().join("data").join("sub").join("deep.txt"), b"deep").unwrap();
+ 
++        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
++        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
++        assert_eq!(v.delete_file("data\\sub\\deep.txt"), Ok(()));
++        assert_eq!(v.remove_dir("data\\sub"), Ok(()));
+         assert_eq!(v.remove_dir("data"), Ok(()));
+         assert!(v.is_whiteout("data"));
+         assert!(v.is_whiteout("data\\hello.txt"));
+diff --git a/crates/xcl/src/vfs_hooks.rs b/crates/xcl/src/vfs_hooks.rs
+index 7cf09a9..0767cf1 100644
+--- a/crates/xcl/src/vfs_hooks.rs
++++ b/crates/xcl/src/vfs_hooks.rs
+@@ -1718,6 +1718,10 @@ mod tests {
+         before.sort();
+         assert_eq!(before, vec![".", "..", "gone.txt", "hello.txt"]);
+ 
++        assert_eq!(v.remove_dir("data"), Err(vfs::ERROR_DIR_NOT_EMPTY));
++        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
++        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
++
+         // Removing `data` must make wildcard listing fail with ERROR_PATH_NOT_FOUND (no "." / "..").
+         assert_eq!(v.remove_dir("data"), Ok(()));
+         assert_eq!(collect_game_entries(v, "data\\*", real_collect).err(), Some(vfs::ERROR_PATH_NOT_FOUND));
 diff --git a/crates/xcl/tests/bcpack_parity.rs b/crates/xcl/tests/bcpack_parity.rs
 new file mode 100644
 index 0000000..06aad8e
@@ -5586,6 +8478,82 @@ index 0000000..06aad8e
 +    );
 +    assert!(cases > 0);
 +    assert_eq!(identical, cases, "every case must match the reference");
++}
+diff --git a/crates/xcl/tests/gpu_compute_e2e.rs b/crates/xcl/tests/gpu_compute_e2e.rs
+index 587c489..7b9a249 100644
+--- a/crates/xcl/tests/gpu_compute_e2e.rs
++++ b/crates/xcl/tests/gpu_compute_e2e.rs
+@@ -81,6 +81,49 @@ fn console_cs(code: &[u8], rsrc2: u32, threads: [u32; 3]) -> Vec<u8> {
+ 
+ const V: u64 = 256; // VALU source code of v0
+ 
++#[test]
++fn offline_compute_pipeline_is_reused_by_a_second_process() {
++    use std::{fs, process::Command};
++    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
++    if xcl::gpu::recomp::dxc::location().is_err() {
++        runner::skip_test("no DXC");
++        return;
++    }
++    if runner::wave64_programs_supported() != Ok(true) {
++        runner::skip_test("no GPU with 32- or 64-lane waves");
++        return;
++    }
++    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
++    let dir = std::env::temp_dir().join(format!("xcl-offline-pso-{}-{nonce}", std::process::id()));
++    let input = dir.join("input");
++    let cache = dir.join("cache");
++    fs::create_dir_all(&input).unwrap();
++    fs::write(input.join("kernel.bin"), console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1])).unwrap();
++    let run = |enabled: bool| {
++        let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
++            .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache)
++            .env("XCL_PSO_DISK_CACHE", if enabled { "1" } else { "0" }).output().unwrap();
++        let text = String::from_utf8_lossy(&out.stdout).into_owned();
++        assert!(out.status.success() && text.contains("pipelines made on the GPU 1, refused 0"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
++        text
++    };
++    run(false);
++    assert!(!cache.join("driver").exists());
++    run(true);
++    let dxil_file = fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
++        .find(|p| p.extension().is_some_and(|ext| ext == "dxil")).unwrap();
++    let dxil = fs::read(dxil_file).unwrap();
++    let name = format!("{:016x}-{:x}-0.pso", xcl::gpu::shader::fnv64(&dxil), dxil.len());
++    let driver_file = cache.join("driver").join(name);
++    assert!(driver_file.metadata().unwrap().len() > 0);
++    let warm = run(true);
++    // A blob from an earlier driver can be refused. The normal build must still succeed.
++    fs::write(&driver_file, b"invalid cached pipeline").unwrap();
++    run(true);
++    let _ = fs::remove_dir_all(&dir);
++    assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
++}
++
+ /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
+ /// s2/s3, thread ids in v0/v1: each thread writes its global (x, y), and through LDS +
+ /// s_barrier the (x, y) of the thread at the mirrored index, which is in the other wave.
+diff --git a/crates/xcl/tests/low_va.rs b/crates/xcl/tests/low_va.rs
+new file mode 100644
+index 0000000..fffcb54
+--- /dev/null
++++ b/crates/xcl/tests/low_va.rs
+@@ -0,0 +1,16 @@
++//! xcl.exe opts out of high-entropy ASLR, so the title's memory stays below 2^40 (#585).
++
++/// IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA
++const HIGH_ENTROPY_VA: u16 = 0x20;
++
++#[test]
++fn xcl_exe_is_linked_without_high_entropy_va() {
++    let image = std::fs::read(env!("CARGO_BIN_EXE_xcl")).unwrap();
++    let pe = u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap()) as usize;
++    assert_eq!(&image[pe..pe + 4], b"PE\0\0");
++    let optional = pe + 24;
++    assert_eq!(u16::from_le_bytes(image[optional..optional + 2].try_into().unwrap()), 0x20b, "PE32+");
++    // DllCharacteristics is at +70 of the PE32+ optional header
++    let flags = u16::from_le_bytes(image[optional + 70..optional + 72].try_into().unwrap());
++    assert_eq!(flags & HIGH_ENTROPY_VA, 0, "DllCharacteristics {flags:#x}: high-entropy VA is on");
 +}
 diff --git a/crates/xcl/tests/xg_oracle.rs b/crates/xcl/tests/xg_oracle.rs
 index 49a7d65..3d02993 100644
@@ -5762,3 +8730,489 @@ index 0000000..83073c7
 +
 +if __name__ == "__main__":
 +    main(sys.argv[1], sys.argv[2])
+diff --git a/scripts/pr_check.py b/scripts/pr_check.py
+index e70cab9..3a526b4 100644
+--- a/scripts/pr_check.py
++++ b/scripts/pr_check.py
+@@ -11,6 +11,14 @@ asks git instead of the GitHub API (whether a commit is on main, a blob's size).
+ import argparse, os, re, subprocess, sys
+ 
+ SECTIONS = ("Tested", "Not tested", "AI use")
++HEADINGS = ("What is in it", "Tested", "Regression run", "Not tested", "AI use")
++# placeholder lines copied verbatim from .github/pull_request_template.md (#965)
++TEMPLATE_PLACEHOLDERS = frozenset({
++    "hardware (GPU + driver, CPU), Rust version, debug / release:",
++    "`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: …)",
++    "`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: ...)",
++    "none / tool and model, and what it did",
++})
+ # small / open-weight models are not accepted for code (CONTRIBUTING.md, "AI-assisted contributions")
+ BANNED_MODELS = r"\b(qwen|deepseek|llama|mistral|mixtral|gemma|phi-?\d)"
+ # game data never goes into the repository (CONTRIBUTING.md, "Licence and provenance")
+@@ -26,9 +34,10 @@ COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
+ 
+ 
+ def smoke_blocks(body):
+-    """The `xcl-smoke v1` blocks of `body`: each a dict of its `key: value` lines."""
++    """The `xcl-smoke v1` blocks of `body`: each a dict of its `key: value` lines. A block ends at
++    a code fence or at the next block's header (both blocks pasted in one fence)."""
+     out = []
+-    for m in re.finditer(r"xcl-smoke v1\s*\n(.*?)(?:```|\Z)", body, re.S):
++    for m in re.finditer(r"xcl-smoke v1\s*\n(.*?)(?=xcl-smoke v1|```|\Z)", body, re.S):
+         block = {}
+         for line in m.group(1).splitlines():
+             k, sep, v = line.partition(":")
+@@ -47,6 +56,34 @@ def runtime(path):
+     return path.startswith("crates/xcl/src/") and "/tests" not in path and not path.endswith("tests.rs")
+ 
+ 
++# built into xcl.exe from outside crates/xcl/src: the data it compiles in (stubdb.toml, by
++# include_str!), its build script, and the manifests and lock file that pick its dependencies
++# and the release profile
++RUNTIME_BUILD = ("crates/xcl/build.rs", "crates/xcl/Cargo.toml", "Cargo.toml", "Cargo.lock")
++
++
++def builds_runtime(path):
++    return path.startswith("crates/xcl/data/") or path in RUNTIME_BUILD
++
++
++def section_has_content(body, section):
++    """True when `**section**` exists and has at least one non-placeholder line."""
++    next_heading = "|".join(re.escape(h) for h in HEADINGS)
++    m = re.search(
++        r"\*\*" + re.escape(section) + r"\*\*[ \t]*\n(.*?)(?=\n\*\*(?:" + next_heading + r")\*\*|\Z)",
++        body,
++        re.S,
++    )
++    if not m:
++        return False
++    text = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
++    for raw in text.splitlines():
++        line = re.sub(r"^\s*[-*•]+\s*", "", raw).strip()
++        if line and line not in TEMPLATE_PLACEHOLDERS:
++            return True
++    return False
++
++
+ def check(body, head, files, is_main_ancestor, *, test_only=False):
+     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
+     size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
+@@ -54,7 +91,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
+     body = body.replace("\r\n", "\n")
+     problems = []
+     for section in SECTIONS:
+-        if not re.search(r"\*\*" + section + r"\*\*\s*\n\s*\S", body):
++        if not section_has_content(body, section):
+             problems.append(f"the **{section}** section is missing or empty")
+ 
+     ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
+@@ -74,7 +111,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
+         elif binary and not in_test_data:
+             problems.append(f"`{path}` is a binary file outside tests/data/ or over 1 MB")
+ 
+-    if not test_only and any(runtime(p) for p, *_ in files):
++    if not test_only and any(runtime(p) or builds_runtime(p) for p, *_ in files):
+         blocks = smoke_blocks(body)
+         mine = [b for b in blocks if len(b.get("commit", "")) >= 7 and head.startswith(b["commit"].split()[0])]
+         clean = [b for b in mine if "uncommitted" not in b.get("commit", "")]
+diff --git a/scripts/test.ps1 b/scripts/test.ps1
+index 6dfc3e2..8bf6dca 100644
+--- a/scripts/test.ps1
++++ b/scripts/test.ps1
+@@ -3,7 +3,7 @@
+ $ErrorActionPreference = 'Stop'
+ Set-Location (Join-Path $PSScriptRoot '..')
+ # tests on game data pass without running anything when their variable is not set
+-$missing = 'XCL_SAMPLE_RPF', 'XCL_SAMPLE_DLLS', 'XCL_SAMPLE_TTPF', 'XCL_SAMPLE_BK2', 'XCL_SAMPLE_BVH4', 'XCL_SAMPLE_AWC', 'XCL_SAMPLE_XG', 'XCL_SAMPLE_DXC' | Where-Object { -not (Test-Path "env:$_") }
++$missing = 'XCL_SAMPLE_RPF', 'XCL_SAMPLE_DLLS', 'XCL_SAMPLE_TTPF', 'XCL_SAMPLE_BCPACK', 'XCL_SAMPLE_BK2', 'XCL_SAMPLE_BVH4', 'XCL_SAMPLE_AWC', 'XCL_SAMPLE_XG', 'XCL_SAMPLE_DXC' | Where-Object { -not (Test-Path "env:$_") }
+ if ($missing) { Write-Host "not set, their tests are skipped: $($missing -join ', ')" }
+ # Windows PowerShell 5.1 treats redirected native stderr as an error even when Cargo succeeds.
+ $null = Get-Command cargo -ErrorAction Stop
+diff --git a/scripts/test_pr_check.py b/scripts/test_pr_check.py
+index f93667f..e5de366 100644
+--- a/scripts/test_pr_check.py
++++ b/scripts/test_pr_check.py
+@@ -1,6 +1,7 @@
++from pathlib import Path
+ import unittest
+ 
+-from pr_check import check
++from pr_check import check, smoke_blocks
+ 
+ 
+ HEAD = "1234567890abcdef"
+@@ -31,10 +32,70 @@ class TestOnlyApprovalTests(unittest.TestCase):
+         for reason in ("Not tested", "AI use", "content.rpf", "attachment.txt"):
+             self.assertTrue(any(reason in problem for problem in problems), problems)
+ 
++    def test_runtime_build_inputs_require_smoke_until_approved(self):
++        for path in ("crates/xcl/data/stubdb.toml", "crates/xcl/build.rs", "crates/xcl/Cargo.toml",
++                     "Cargo.toml", "Cargo.lock"):
++            with self.subTest(path=path):
++                problems = check(BODY, HEAD, [changed(path)], lambda _: False)
++                self.assertEqual(2, len(problems))
++                self.assertTrue(all("Regression run" in problem for problem in problems))
++                self.assertEqual([], check(BODY, HEAD, [changed(path)], lambda _: False, test_only=True))
++        for path in ("tests/testtitle/Cargo.toml", "tests/testgamedll/build.rs", "crates/xcl/tests/data/x.toml"):
++            with self.subTest(path=path):
++                self.assertEqual([], check(BODY, HEAD, [changed(path)], lambda _: False))
++
+     def test_test_paths_do_not_need_approval(self):
+         files = [changed("crates/xcl/tests/integration.rs"), changed("crates/xcl/src/gpu/recomp/tests.rs")]
+         self.assertEqual([], check(BODY, HEAD, files, lambda _: False))
+ 
+ 
++class SmokeBlockTests(unittest.TestCase):
++    def test_two_blocks_in_one_fence_are_two_blocks(self):
++        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n\n"
++                "xcl-smoke v1\ncommit: 1234567890\ntitle: G\nseconds: 60\n```\n")
++        blocks = smoke_blocks(body)
++        self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in blocks])
++        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
++        self.assertEqual([], check(BODY + body, HEAD, files, lambda sha: sha == "1111111aaaa"))
++
++    def test_blocks_in_separate_fences_stay_separate(self):
++        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\n```\ntext\n"
++                "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\n```\n")
++        self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in smoke_blocks(body)])
++
++
++class TemplatePlaceholderTests(unittest.TestCase):
++    def test_untouched_pr_template_fails_all_required_sections(self):
++        template = Path(__file__).resolve().parent.parent / ".github" / "pull_request_template.md"
++        body = template.read_text(encoding="utf-8")
++        problems = check(body, HEAD, [changed("README.md")], lambda _: True)
++        self.assertEqual(
++            [
++                "the **Tested** section is missing or empty",
++                "the **Not tested** section is missing or empty",
++                "the **AI use** section is missing or empty",
++            ],
++            problems,
++        )
++
++    def test_filled_template_with_comments_and_real_lines_passes(self):
++        body = (
++            "**Tested**\n"
++            "<!-- comment only does not count, real line below does -->\n"
++            "- hardware (GPU + driver, CPU), Rust version, debug / release: RTX 3070 Ti, Rust 1.88.0\n"
++            "- `cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: …)\n"
++            "**Not tested**\n"
++            "- AMD GPUs\n"
++            "**AI use**\n"
++            "- none\n"
++        )
++        self.assertEqual([], check(body, HEAD, [changed("README.md")], lambda _: True))
++
++    def test_bare_bullets_and_html_comments_only_fail(self):
++        body = "**Tested**\n<!-- todo -->\n-\n**Not tested**\n*\n**AI use**\n  -  \n"
++        problems = check(body, HEAD, [changed("README.md")], lambda _: True)
++        self.assertEqual(3, len(problems))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/data/bcpack/.gitattributes b/tests/data/bcpack/.gitattributes
+new file mode 100644
+index 0000000..3988ee0
+--- /dev/null
++++ b/tests/data/bcpack/.gitattributes
+@@ -0,0 +1,2 @@
++*.bin binary
++*.lanes binary
+diff --git a/tests/data/bcpack/bc1-1-8.bin b/tests/data/bcpack/bc1-1-8.bin
+new file mode 100644
+index 0000000..9505075
+Binary files /dev/null and b/tests/data/bcpack/bc1-1-8.bin differ
+diff --git a/tests/data/bcpack/bc1-1-8.lanes b/tests/data/bcpack/bc1-1-8.lanes
+new file mode 100644
+index 0000000..ccac41a
+Binary files /dev/null and b/tests/data/bcpack/bc1-1-8.lanes differ
+diff --git a/tests/data/bcpack/bc1-16-1.bin b/tests/data/bcpack/bc1-16-1.bin
+new file mode 100644
+index 0000000..8201430
+Binary files /dev/null and b/tests/data/bcpack/bc1-16-1.bin differ
+diff --git a/tests/data/bcpack/bc1-16-1.lanes b/tests/data/bcpack/bc1-16-1.lanes
+new file mode 100644
+index 0000000..92a74dd
+Binary files /dev/null and b/tests/data/bcpack/bc1-16-1.lanes differ
+diff --git a/tests/data/bcpack/bc1-16-9.bin b/tests/data/bcpack/bc1-16-9.bin
+new file mode 100644
+index 0000000..2462981
+Binary files /dev/null and b/tests/data/bcpack/bc1-16-9.bin differ
+diff --git a/tests/data/bcpack/bc1-16-9.lanes b/tests/data/bcpack/bc1-16-9.lanes
+new file mode 100644
+index 0000000..bbba064
+Binary files /dev/null and b/tests/data/bcpack/bc1-16-9.lanes differ
+diff --git a/tests/data/bcpack/bc1-2-0.bin b/tests/data/bcpack/bc1-2-0.bin
+new file mode 100644
+index 0000000..9583e40
+Binary files /dev/null and b/tests/data/bcpack/bc1-2-0.bin differ
+diff --git a/tests/data/bcpack/bc1-2-0.lanes b/tests/data/bcpack/bc1-2-0.lanes
+new file mode 100644
+index 0000000..7067007
+Binary files /dev/null and b/tests/data/bcpack/bc1-2-0.lanes differ
+diff --git a/tests/data/bcpack/bc1-700-2.bin b/tests/data/bcpack/bc1-700-2.bin
+new file mode 100644
+index 0000000..b347065
+Binary files /dev/null and b/tests/data/bcpack/bc1-700-2.bin differ
+diff --git a/tests/data/bcpack/bc1-700-2.lanes b/tests/data/bcpack/bc1-700-2.lanes
+new file mode 100644
+index 0000000..6eac67a
+Binary files /dev/null and b/tests/data/bcpack/bc1-700-2.lanes differ
+diff --git a/tests/data/bcpack/bc1-8192-3.bin b/tests/data/bcpack/bc1-8192-3.bin
+new file mode 100644
+index 0000000..1bf0c42
+Binary files /dev/null and b/tests/data/bcpack/bc1-8192-3.bin differ
+diff --git a/tests/data/bcpack/bc3-16-1.bin b/tests/data/bcpack/bc3-16-1.bin
+new file mode 100644
+index 0000000..7090e9c
+Binary files /dev/null and b/tests/data/bcpack/bc3-16-1.bin differ
+diff --git a/tests/data/bcpack/bc3-16-1.lanes b/tests/data/bcpack/bc3-16-1.lanes
+new file mode 100644
+index 0000000..21f601d
+Binary files /dev/null and b/tests/data/bcpack/bc3-16-1.lanes differ
+diff --git a/tests/data/bcpack/bc4-16-1.bin b/tests/data/bcpack/bc4-16-1.bin
+new file mode 100644
+index 0000000..1801a52
+Binary files /dev/null and b/tests/data/bcpack/bc4-16-1.bin differ
+diff --git a/tests/data/bcpack/bc4-16-1.lanes b/tests/data/bcpack/bc4-16-1.lanes
+new file mode 100644
+index 0000000..d10778c
+Binary files /dev/null and b/tests/data/bcpack/bc4-16-1.lanes differ
+diff --git a/tests/data/bcpack/bc5-16-1.bin b/tests/data/bcpack/bc5-16-1.bin
+new file mode 100644
+index 0000000..76fe757
+Binary files /dev/null and b/tests/data/bcpack/bc5-16-1.bin differ
+diff --git a/tests/data/bcpack/bc5-16-1.lanes b/tests/data/bcpack/bc5-16-1.lanes
+new file mode 100644
+index 0000000..b99826b
+Binary files /dev/null and b/tests/data/bcpack/bc5-16-1.lanes differ
+diff --git a/tests/data/bcpack/bc6-16-1.bin b/tests/data/bcpack/bc6-16-1.bin
+new file mode 100644
+index 0000000..6a3a204
+Binary files /dev/null and b/tests/data/bcpack/bc6-16-1.bin differ
+diff --git a/tests/data/bcpack/bc6-16-1.lanes b/tests/data/bcpack/bc6-16-1.lanes
+new file mode 100644
+index 0000000..02e458d
+Binary files /dev/null and b/tests/data/bcpack/bc6-16-1.lanes differ
+diff --git a/tests/data/bcpack/bc7-16-1.bin b/tests/data/bcpack/bc7-16-1.bin
+new file mode 100644
+index 0000000..43e4a40
+Binary files /dev/null and b/tests/data/bcpack/bc7-16-1.bin differ
+diff --git a/tests/data/bcpack/bc7-16-1.lanes b/tests/data/bcpack/bc7-16-1.lanes
+new file mode 100644
+index 0000000..850bc0d
+Binary files /dev/null and b/tests/data/bcpack/bc7-16-1.lanes differ
+diff --git a/tests/data/bcpack/bc7-2-0.bin b/tests/data/bcpack/bc7-2-0.bin
+new file mode 100644
+index 0000000..83adbc9
+Binary files /dev/null and b/tests/data/bcpack/bc7-2-0.bin differ
+diff --git a/tests/data/bcpack/bc7-2-0.lanes b/tests/data/bcpack/bc7-2-0.lanes
+new file mode 100644
+index 0000000..1dbd860
+Binary files /dev/null and b/tests/data/bcpack/bc7-2-0.lanes differ
+diff --git a/tests/data/bcpack/bc7-700-2.bin b/tests/data/bcpack/bc7-700-2.bin
+new file mode 100644
+index 0000000..2562254
+Binary files /dev/null and b/tests/data/bcpack/bc7-700-2.bin differ
+diff --git a/tests/data/bcpack/bc7-700-2.lanes b/tests/data/bcpack/bc7-700-2.lanes
+new file mode 100644
+index 0000000..e16eece
+Binary files /dev/null and b/tests/data/bcpack/bc7-700-2.lanes differ
+diff --git a/tests/data/bcpack/bc7-8192-3.bin b/tests/data/bcpack/bc7-8192-3.bin
+new file mode 100644
+index 0000000..c362eec
+Binary files /dev/null and b/tests/data/bcpack/bc7-8192-3.bin differ
+diff --git a/tests/data/bcpack/generate.py b/tests/data/bcpack/generate.py
+new file mode 100644
+index 0000000..18b738c
+--- /dev/null
++++ b/tests/data/bcpack/generate.py
+@@ -0,0 +1,186 @@
++"""Generate synthetic q=0 and q=15 BCPack vectors using the encoder's byte counts.
++
++The multiplexer never decodes rANS. Each inverse step records the number
++of bytes the forward step will need later.
++"""
++
++import random
++import struct
++from collections import deque
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent
++BC1 = (8, 8, 5, 6, 5, 5, 6, 5, 8, 8, 8, 8)
++BC7 = (4, 4, 8, 8, 8, 8, 8, 7, 7, 5, 6, 8, 8, 8, 8, 5)
++
++
++WIDTHS = {
++    1: BC1,
++    3: (4, 4, 8, 6, 6, 6, 6, 5, 6, 5, 8, 8),
++    4: (8, 8, 8, 8, 6, 6, 6, 6, 6, 6, 6, 6),
++    5: (4, 4, 8, 8, 6, 6, 6, 6, 6, 6, 6, 6),
++    6: (4, 4, 8, 8, 8, 5, 5, 5, 6, 6, 6, 8, 8, 8, 8, 5),
++    7: BC7,
++}
++
++
++def record_header(mode, body_size):
++    if body_size <= 256:
++        return bytes((mode, body_size - 1))
++    return bytes((mode | 32,)) + struct.pack('<H', body_size - 257)
++
++
++class EncoderLane:
++    def __init__(self, symbols, width, reduction, model, carry=False, trim=False):
++        state = 1 << 24
++        emitted = bytearray()
++        counts = []
++        step = 1 << (16 - width + reduction)
++        for symbol in reversed(symbols):
++            lo = max(1, symbol * step)
++            count = (symbol + 1) * step - lo
++            if model == 15:
++                alphabet = 1 << (width - reduction)
++                count = 65536 - alphabet if symbol == 0 else 1
++                lo = 1 if symbol == 0 else 65536 - alphabet + symbol
++            start = len(emitted)
++            while state >= count << 16:
++                emitted.append(state & 255)
++                state >>= 8
++            counts.append(len(emitted) - start)
++            whole, remainder = divmod(state, count)
++            state = (whole << 16) + lo + remainder
++        mode = 16 | model | (reduction << 6)
++        size = 4 + len(emitted)
++        state_bytes = state.to_bytes(4, 'big')
++        self.continuation = None
++        if carry and emitted:
++            # First record ends immediately after the initial state. Its first
++            # unfulfilled normalisation request starts the continuation header.
++            self.header = deque(bytes((mode & ~16, 3)) + state_bytes)
++            self.payload = deque()
++            self.continuation = (deque(record_header(mode, len(emitted))),
++                                 deque(reversed(emitted)))
++        elif trim:
++            assert len(symbols) == 1 and not any(emitted)
++            state_bytes = state_bytes.rstrip(b'\x00')
++            self.header = deque(record_header(mode, len(state_bytes)) + state_bytes)
++            self.payload = deque()
++            counts = [0]
++        else:
++            self.header = deque(record_header(mode, size) + state_bytes)
++            self.payload = deque(reversed(emitted))
++        self.counts = deque(reversed(counts))
++        self.buffered = False
++        self.owed = 0
++        self.ahead = False
++
++    def wants(self):
++        return self.header or (self.payload and not self.buffered
++                               and (self.owed or not self.ahead))
++
++    def tick(self, served, stalled, out):
++        if self.header:
++            if served:
++                out.append(self.header.popleft())
++            return
++        if served:
++            out.append(self.payload.popleft())
++            self.buffered = True
++        if self.owed:
++            if self.buffered:
++                self.owed -= 1
++                self.buffered = False
++            return
++        if self.counts and not (self.ahead or stalled):
++            self.owed = self.counts.popleft()
++            self.ahead = True
++            if self.buffered and self.owed:
++                self.buffered = False
++                self.owed -= 1
++
++
++def encode(symbols, widths, reductions, model=0, carry=False, trim=False):
++    lanes = [EncoderLane(*spec, model, carry, trim) for spec in zip(symbols, widths, reductions)]
++    out = bytearray()
++    while any(lane.header or lane.counts or lane.owed for lane in lanes):
++        wanted = [i for i, lane in enumerate(lanes) if lane.wants()]
++        for i, lane in enumerate(lanes):
++            lane.tick(i in wanted[:8], i in wanted[8:], out)
++            if lane.owed and lane.continuation:
++                lane.header, lane.payload = lane.continuation
++                lane.continuation = None
++        if all(lane.ahead for lane in lanes):
++            for lane in lanes:
++                lane.ahead = False
++    assert all(not lane.payload and not lane.buffered for lane in lanes)
++    return bytes(out)
++
++
++def generate(mode, units, seed, reduced, **options):
++    widths = WIDTHS[mode]
++    rng = random.Random(seed)
++    reductions = [rng.randrange(4) if reduced else 0 for width in widths]
++    symbols = [[rng.randrange(1 << (width - reduction)) for _ in range(units)]
++               for width, reduction in zip(widths, reductions)]
++    if mode == 1:
++        symbols[1] = [0] * units
++    path = ROOT / f'bc{mode}-{units}-{seed}'
++    path.with_suffix('.bin').write_bytes(encode(symbols, widths, reductions, **options))
++    path.with_suffix('.lanes').write_bytes(b''.join(map(bytes, symbols)))
++    return symbols, path
++
++
++def seed_channels(slot):
++    return [(7 * slot + 13 * k) % (1 << w) for k, w in enumerate(BC1[2:8])]
++
++
++def assemble(symbols):
++    blocks = []
++    raw = bytearray()
++    for i, (ref, _, *fields) in enumerate(zip(*symbols)):
++        d = 255 - ref // 2 if ref & 1 else ref // 2
++        predictor = ([0] * 6 if d == 0 else
++                     blocks[i-d] if i >= d else seed_channels((i-d) % 256))
++        channels = []
++        for v, base, w in zip(fields, predictor, BC1[2:8]):
++            delta = ~(v >> 1) if v & 1 else v >> 1
++            channels.append((base + delta) % (1 << w))
++        blocks.append(channels)
++        for r, g, b in (channels[:3], channels[3:]):
++            raw.extend(struct.pack('<H', r << 11 | g << 5 | b))
++        indices = 0
++        for y in range(4):
++            for x in range(4):
++                code = fields[6 + 2*(y//2) + x//2]
++                px = (code >> (2 * (2*(y%2) + x%2))) & 3
++                indices |= px << (2 * (4*y + x))
++        raw.extend(struct.pack('<I', indices))
++    return bytes(raw)
++
++
++if __name__ == '__main__':
++    for mode in WIDTHS:
++        cases = [(2, 0, False), (16, 1, True), (700, 2, False)]
++        if mode not in (1, 7):
++            cases = [(16, 1, True)]
++        for units, seed, reduced in cases:
++            syms, path = generate(mode, units, seed, reduced)
++            if mode == 1:
++                path.with_suffix('.bc1').write_bytes(assemble(syms))
++
++    for units, seed, extra in [(1, 8, dict(trim=True)), (16, 9, dict(carry=True))]:
++        syms, path = generate(1, units, seed, False, **extra)
++        path.with_suffix('.bc1').write_bytes(assemble(syms))
++
++    for mode, widths in [(1, BC1), (7, BC7)]:
++        units = 8192
++        syms = [[0] * units for _ in widths]
++        if mode == 1:
++            for i in range(0, units, 511):
++                syms[2][i] = 30
++                syms[8][i] = 5
++            for i in range(31, units, 31):
++                syms[0][i] = 2
++        path = ROOT / f'bc{mode}-{units}-3.bin'
++        path.write_bytes(encode(syms, widths, [0]*len(widths), model=15))

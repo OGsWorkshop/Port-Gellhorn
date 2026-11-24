@@ -138,6 +138,9 @@ static FALLBACK_PSO: AtomicU64 = AtomicU64::new(0);
 static FAILED_PSO: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_RS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATED_PSO: AtomicU64 = AtomicU64::new(0);
+/// console MS containers moved from the AS slot and translated (logged sparsely: a title
+/// creates tens of thousands of these pipelines during boot)
+static AS_SLOT_MS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// XCL shader ABI root signature on the backend device (raw, kept for the process lifetime)
 static ABI_RS: AtomicUsize = AtomicUsize::new(0);
@@ -1563,6 +1566,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     } else {
         f(this)
     };
+    let mut memory = None;
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1576,22 +1580,36 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        super::sparse::forget_buffer(this as usize);
+        // a held resource's tiles stay pinned until it goes (`late_release`)
+        if !held {
+            super::sparse::forget_buffer(this as usize);
+        }
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
-        if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
-            }
-        }
+        // the block XCL placed under it (not the title's own memory)
+        memory = match gone {
+            Some((p, _, true)) => Some(p),
+            _ => None,
+        };
     }
     if held {
-        super::late_release::hold(this as usize);
+        // its memory goes with it: a queue may still be using it
+        super::late_release::hold(this as usize, memory);
+    } else if let Some(p) = memory {
+        free_backing(p);
     }
     n
+}
+
+/// Give back the unified-memory or sparse-VRAM block XCL placed under a resource that is gone.
+pub(super) unsafe fn free_backing(p: usize) {
+    let Some(u) = crate::gpu::uma::get() else { return };
+    if u.is_sparse(p) {
+        super::sparse::free(p);
+    } else {
+        u.free(p);
+    }
 }
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
@@ -3499,7 +3517,7 @@ pub(super) fn is_skipped_big_compute(pso: usize) -> bool {
 /// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
 /// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
-mod driver_cache {
+pub(crate) mod driver_cache {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3540,16 +3558,36 @@ mod driver_cache {
         }
     }
 
+    fn create_staging_file(p: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        create_staging_file_with(p, &NEXT)
+    }
+
+    fn create_staging_file_with(p: &Path, next: &AtomicU64) -> std::io::Result<(PathBuf, std::fs::File)> {
+        loop {
+            let tmp = p.with_extension(format!("tmp{}-{}", std::process::id(), next.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+                Ok(file) => return Ok((tmp, file)),
+                // A prior process with this PID may have left a file behind. It is not ours.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// `bytes` to `p`, under another name first: a run that is cut short leaves no half file.
     pub fn write(p: &Path, bytes: &[u8]) -> bool {
+        use std::io::Write;
         if bytes.is_empty() {
             return false;
         }
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-        let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, p).is_ok();
+        let Ok((tmp, mut file)) = create_staging_file(p) else { return false };
+        let written = file.write_all(bytes).is_ok();
+        drop(file);
+        let ok = written && std::fs::rename(&tmp, p).is_ok();
         if !ok {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -3569,6 +3607,11 @@ mod driver_cache {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
 
         #[test]
         fn a_file_is_named_after_its_dxil_and_flags() {
@@ -3597,6 +3640,44 @@ mod driver_cache {
             note(false, Some(&p));
             assert_eq!(load(&p), None);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_overlapping_writer_cannot_modify_the_published_blob() {
+            use std::io::Write;
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-overlap-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let p = dir.join("program.pso");
+            // Another writer, paused after the production staging-file creation step.
+            let (_other_tmp, mut other) = create_staging_file(&p).unwrap();
+            let complete = b"complete second blob";
+            assert!(write(&p, complete));
+            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()));
+            // Resuming the older writer must not change a file already published by this
+            // invocation, even when the older payload is shorter than the newer one.
+            other.write_all(b"old").unwrap();
+            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()), "published bytes must not alias another writer's staging file");
+        }
+
+        #[test]
+        fn an_abandoned_staging_file_is_skipped_and_preserved() {
+            use std::io::Write;
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-stale-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let p = dir.join("program.pso");
+            let occupied = p.with_extension(format!("tmp{}-0", std::process::id()));
+            std::fs::write(&occupied, b"not ours").unwrap();
+            let next = AtomicU64::new(0);
+            let (tmp, mut file) = create_staging_file_with(&p, &next).unwrap();
+            assert_eq!(next.load(Ordering::Relaxed), 2, "the occupied candidate was passed over");
+            assert_ne!(tmp, occupied);
+            file.write_all(b"ours").unwrap();
+            drop(file);
+            std::fs::rename(&tmp, &p).unwrap();
+            assert_eq!(load(&p).as_deref(), Some(b"ours".as_slice()));
+            assert_eq!(std::fs::read(&occupied).unwrap(), b"not ours");
         }
     }
 }
@@ -4282,6 +4363,149 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     hr
 }
 
+/// The mesh and amplification shaders of a stream, as XCL translates them: a console MS
+/// container in the AS slot with no MS subobject (a retail game's minimap pipelines) is the
+/// mesh shader it says it is. It used to be refused – translated, the title rendered nothing
+/// from then on, which was the translated mesh shaders failing their output budget (ms_6_6),
+/// not the slot. With the chunk budget fixed they translate and the title keeps rendering.
+/// Returns (MS to translate, AS left): the moved shader is not an AS any more.
+fn mesh_shader_slots<'a>(ms_slot: Option<&'a [u8]>, as_slot: Option<&'a [u8]>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    use crate::gpu::recomp::pso::is_console;
+    match (ms_slot, as_slot) {
+        (None, Some(a)) if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") => (Some(a), None),
+        (ms, a) => (ms, a),
+    }
+}
+
+#[cfg(test)]
+mod mesh_slot_tests {
+    use super::{console_ms_in_as_slot, fallback_stream, mesh_shader_slots};
+    use crate::gpu::xbox::tests::{sample, fssm, CODE};
+
+    /// A stream subobject: its type, then the payload at 4 (align 4) or 8 (align 8).
+    fn sub(ty: u32, payload: &[u8]) -> Vec<u8> {
+        let (_, palign) = super::super::null::subobject_payload(ty).unwrap();
+        let poff = if palign == 8 { 8 } else { 4 };
+        let mut b = vec![0u8; (poff + payload.len() + 7) & !7];
+        b[..4].copy_from_slice(&ty.to_le_bytes());
+        b[poff..poff + payload.len()].copy_from_slice(payload);
+        b
+    }
+
+    fn bytecode(s: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(s.as_ptr() as u64).to_le_bytes());
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b
+    }
+
+    /// The stream the retail title's AS-slot MS pipelines have: a console MS container in the
+    /// AS subobject, no MS subobject, a PS and the graphics state (`mesh_shader_slots` moves it).
+    fn as_slot_ms_stream(ms: &[u8], ps: &[u8]) -> Vec<u8> {
+        let mut s = sub(0, &0u64.to_le_bytes()); // ROOT_SIGNATURE: null
+        s.extend_from_slice(&sub(24, &bytecode(ms)));
+        s.extend_from_slice(&sub(2, &bytecode(ps)));
+        s.extend_from_slice(&sub(8, &vec![0u8; 328])); // BLEND
+        s.extend_from_slice(&sub(9, &u32::MAX.to_le_bytes())); // SAMPLE_MASK
+        s.extend_from_slice(&sub(10, &vec![0u8; 44])); // RASTERIZER
+        s.extend_from_slice(&sub(11, &vec![0u8; 52])); // DEPTH_STENCIL
+        s.extend_from_slice(&sub(15, &vec![0u8; 36])); // RENDER_TARGET_FORMATS
+        s.extend_from_slice(&sub(17, &[1, 0, 0, 0, 0, 0, 0, 0])); // SAMPLE_DESC
+        s
+    }
+
+    /// The stand-in for a console MS alone in the AS slot is a mesh pipeline: the subobject is
+    /// retyped to MS with the dummy MS (as `translated_mesh_stream` reads the title's stream),
+    /// the PS is the dummy PS. Left an empty AS and a PS, the stream had neither an MS nor a VS
+    /// and the driver refused it (E_INVALIDARG, NishantParajuli's and Chrysana's runs).
+    #[test]
+    fn the_stand_in_of_a_moved_ms_is_a_mesh_pipeline() {
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let ps = b"DXBC-a-pixel-shader".to_vec();
+        let stream = as_slot_ms_stream(&ms, &ps);
+        let desc = [stream.len(), stream.as_ptr() as usize];
+        let subs = super::stream_subobjects(&stream).unwrap();
+        assert!(unsafe { console_ms_in_as_slot(&subs) });
+        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
+        let out = super::stream_subobjects(&buf).unwrap();
+        assert!(!out.iter().any(|s| s.0 == 24), "no AS subobject left");
+        let m = out.iter().find(|s| s.0 == 25).expect("an MS subobject");
+        let dm = super::dummy_mesh().expect("DXC for the stand-in shaders");
+        let got = unsafe { super::payload_shader(m.1) }.unwrap();
+        assert_eq!(got, dm.0.as_slice(), "the dummy MS");
+        let p = out.iter().find(|s| s.0 == 2).unwrap();
+        assert_eq!(unsafe { super::payload_shader(p.1) }.unwrap(), dm.1.as_slice(), "the dummy PS");
+        // a real AS with no MS is not moved, and its stand-in keeps the AS slot empty
+        let as_ = sample(14, &[fssm(&CODE, &[(8, 14)])]);
+        let stream = as_slot_ms_stream(&as_, &ps);
+        let desc = [stream.len(), stream.as_ptr() as usize];
+        assert!(!unsafe { console_ms_in_as_slot(&super::stream_subobjects(&stream).unwrap()) });
+        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.unwrap();
+        let out = super::stream_subobjects(&buf).unwrap();
+        assert!(out.iter().any(|s| s.0 == 24) && !out.iter().any(|s| s.0 == 25));
+    }
+
+    /// The stand-in's target formats are the PC's, as the real pipeline's: the console's
+    /// D16_UNORM_S8_UINT (118) is D24_UNORM_S8_UINT (45) and a B4G4R4A4 target (115) is
+    /// R8G8B8A8 (28). With the console's the driver refuses the stand-in (the title's depth-only
+    /// mesh pipelines; NishantParajuli's follow-up, reproduced natively by thehollowedone).
+    #[test]
+    fn the_stand_in_of_a_stream_has_the_pcs_target_formats() {
+        let mut s = sub(15, &{
+            let mut p = Vec::new();
+            for f in [115u32, 28, 0, 0, 0, 0, 0, 0, 2] {
+                p.extend_from_slice(&f.to_le_bytes());
+            }
+            p
+        });
+        s.extend_from_slice(&sub(16, &118u32.to_le_bytes()));
+        let desc = [s.len(), s.as_ptr() as usize];
+        let (out, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
+        let subs = super::stream_subobjects(&out).unwrap();
+        let word = |p: &[u8], k: usize| u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap());
+        assert_eq!((subs[0].0, word(subs[0].1, 0), word(subs[0].1, 1), word(subs[0].1, 8)), (15, 28, 28, 2));
+        assert_eq!((subs[1].0, word(subs[1].1, 0)), (16, 45));
+    }
+
+    /// A console MS container alone in the AS slot becomes the MS; a real AS (console or PC),
+    /// an MS already present, or a PC shader in the AS slot are left as they are.
+    #[test]
+    fn a_console_ms_in_the_as_slot_is_the_mesh_shader() {
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let as_ = sample(14, &[fssm(&CODE, &[(8, 14)])]);
+        let pc = b"DXBC-not-a-console-container".to_vec();
+        // MS in the AS slot, no MS: moved, and not an AS any more
+        let (m, a) = mesh_shader_slots(None, Some(&ms));
+        assert!(m.is_some_and(|m| std::ptr::eq(m, ms.as_slice())) && a.is_none());
+        // an MS present: both slots untouched, whatever the AS holds
+        let (m, a) = mesh_shader_slots(Some(&ms), Some(&as_));
+        assert!(m.is_some_and(|m| std::ptr::eq(m, ms.as_slice())) && a.is_some_and(|a| std::ptr::eq(a, as_.as_slice())));
+        // a console AS (not an MS) stays in the AS slot
+        let (m, a) = mesh_shader_slots(None, Some(&as_));
+        assert!(m.is_none() && a.is_some_and(|a| std::ptr::eq(a, as_.as_slice())));
+        // a PC shader in the AS slot stays too
+        let (m, a) = mesh_shader_slots(None, Some(&pc));
+        assert!(m.is_none() && a.is_some());
+        // nothing: nothing
+        assert!(mesh_shader_slots(None, None) == (None, None));
+    }
+
+    /// The cached-only attempt defers a moved MS like a console compute pipeline: `defer`
+    /// marks the attempt missed, so `dev_create_pipeline_state` takes the background path
+    /// (stand-in now, translation on the worker / first bind) instead of translating on the
+    /// title's thread – tens of thousands of these pipelines during boot delayed the intro
+    /// by seconds on NVIDIA and past a minute on AMD wave64. Outside the attempt (the
+    /// worker's build) nothing is deferred.
+    #[test]
+    fn a_moved_ms_defers_in_the_attempt_only() {
+        let (_, missed) = crate::gpu::recomp::dxc::cached_only(|| {
+            assert!(crate::gpu::recomp::dxc::defer(), "inside the attempt: deferred");
+        });
+        assert!(missed, "the attempt is missed: the caller takes the background path");
+        assert!(!crate::gpu::recomp::dxc::defer(), "outside: the build translates");
+    }
+}
+
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -4296,17 +4520,11 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
-    // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
-    // from then on (a black screen every run); refused, it goes on to its menus. What it
-    // expects of them is not known yet.
-    if let (None, Some(a)) = (ms_slot, as_slot) {
-        if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
-            return Some(E_INVALIDARG);
-        }
-    }
-    let ms = ms_slot?;
+    // a console MS in the AS slot with no MS subobject: moved, and translated when first
+    // bound (below), not on the title's thread for each of tens of thousands
+    let moved = ms_slot.is_none();
+    let (ms, as_slot) = mesh_shader_slots(ms_slot, as_slot);
+    let Some(ms) = ms else { return None };
     if !is_console(ms) {
         return None;
     }
@@ -4318,6 +4536,21 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             crate::gpu::shader::fnv64(ms)
         ));
         return Some(E_INVALIDARG);
+    }
+    // In the cached-only attempt (non-blocking creation) a moved MS is not translated here:
+    // the title creates tens of thousands of these during boot and uses few; translating each
+    // on the calling thread delayed the intro by seconds (NVIDIA) or past a minute (AMD wave64,
+    // the split path). Made when first bound (`pso_async::lazy`), like a console compute
+    // pipeline: the attempt defers, `go_background` hands the title a stand-in and the worker
+    // (or the bind) runs this path again outside cached-only.
+    if moved && super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return Some(E_INVALIDARG);
+    }
+    if moved {
+        let n = AS_SLOT_MS.fetch_add(1, Ordering::Relaxed);
+        if n < 5 || n % 1000 == 0 {
+            crate::xlog_info!("D3D12.X: mesh pipeline with its MS {:016x} in the AS slot – translated as MS (#{})", crate::gpu::shader::fnv64(ms), n + 1);
+        }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
@@ -4430,6 +4663,25 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
 }
 
+/// The subobject type a retail game gives its console MS: the PC's AS slot (24).
+const CONSOLE_MS: u32 = 24;
+
+/// Index in `subs` of the MS of a stream that numbers it the console's way (`CONSOLE_MS`):
+/// a console MS container there and no PC MS (25) in the stream.
+unsafe fn console_numbered_ms(subs: &[(u32, &[u8])]) -> Option<usize> {
+    if subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32) {
+        return None;
+    }
+    let k = subs.iter().position(|s| s.0 == CONSOLE_MS)?;
+    let b = payload_shader(subs[k].1)?;
+    (crate::gpu::recomp::pso::is_console(b) && crate::gpu::xbox::parse(b).is_some_and(|sh| sh.stage == "MS")).then_some(k)
+}
+
+/// A console MS container in the stream's AS subobject and no MS subobject (`mesh_shader_slots`).
+unsafe fn console_ms_in_as_slot(subs: &[(u32, &[u8])]) -> bool {
+    console_numbered_ms(subs).is_some()
+}
+
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
 unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     let size = *(desc as *const usize);
@@ -4439,7 +4691,12 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    // A console MS alone in the AS slot is the stream's mesh shader (`mesh_shader_slots`), so its
+    // stand-in is a mesh pipeline too, with the dummy MS in that subobject as an MS. Left an AS
+    // without a shader, the stream had a PS and neither an MS nor a VS: the driver refused it
+    // (E_INVALIDARG) and every such pipeline was built in the title's call (NishantParajuli).
+    let ms_in_as = stream_subobjects(&buf).is_some_and(|subs| console_ms_in_as_slot(&subs));
+    let mesh = ms_in_as || stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
@@ -4458,8 +4715,22 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             1 => put(&mut buf, &d.vs),
             2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
+            24 if ms_in_as => {
+                buf[off..off + 4].copy_from_slice(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).to_le_bytes());
+                put(&mut buf, &dm?.0)
+            }
             3 | 4 | 5 | 24 => put(&mut buf, &[]),
             25 => put(&mut buf, &dm?.0),
+            // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's, as
+            // the real pipeline gets them (`translated_mesh_stream`) – with a console-only one
+            // (a retail game's depth-only mesh pipelines: D16_UNORM_S8_UINT) the driver refuses
+            // the stand-in (E_INVALIDARG) and the pipeline is built in the title's call
+            15 | 16 => {
+                for k in 0..if ty == 15 { 8 } else { 1 } {
+                    let f = super::device_x::pc_target_format(u32::from_le_bytes(buf[at + 4 * k..at + 4 * k + 4].try_into().ok()?));
+                    buf[at + 4 * k..at + 4 * k + 4].copy_from_slice(&f.to_le_bytes());
+                }
+            }
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
             _ => {}
@@ -5333,6 +5604,79 @@ mod rect_list_pso_tests {
 }
 
 #[cfg(test)]
+mod console_ms_stream_tests {
+    use super::*;
+    use crate::gpu::xbox::tests::{fssm, sample, CODE};
+
+    /// A console MS container (DXIL kind 13, NGG hardware stage, API stage MS).
+    fn console_ms() -> Vec<u8> {
+        sample(13, &[fssm(&CODE, &[(7, 6)])])
+    }
+
+    /// The title's mesh stream layout: RS, the MS at `ms_type`, PS, null DS / HS / GS, sample mask.
+    fn stream(ms_type: u32, ms: &[u8], extra_pc_ms: Option<&[u8]>) -> StreamOut {
+        let mut s = StreamOut::default();
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &0usize);
+        s.raw(ms_type, &[(ms.as_ptr() as u64).to_le_bytes(), (ms.len() as u64).to_le_bytes()].concat(), true);
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &[]);
+        for ty in [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS] {
+            s.put(ty, &D3D12_SHADER_BYTECODE::default());
+        }
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &u32::MAX);
+        if let Some(m) = extra_pc_ms {
+            s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, m);
+        }
+        s
+    }
+
+    /// An MS container at 24 in a stream without a 25 is the stream's MS; one at 24 next to a PC
+    /// MS (25) is not, and neither is another console stage or a PC shader at 24.
+    #[test]
+    fn a_console_ms_at_24_without_a_pc_ms_is_the_streams_ms() {
+        let ms = console_ms();
+        let ps = sample(0, &[fssm(&CODE, &[(5, 1)])]);
+        let pc = vec![0x44u8; 64];
+        unsafe {
+            let s = stream(CONSOLE_MS, &ms, None);
+            let subs = stream_subobjects(&s.0).expect("a stream XCL can read");
+            assert_eq!(console_numbered_ms(&subs), Some(1));
+            assert_eq!(payload_shader(subs[1].1), Some(&ms[..]));
+            let both = stream(CONSOLE_MS, &ms, Some(&ms));
+            assert_eq!(console_numbered_ms(&stream_subobjects(&both.0).unwrap()), None);
+            for other in [&ps, &pc] {
+                let s = stream(CONSOLE_MS, other, None);
+                assert_eq!(console_numbered_ms(&stream_subobjects(&s.0).unwrap()), None);
+            }
+            let at_25 = stream(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32, &ms, None);
+            assert_eq!(console_numbered_ms(&stream_subobjects(&at_25.0).unwrap()), None);
+        }
+    }
+
+    /// The stand-in of such a stream is a PC mesh stream: the stand-in MS at 25, nothing at 24
+    /// (before, 24 was emptied and the stream had no shader stage: the driver refused it, and the
+    /// title's pipelines were all built in the call).
+    #[test]
+    fn the_stand_in_of_a_console_numbered_stream_has_a_pc_ms() {
+        if crate::gpu::recomp::dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let ms = console_ms();
+        let s = stream(CONSOLE_MS, &ms, None);
+        let desc: [usize; 2] = [s.0.len(), s.0.as_ptr() as usize];
+        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
+        let subs = stream_subobjects(&buf).unwrap();
+        let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
+        assert_eq!(types, [0, 25, 2, 3, 4, 5, 9]);
+        let dm = dummy_mesh().expect("stand-in mesh shaders");
+        unsafe {
+            assert_eq!(payload_shader(subs[1].1), Some(&dm.0[..]));
+            assert_eq!(payload_shader(subs[2].1), Some(&dm.1[..]));
+        }
+    }
+}
+
+#[cfg(test)]
 mod this_first_tests {
     use super::*;
 
@@ -5787,6 +6131,66 @@ mod console_format_query_tests {
             let d: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&x).as_ptr() as *const _) };
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod held_release_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    /// A resource whose last `Release` is held (a queue still has work) keeps the unified memory
+    /// XCL placed under it until the hold ends: given back at the title's `Release`, the block
+    /// could go to the next allocation while the GPU still used it.
+    #[test]
+    fn a_held_resource_keeps_its_unified_memory_until_it_goes() {
+        unsafe {
+            if !super::super::late_release::enabled() {
+                return;
+            }
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(u) = crate::gpu::uma::get() else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // a queue with work in flight (it waits for a fence nobody has signalled yet) that
+            // the title has submitted to: late release waits for the queues it knows
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 4096,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
+            let raw = res.unwrap().into_raw();
+            adopt(raw, Kind::Resource);
+            // the block XCL placed under it, recorded as `place_console_buffer` does
+            let p = u.alloc(0x1_0000, crate::gpu::uma::GRAIN).expect("unified memory") as usize;
+            UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(raw as usize, (p, 0x1_0000, true));
+
+            // the title's last Release, while the queue still has work
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw as *const *const usize)).add(2));
+            assert_eq!(release(raw), 0);
+            assert!(u.is_allocated(p), "the block under a held resource went back while a queue still had work");
+
+            gate.Signal(1).unwrap();
+            let start = std::time::Instant::now();
+            while u.is_allocated(p) && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!u.is_allocated(p), "the block goes back once the held resource goes");
         }
     }
 }

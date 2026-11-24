@@ -91,8 +91,34 @@ fn build_threads() -> usize {
     std::env::var("XCL_PSO_BUILD_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(4).clamp(1, 64)
 }
 
+/// The queued builds in three lanes, taken in this order: `urgent` (a bind is waiting), graphics,
+/// compute. Graphics pipelines go ahead of queued compute ones: a compute pipeline is waited for
+/// at its first bind anyway, while a graphics pipeline draws nothing until it is built.
+#[derive(Default)]
+struct Lanes {
+    urgent: std::collections::VecDeque<Arc<Pending>>,
+    gfx: std::collections::VecDeque<Arc<Pending>>,
+    compute: std::collections::VecDeque<Arc<Pending>>,
+}
+
+impl Lanes {
+    fn push(&mut self, compute: bool, front: bool, p: Arc<Pending>) {
+        if front {
+            self.urgent.push_back(p);
+        } else if compute {
+            self.compute.push_back(p);
+        } else {
+            self.gfx.push_back(p);
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<Arc<Pending>> {
+        self.urgent.pop_front().or_else(|| self.gfx.pop_front()).or_else(|| self.compute.pop_front())
+    }
+}
+
 struct WorkQ {
-    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
+    list: Mutex<Lanes>,
     cv: Condvar,
 }
 
@@ -107,7 +133,7 @@ fn queue() -> &'static WorkQ {
                     let p = {
                         let mut g = q.list.lock().unwrap();
                         loop {
-                            if let Some(p) = g.pop_front() {
+                            if let Some(p) = g.pop_next() {
                                 break p;
                             }
                             g = q.cv.wait(g).unwrap();
@@ -125,15 +151,12 @@ fn queue() -> &'static WorkQ {
     })
 }
 
-/// To the workers; `front`: ahead of everything queued (a bind is waiting for it).
+/// To the workers; `front`: ahead of everything queued (a bind is waiting for it); otherwise
+/// graphics pipelines are taken before compute ones.
 fn enqueue(p: Arc<Pending>, front: bool) {
     let q = queue();
     let mut g = q.list.lock().unwrap();
-    if front {
-        g.push_front(p);
-    } else {
-        g.push_back(p);
-    }
+    g.push(p.compute, front, p);
     drop(g);
     q.cv.notify_one();
 }
@@ -366,6 +389,36 @@ mod used_tests {
         }
         assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
         let _ = released(standin);
+    }
+
+    /// Graphics builds are taken ahead of queued compute ones; a build a bind waits for, ahead of both.
+    #[test]
+    fn graphics_builds_dequeue_ahead_of_queued_compute_builds() {
+        let mk = |compute: bool| {
+            Arc::new(Pending {
+                job: Mutex::new(None),
+                sent: Default::default(),
+                real: AtomicUsize::new(0),
+                done: Mutex::new(false),
+                cv: Condvar::new(),
+                compute,
+                key: 0,
+                used: Default::default(),
+                orphan: Default::default(),
+                late: Default::default(),
+            })
+        };
+        let (c1, c2, g1, g2, u) = (mk(true), mk(true), mk(false), mk(false), mk(true));
+        let mut l = Lanes::default();
+        l.push(true, false, c1.clone());
+        l.push(true, false, c2.clone());
+        l.push(false, false, g1.clone());
+        l.push(false, false, g2.clone());
+        l.push(true, true, u.clone());
+        for want in [&u, &g1, &g2, &c1, &c2] {
+            assert!(Arc::ptr_eq(&l.pop_next().unwrap(), want));
+        }
+        assert!(l.pop_next().is_none());
     }
 
     /// Prefetched pipelines build side by side on the workers, and a waiting bind does not build

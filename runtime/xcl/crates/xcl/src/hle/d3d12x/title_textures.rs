@@ -464,6 +464,9 @@ pub fn note_gpu_write(res: usize) {
             GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
         }
     }
+    drop(t);
+    // page budget: its texels are not in the title's memory, so the page budget keeps it
+    super::vram::pin(res);
 }
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -570,7 +573,31 @@ pub fn submitted(lists: &[*mut c_void]) {
     if notes.is_empty() {
         return;
     }
+    // page budget: a texture the title uses is recent; an evicted one is
+    // mapped again and uploaded whole at the next submit
+    let mut revive = Vec::new();
+    for &(res, _, _) in &notes {
+        super::vram::touch(res);
+        if super::vram::any_evicted() && super::vram::take_evicted(res) {
+            revive.push(res);
+        }
+    }
+    for &res in &revive {
+        let p = res as *mut c_void;
+        if let Some(r) = unsafe { ID3D12Resource::from_raw_borrowed(&p) } {
+            unsafe { super::vram::remap_if_unmapped(r) };
+        }
+        forget_content(res);
+    }
     let mut t = TEXTURES.lock().unwrap();
+    for res in revive {
+        if let Some(e) = t.get_mut(res) {
+            if !e.pending {
+                e.pending = true;
+                PENDING.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     for (res, sub, after) in notes {
         if let Some(e) = t.get_mut(res) {
             let n = subresource_count(&e.tex);
@@ -776,6 +803,16 @@ unsafe fn refresh_once(queue: *mut c_void) {
             })
             .collect()
     });
+    // page budget: a texture the CPU wrote again is mapped again before its
+    // whole upload
+    if super::vram::any_evicted() {
+        for (r, _) in &todo {
+            if super::vram::take_evicted(r.as_raw() as usize) {
+                super::vram::remap_if_unmapped(r);
+                forget_content(r.as_raw() as usize);
+            }
+        }
+    }
     upload_all(todo);
 }
 
@@ -793,6 +830,12 @@ fn unchanged_skip() -> bool {
 /// content from here on (the caller uploads it when this is false).
 fn same_as_last_upload(res: usize, h: u64) -> bool {
     LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+}
+
+/// Page budget: `res` was mapped again on fresh tiles, so its next upload
+/// must not be left out as unchanged.
+fn forget_content(res: usize) {
+    LAST_CONTENT.lock().unwrap().remove(&res);
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -1010,9 +1053,12 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
     Ok(made)
 }
 
-/// Ranges closer than this are scanned as one (a gap costs little to scan; a call per texture –
-/// thousands of them – a lot)
-const WATCH_GAP: usize = 1 << 20;
+/// Ranges closer than this are scanned as one. A write-watch call costs ~3.5 µs however little it
+/// covers, while one call over 2 GiB of committed pages takes ~1.3 ms (measured on Windows 11): a
+/// retail game's intro video had its submitting thread at 42 % in GetWriteWatch with a 1 MiB gap
+/// (thousands of calls before each submit over its mapped sparse tiles). The pages of a gap are
+/// reported as written too; the uploads keep to what they track.
+const WATCH_GAP: usize = 64 << 20;
 
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
@@ -1026,10 +1072,14 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
             _ => merged.push((a, b)),
         }
     }
+    // each region against the merged ranges it meets (sorted and disjoint: a binary search, not
+    // a pass over all of them – both lists run to thousands while a game streams)
     let mut out = Vec::new();
-    for (a, b) in merged {
-        for &(base, size) in regions {
-            let (lo, hi) = (a.max(base), b.min(base + size));
+    for &(base, size) in regions {
+        let end = base + size;
+        let first = merged.partition_point(|&(_, b)| b <= base);
+        for &(a, b) in merged[first..].iter().take_while(|&&(a, _)| a < end) {
+            let (lo, hi) = (a.max(base), b.min(end));
             if lo < hi {
                 out.push((lo, hi - lo));
             }
@@ -1210,6 +1260,19 @@ mod tests {
         assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
         forget(a);
         forget(b);
+    }
+
+    /// Page budget: a texture mapped again after an eviction sits on fresh
+    /// tiles, so unchanged memory is uploaded again.
+    #[test]
+    fn a_texture_mapped_again_after_eviction_is_uploaded_even_if_unchanged() {
+        let a = 0x7E57_0000_3000usize;
+        let h = content_hash(&[7u8; 4096]);
+        assert!(!same_as_last_upload(a, h));
+        assert!(same_as_last_upload(a, h), "unchanged: left out");
+        forget_content(a);
+        assert!(!same_as_last_upload(a, h), "mapped again: uploaded whole");
+        forget_content(a);
     }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
@@ -1538,9 +1601,15 @@ mod tests {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
-        // ranges a gap of under 1 MiB apart: one scan; further apart: two
-        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+        // ranges a gap of under WATCH_GAP apart: one scan; further apart: two
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000), (0x1800_0000, 0x1800_1000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x100_1000), (0x1800_0000, 0x1000)]);
+        // a merged range over two regions: a piece in each, whatever order the regions come in
+        let regions = [(0x40000, 0x10000), (0x10000, 0x10000)];
+        assert_eq!(watch_ranges(&regions, vec![(0x18000, 0x48000)]), vec![(0x18000, 0x8000), (0x40000, 0x8000)]);
+        // a region between two merged ranges, and one past them all
+        let regions = [(0x2000_0000, 0x10_0000), (0x9000_0000, 0x1000)];
+        assert_eq!(watch_ranges(&regions, vec![(0x1000_0000, 0x1000_1000), (0x2008_0000, 0x2009_0000)]), vec![(0x2008_0000, 0x1_0000)]);
     }
 
     /// The textures of a batch detiled on several threads come back as on one: complete and in
