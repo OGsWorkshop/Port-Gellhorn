@@ -28,5 +28,8 @@ Every change we made to a runtime is also in `patches/` as a plain diff against 
 | Patch | Base | What it does |
 |---|---|---|
 | `xcl-stack.patch` | xcl `main` | everything this repo's XCL adds: upstream PRs #684, #850, #851, #891, #900, #906 and #944, the BCPack decoder from #905, a 4096-iteration cap on shader loops, `XCL_PRESS_FILE` live input, and `XCL_SKIP_CS_OVER` (a debugging switch) |
-| `victory-01-wave64-emulation-and-agility-sdk.patch` | VIctory `d2a4bae` | wave64 emulation on 32-lane GPUs; Agility SDK opt-in so Windows 10 works |
-| `victory-02-auto-input.patch` | above | `VICTORY_AUTO_INPUT`: hands-free menu presses |
+| `victory-stack.patch` | VIctory `main` | upstream PR #578 (refuse wave64 programs a 32-lane GPU cannot run, instead of hanging); Agility SDK opt-in for Windows 10; `VICTORY_PRESS_FILE` live input; `VICTORY_CAPTURE_EVERY=N` (saves the frame and every render target every N frames) |
+
+## Where the world stands (NVIDIA, 32-lane GPUs)
+
+With VIctory `main` + #578 in Series S mode (`--console series-s`, about half the memory), the game enters the open world and its frame graph runs: around 190 render targets per frame, the screen-space buffers and simulation maps are being written. The G-buffer stays empty because the world's geometry is drawn by **wave64 mesh shaders**, which a 32-lane GPU can't run as-is. Translating those (XCL's two-pass mesh path, or a wave64-on-wave32 mesh lowering in VIctory) is the remaining wall.

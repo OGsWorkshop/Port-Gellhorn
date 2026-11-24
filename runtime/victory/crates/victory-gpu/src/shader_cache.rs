@@ -6,7 +6,7 @@
 //! atomically; an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to [`encode`] and [`decode`] too (entries of older builds
+//! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 
 use std::path::PathBuf;
@@ -72,23 +72,9 @@ fn build() -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => {
-            let key = key(build(), victory_shader::emit::wave64_emulation());
-            cached(cache, &key, container, translate)
-        }
+        Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
     }
-}
-
-/// The build part of an entry's key. Translations made with 64-lane waves
-/// emulated (`VICTORY_WAVE64_EMULATE`) differ from the plain ones of the
-/// same build, so that mode's byte is hashed into the key; without it the
-/// key is the build, as it always was.
-fn key(build: &[u8; 32], emulate_wave64: bool) -> [u8; 32] {
-    if !emulate_wave64 {
-        return *build;
-    }
-    *blake3::hash(&[&build[..], &[1u8]].concat()).as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -360,14 +346,6 @@ mod tests {
             }
         }
         files
-    }
-
-    #[test]
-    fn emulated_translations_have_their_own_key() {
-        let build = [7u8; 32];
-        assert_eq!(key(&build, false), build, "plain entries keep their key");
-        assert_ne!(key(&build, true), build);
-        assert_ne!(key(&build, true), key(&[8; 32], true));
     }
 
     #[test]

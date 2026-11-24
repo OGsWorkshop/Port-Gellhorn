@@ -14,11 +14,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
-// Local addition: DirectX Agility SDK opt-in, so Windows 10 loads D3D12Core.dll 1.614 from .\D3D12\ next to the
-// executable. The inbox Windows 10 runtime refuses the *_HEAP_DIRECTLY_INDEXED root signature flags.
+// Agility SDK opt-in: Windows 10 loads D3D12Core.dll 1.614 from .\D3D12\
+// next to the executable (the inbox runtime refuses HEAP_DIRECTLY_INDEXED).
 #[repr(transparent)]
 pub struct SdkPath(*const u8);
-// SAFETY: a pointer to a static, never-written string.
 unsafe impl Sync for SdkPath {}
 
 #[used]
@@ -197,6 +196,7 @@ fn show_config() -> Result<()> {
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
+    println!("data_dir    : {}", cfg.data_dir.display());
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
@@ -204,7 +204,7 @@ fn show_config() -> Result<()> {
         .game_dir
         .iter()
         .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir])
+        .chain([&cfg.cache_dir, &cfg.data_dir])
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");

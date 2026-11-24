@@ -264,6 +264,8 @@ mod tests {
             factory.EnumWarpAdapter::<IDXGIAdapter>()
         };
         let Ok(raw) = raw else { return };
+        // SAFETY: EnumWarpAdapter returns a DXGI adapter, which implements
+        // IDXGIAdapter1; `raw` owns that interface.
         let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
         eprintln!(
             "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
@@ -444,6 +446,46 @@ impl Host {
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
             tracing::info!(mesh, "host mesh shader support");
             mesh
+        })
+    }
+
+    /// The host GPU's supported wave-lane range `(WaveLaneCountMin,
+    /// WaveLaneCountMax)` from `D3D12_FEATURE_D3D12_OPTIONS1` (defaults to
+    /// `(32, 64)` when the query fails, so nothing is refused for it).
+    /// Note: WARP (`VICTORY_D3D12_WARP=1`) reports `(4, 4)` even on 64-lane
+    /// hardware, so shaders requiring wider waves are refused there too.
+    pub(crate) fn wave_lanes(&self) -> (u32, u32) {
+        static LANES: OnceLock<(u32, u32)> = OnceLock::new();
+        *LANES.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let (min, max) = if ok
+                && options.WaveLaneCountMin > 0
+                && options.WaveLaneCountMax >= options.WaveLaneCountMin
+            {
+                (options.WaveLaneCountMin, options.WaveLaneCountMax)
+            } else {
+                (32, 64)
+            };
+            if max < 32 {
+                tracing::info!(
+                    min,
+                    max,
+                    "host wave lanes (software/WARP adapter reports narrow waves; wider-wave shaders will be refused)"
+                );
+            } else {
+                tracing::info!(min, max, "host wave lanes");
+            }
+            (min, max)
         })
     }
 
@@ -1466,6 +1508,8 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    #[cfg(feature = "diagnostics")]
+    copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -1478,6 +1522,8 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            #[cfg(feature = "diagnostics")]
+            copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -1489,6 +1535,10 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.copy_stats_frames += 1;
+        }
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -1527,7 +1577,7 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(frames);
+                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

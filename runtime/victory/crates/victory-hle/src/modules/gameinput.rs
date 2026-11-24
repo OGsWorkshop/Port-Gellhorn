@@ -513,9 +513,54 @@ impl State {
     }
 }
 
+/// VICTORY_PRESS_FILE=<path>: buttons written to that file ("A", "DOWN DOWN A") are held one
+/// after another for 150 ms each, then the file is emptied.
+fn live_press(keys: &mut Vec<KeyState>) {
+    use std::sync::{Mutex, OnceLock};
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    static Q: Mutex<(Option<Instant>, Vec<u8>, Option<Instant>)> = Mutex::new((None, Vec::new(), None));
+    let Some(path) = PATH.get_or_init(|| std::env::var("VICTORY_PRESS_FILE").ok()) else { return };
+    let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if q.1.is_empty() && q.0.is_none_or(|t| now - t >= Duration::from_millis(50)) {
+        q.0 = Some(now);
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if !s.trim().is_empty() {
+                let _ = std::fs::write(path, "");
+                q.1 = s
+                    .split_whitespace()
+                    .rev()
+                    .filter_map(|b| match b.to_ascii_uppercase().as_str() {
+                        "A" => Some(0x0D),
+                        "B" => Some(0x08),
+                        "UP" => Some(0x26),
+                        "DOWN" => Some(0x28),
+                        "LEFT" => Some(0x25),
+                        "RIGHT" => Some(0x27),
+                        "MENU" => Some(0x1B),
+                        "X" => Some(b'X'),
+                        "Y" => Some(b'Y'),
+                        _ => None,
+                    })
+                    .collect();
+                q.2 = Some(now);
+            }
+        }
+    }
+    let Some(&vk) = q.1.last() else { return };
+    let held = q.2.map_or(Duration::ZERO, |t| now - t);
+    if held < Duration::from_millis(150) {
+        keys.push(KeyState { scan_code: 0, code_point: 0, virtual_key: vk, dead_key: false });
+    } else if held >= Duration::from_millis(300) {
+        q.1.pop();
+        q.2 = Some(now);
+    }
+}
+
 /// VICTORY_AUTO_INPUT: inject A-button presses every ~2 s for the first
 /// 120 s, so menus advance without manual interaction.
 fn auto_input_inject(keys: &mut Vec<KeyState>) {
+    live_press(keys);
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     static START: OnceLock<Instant> = OnceLock::new();
