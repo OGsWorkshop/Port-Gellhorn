@@ -7,7 +7,7 @@ use crate::{Launcher, LogKind, Page, RunKind, GAME_EXE, KOFI_URL, PAYPAL_URL, PL
 use eframe::egui::{self, pos2, vec2, Align2, Color32, Rect, Sense, Stroke, Ui};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 3] = ["Game", "Options", "About"];
+const TABS: [&str; 4] = ["Game", "Display", "Options", "About"];
 
 /// (kind, status, title, summary)
 const NEWS: [(&str, &str, &str, &str); 6] = [
@@ -173,7 +173,7 @@ impl Launcher {
         let (status, color) = if self.runtime_dir.is_some() { ("Ready", Some(SUCCESS)) } else { ("Unpacking…", None) };
         let note = self.runtime_note.clone();
         if section_row(ui, row(52.), "row-runtime", Icon::Server, "XCL runtime", &note, Status { text: status, color }, true) {
-            self.settings_tab = 2;
+            self.settings_tab = 3;
             self.go(Page::Settings);
         }
         let stage = self.stage();
@@ -541,7 +541,8 @@ impl Launcher {
         p.line_segment([pos2(c.min.x - 12., top), pos2(c.min.x - 12., area.max.y)], Stroke::new(1.0_f32, LINE));
         match self.settings_tab {
             0 => self.settings_game(ui, c),
-            1 => self.settings_options(ui, c),
+            1 => self.settings_display(ui, c),
+            2 => self.settings_options(ui, c),
             _ => self.settings_about(ui, c),
         }
     }
@@ -563,6 +564,165 @@ impl Launcher {
         let note_color = if self.folder_busy { TEXT_MUTED } else if ok { SUCCESS } else { mix(DANGER, TEXT, 0.2) };
         let galley = p.layout(note, font(12.5, "regular"), note_color, c.width());
         p.galley(pos2(c.min.x, by + CONTROL + 12.), galley, note_color);
+    }
+
+    fn settings_display(&mut self, ui: &mut Ui, c: Rect) {
+        let p = ui.painter().clone();
+        caption(&p, pos2(c.min.x, c.min.y), Align2::LEFT_TOP, "Display");
+        let w = c.width().min(640.);
+        let row_at = |i: usize| Rect::from_min_size(pos2(c.min.x, c.min.y + 28. + i as f32 * 66.), vec2(w, 58.));
+        let rows = [
+            ("Window mode", "Alt+Enter toggles windowed and borderless."),
+            ("Resolution", "Output size. The game renders at its own resolution."),
+            ("Frame rate limit", "Caps the frame clock. Unlimited adds no cap."),
+            ("VSync", "Waits for the display refresh. Off may tear."),
+            ("Monitor", "Which display the game opens on."),
+        ];
+        for (i, (title, sub)) in rows.iter().enumerate() {
+            let row = row_at(i);
+            p.rect_filled(row, RADIUS_MD, BG_100);
+            p.rect_stroke(row, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
+            p.text(pos2(row.min.x + 18., row.center().y - 9.), Align2::LEFT_CENTER, *title, font(15., "semibold"), TEXT);
+            p.text(pos2(row.min.x + 18., row.center().y + 10.), Align2::LEFT_CENTER, *sub, font(12., "regular"), TEXT_MUTED);
+        }
+        let mut changed = false;
+        let ctl_y = |r: Rect| r.center().y - CONTROL / 2.;
+
+        // window mode
+        let r = row_at(0);
+        for (k, label) in crate::display::MODE_LABELS.iter().enumerate() {
+            let x = r.max.x - 18. - 3. * 96. - 2. * 6. + k as f32 * 102.;
+            let sel = self.config.display.mode == crate::display::MODES[k];
+            let kind = if sel { Kind::Primary } else { Kind::Secondary };
+            if button(ui, Rect::from_min_size(pos2(x, ctl_y(r)), vec2(96., CONTROL)), ("dmode", k), label, kind, true, None) && !sel {
+                self.config.display.mode = crate::display::MODES[k].to_string();
+                changed = true;
+            }
+        }
+
+        // frame rate limit
+        let r = row_at(2);
+        let caps = [(30u32, "30", 60.), (60, "60", 60.), (0, "Unlimited", 104.)];
+        let total: f32 = caps.iter().map(|c| c.2).sum::<f32>() + 12.;
+        let mut x = r.max.x - 18. - total;
+        for (cap, label, bw) in caps {
+            let sel = self.config.display.fps_cap == cap;
+            let kind = if sel { Kind::Primary } else { Kind::Secondary };
+            if button(ui, Rect::from_min_size(pos2(x, ctl_y(r)), vec2(bw, CONTROL)), ("dfps", cap), label, kind, true, None) && !sel {
+                self.config.display.fps_cap = cap;
+                changed = true;
+            }
+            x += bw + 6.;
+        }
+
+        // vsync
+        let r = row_at(3);
+        let mut on = self.config.display.vsync;
+        if switch(ui, Rect::from_center_size(pos2(r.max.x - 44., r.center().y), vec2(40., 24.)), "dvsync", &mut on) {
+            self.config.display.vsync = on;
+            changed = true;
+        }
+
+        // resolution and monitor: dropdowns, drawn last so an open list is on top
+        let mon = (self.config.display.monitor as usize).min(self.monitors.len().saturating_sub(1));
+        let mut res_items = vec!["Automatic".to_string()];
+        let mut res_vals = vec![String::new()];
+        for &(rw, rh) in self.monitors.get(mon).map(|m| m.modes.as_slice()).unwrap_or(&[]) {
+            res_items.push(format!("{rw} x {rh}"));
+            res_vals.push(format!("{rw}x{rh}"));
+        }
+        let res_sel = res_vals.iter().position(|v| *v == self.config.display.resolution.replace(' ', "")).unwrap_or(0);
+        let mon_items: Vec<String> = if self.monitors.is_empty() { vec!["Primary".to_string()] } else { self.monitors.iter().enumerate().map(|(i, m)| m.label(i)).collect() };
+        let fields = [(0u8, row_at(1)), (1u8, row_at(4))];
+        let mut popup = None;
+        for (which, r) in fields {
+            let field = Rect::from_min_size(pos2(r.max.x - 18. - 220., ctl_y(r)), vec2(220., CONTROL));
+            let (items, sel) = if which == 0 { (&res_items, res_sel) } else { (&mon_items, mon.min(mon_items.len() - 1)) };
+            let text = items[sel].clone();
+            if self.dropdown_field(ui, field, which, &text) {
+                self.dd = if self.dd == Some(which) { None } else { Some(which) };
+                self.dd_scroll = sel.saturating_sub(3);
+            }
+            if self.dd == Some(which) {
+                popup = Some((which, field, items.clone(), sel));
+            }
+        }
+        if let Some((which, field, items, sel)) = popup {
+            if let Some(i) = self.dropdown_list(ui, field, &items, sel) {
+                if which == 0 {
+                    self.config.display.resolution = res_vals[i].clone();
+                } else {
+                    self.config.display.monitor = i as u32;
+                    self.config.display.resolution.clear();
+                }
+                self.dd = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save();
+        }
+        p.text(pos2(c.min.x, row_at(4).max.y + 16.), Align2::LEFT_TOP, "Applied the next time you press Play.", font(12.5, "regular"), TEXT_MUTED);
+    }
+
+    /// The closed dropdown: current value and a chevron. True when clicked.
+    fn dropdown_field(&self, ui: &mut Ui, rect: Rect, id: u8, text: &str) -> bool {
+        let id = egui::Id::new(("dropdown", id));
+        let r = ui.interact(rect, id, Sense::click());
+        let h = ui.ctx().animate_bool_with_time(id.with("h"), r.hovered(), QUICK);
+        let p = ui.painter().clone();
+        p.rect_filled(rect, RADIUS_SM, mix(BG_200, BG_300, h));
+        p.rect_stroke(rect, RADIUS_SM, Stroke::new(1.0_f32, mix(LINE, LINE_HOVER, h)), egui::StrokeKind::Inside);
+        let t = fit(ui, text, font(13.5, "regular"), rect.width() - 44.);
+        p.text(pos2(rect.min.x + 14., rect.center().y), Align2::LEFT_CENTER, t, font(13.5, "regular"), TEXT);
+        let c = pos2(rect.max.x - 18., rect.center().y);
+        let s = Stroke::new(1.6_f32, TEXT_MUTED);
+        p.line_segment([c + vec2(-4., -2.), c + vec2(0., 2.)], s);
+        p.line_segment([c + vec2(0., 2.), c + vec2(4., -2.)], s);
+        hand(ui, &r);
+        r.clicked()
+    }
+
+    /// The open list under a dropdown (seven rows, the wheel scrolls). The picked index.
+    fn dropdown_list(&mut self, ui: &mut Ui, field: Rect, items: &[String], selected: usize) -> Option<usize> {
+        const ROW: f32 = 30.;
+        let vis = items.len().min(7);
+        let list = Rect::from_min_size(pos2(field.min.x, field.max.y + 4.), vec2(field.width(), vis as f32 * ROW + 8.));
+        let (pointer, pressed, wheel) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.primary_pressed(), i.raw_scroll_delta.y));
+        let over = pointer.is_some_and(|q| list.contains(q));
+        if pressed && !over && !pointer.is_some_and(|q| field.contains(q)) {
+            self.dd = None;
+            return None;
+        }
+        if over && wheel != 0. {
+            let max = items.len().saturating_sub(vis);
+            self.dd_scroll = if wheel > 0. { self.dd_scroll.saturating_sub(1) } else { (self.dd_scroll + 1).min(max) };
+        }
+        self.dd_scroll = self.dd_scroll.min(items.len().saturating_sub(vis));
+        let p = ui.painter().clone();
+        p.rect_filled(list.expand(1.), RADIUS_SM, LINE);
+        p.rect_filled(list, RADIUS_SM, BG_200);
+        let mut picked = None;
+        for k in 0..vis {
+            let i = self.dd_scroll + k;
+            let row = Rect::from_min_size(pos2(list.min.x + 4., list.min.y + 4. + k as f32 * ROW), vec2(list.width() - 8., ROW));
+            let r = ui.interact(row, egui::Id::new(("dd-item", i)), Sense::click());
+            let h = ui.ctx().animate_bool_with_time(r.id, r.hovered(), QUICK);
+            p.rect_filled(row, RADIUS_SM, fade(BG_300, h));
+            let on = i == selected;
+            p.text(pos2(row.min.x + 10., row.center().y), Align2::LEFT_CENTER, fit(ui, &items[i], font(13., "regular"), row.width() - 20.), font(13., if on { "semibold" } else { "regular" }), if on { ACCENT } else { TEXT });
+            hand(ui, &r);
+            if r.clicked() {
+                picked = Some(i);
+            }
+        }
+        if items.len() > vis {
+            let track = Rect::from_min_size(pos2(list.max.x - 5., list.min.y + 6.), vec2(2., list.height() - 12.));
+            let th = track.height() * vis as f32 / items.len() as f32;
+            let ty = track.min.y + (track.height() - th) * self.dd_scroll as f32 / (items.len() - vis) as f32;
+            p.rect_filled(Rect::from_min_size(pos2(track.min.x, ty), vec2(2., th)), 1, LINE_HOVER);
+        }
+        picked
     }
 
     fn settings_options(&mut self, ui: &mut Ui, c: Rect) {

@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod art;
+mod display;
 mod flow;
 mod game;
 mod runtime;
@@ -70,6 +71,9 @@ pub struct Config {
     /// Size of the pipeline journal when the world pipelines were last built.
     #[serde(default)]
     pub world_len: u64,
+    /// Window mode, resolution, frame rate cap, vsync and monitor (passed to the runtime).
+    #[serde(default)]
+    pub display: display::DisplayCfg,
 }
 
 pub enum Message {
@@ -102,6 +106,10 @@ pub struct Launcher {
     pub folder_note: (String, bool),
     pub folder_busy: bool,
     pub settings_tab: usize,
+    pub monitors: Vec<display::Monitor>,
+    /// The open dropdown on the Display tab (0 resolution, 1 monitor) and its scroll offset.
+    pub dd: Option<u8>,
+    pub dd_scroll: usize,
     pub running: Option<RunKind>,
     pub stop: Option<Arc<AtomicBool>>,
     pub logs: Vec<(String, LogKind)>,
@@ -180,6 +188,9 @@ impl Launcher {
             folder_note: (String::new(), true),
             folder_busy: false,
             settings_tab: 0,
+            monitors: display::monitors(),
+            dd: None,
+            dd_scroll: 0,
             running: None,
             stop: None,
             logs: Vec::new(),
@@ -199,6 +210,15 @@ impl Launcher {
             l.save();
         }
         l.unpack_runtime();
+        let mut l = l;
+        // `--page=settings` opens Settings on its Display tab (`--tab=game|display|options|about`)
+        if std::env::args().any(|a| a == "--page=settings") {
+            l.page = Page::Settings;
+            l.settings_tab = 1;
+        }
+        if let Some(t) = std::env::args().find_map(|a| a.strip_prefix("--tab=").map(str::to_string)) {
+            l.settings_tab = ["game", "display", "options", "about"].iter().position(|n| *n == t).unwrap_or(l.settings_tab);
+        }
         l
     }
 
@@ -295,6 +315,9 @@ impl Launcher {
         match kind {
             RunKind::Play => {
                 cmd.env("XCL_DXC_THREADS", "4").env("XCL_PSO_PRELOAD", "0").arg("run").arg(&game);
+                for (k, v) in display::env(&self.config.display, self.monitors.len()) {
+                    cmd.env(k, v);
+                }
                 if self.config.auto_menu {
                     let at: Vec<String> = (22..=70).step_by(6).map(|s| format!("{s}:A")).collect();
                     cmd.env("XCL_PRESS_AT", at.join(","));
