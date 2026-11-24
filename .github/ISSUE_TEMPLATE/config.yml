@@ -1,5 +1,3 @@
 blank_issues_enabled: true
-contact_links:
-  - name: How to build
-    url: https://github.com/ItsNotRexed/Leonida#how-to-build
-    about: Prerequisites, Build.bat and the make_game.py options
+# Local-only project with no GitHub remote. See README.md#how-to-build for prerequisites,
+# Build.bat, and the make_game.py options.

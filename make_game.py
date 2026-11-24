@@ -4,7 +4,7 @@ r"""Build the PC port from your own copy of the game.
     python -I make_game.py                                      # same, from a terminal
     python -I make_game.py --find                               # list the copies found on this PC
     python -I make_game.py --pick                               # choose the game folder in a folder dialog
-    python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida"
+    python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\PortGellhorn"
     python -I make_game.py --game "..." --check                 # only check the copy, build nothing
     python -I make_game.py --stages shaders,assets              # only some stages
 
@@ -297,7 +297,7 @@ def pick_game() -> str:
             if v:
                 log(f"chose {v['title']} {v['version']} in {d}")
                 return d
-            messagebox.showwarning("Leonida", "That folder isn't a supported version of the game. Choose the "
+            messagebox.showwarning("Port Gellhorn", "That folder isn't a supported version of the game. Choose the "
                                    "folder that holds MicrosoftGame.Config and the .rpf archives.", parent=root)
     finally:
         root.destroy()
@@ -346,17 +346,17 @@ def icloud_documents() -> bool:
 
 
 def default_out() -> str:
-    """Documents/Leonida, except on a Mac whose Documents iCloud syncs: the port and its work folder (hundreds of
-    GB made from the game) must stay on this computer, so they go to ~/Leonida there."""
+    """Documents/Port Gellhorn, except on a Mac whose Documents iCloud syncs: the port and its work folder
+    (hundreds of GB made from the game) must stay on this computer, so they go to ~/Port Gellhorn there."""
     if icloud_documents():
-        return os.path.join(os.path.expanduser("~"), "Leonida")
-    return os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
+        return os.path.join(os.path.expanduser("~"), "Port Gellhorn")
+    return os.path.join(os.path.expanduser("~"), "Documents", "Port Gellhorn")
 
 
 def icloud_default_notes() -> list:
     """The log lines when default_out() left iCloud-synced Documents: why, and where a build made before this change
     is, so its resumable work folder isn't silently left behind."""
-    notes = ["iCloud syncs Documents on this Mac: building into ~/Leonida instead, so the game's files stay off iCloud"]
+    notes = ["iCloud syncs Documents on this Mac: building into ~/Port Gellhorn instead, so the game's files stay off iCloud"]
     earlier = os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
     if os.path.isdir(earlier):
         notes.append(f"an earlier build is in {earlier}: move it to {default_out()} to resume it there, "
@@ -1568,7 +1568,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
     ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
-    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
+    ap.add_argument("--out", help="folder for the finished port (default Documents/Port Gellhorn; ~/Port Gellhorn on a Mac "
                                   "whose Documents iCloud syncs)")
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))

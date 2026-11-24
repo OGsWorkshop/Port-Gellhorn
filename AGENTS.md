@@ -33,23 +33,12 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 
 ## Claim before you start
 
-- Work is claimed in the coordination issue before a pull request is opened: the open issue titled "Coordinating
-  who works on what". It moves to a new issue when the thread gets long, so look it up instead of using an old
-  number:
+This is a **local-only copy with no GitHub remote**. The former coordination issue and issue #313 no longer exist.
+Before changing anything, read the existing source and `docs/`, then tell the user what you found and what you intend
+to change. Do not set up a remote or publish this copy without an explicit decision from the user.
 
-  ```sh
-  gh issue list -R ItsNotRexed/Leonida --state open --search "Coordinating who works on what in:title"
-  ```
-
-  Check its tables and the open pull requests first. If someone has claimed the item or has a pull request for it,
-  stop and tell the user instead of writing it a second time.
-- Put the item ID from that issue in the pull request, and `Depends on: #N` for every pull request yours builds on.
-- Found work you won't do yourself (a bug, a missing method, a stale doc, a follow-up of your own pull request)?
-  Post it in the coordination issue as `finding: <one line>`, followed by where it is (file and line), why it matters,
-  and whether it needs game files or particular hardware. The coordinator checks it and lists it for others.
-- For the D3D12 → Vulkan layer (`runtime/shims/d3d12_*`, `runtime/src/vulkan_*`), also read
-  [#313](https://github.com/ItsNotRexed/Leonida/issues/313): most of that work builds on a few open pull requests,
-  and it lists which D3D12 methods are still open.
+- For the D3D12 → Vulkan layer (`runtime/shims/d3d12_*`, `runtime/src/vulkan_*`), read `docs/d3d12_vulkan.md`; it
+  lists which D3D12 methods are still open.
 
 ## Before you guess, look
 

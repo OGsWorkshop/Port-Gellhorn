@@ -1,15 +1,15 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/logo.png" alt="Leonida" width="200">
+  <img src="assets/logo.png" alt="Port Gellhorn" width="200">
 </a>
 
   <br>
-  <b>Leonida</b>
+  <b>Port Gellhorn</b>
   <br>
 </h1>
 
-<h4 align="center">Grand Theft Auto VI (Xbox Series) running natively on Windows, built on your PC from your own copy.
+<h4 align="center">Xbox Series game tooling running natively on Windows, built on your PC from your own copy.
 </h4>
 
 <p align="center">
@@ -23,10 +23,16 @@
   <a href="https://discord.gg/rexed">Discord</a>
 </p>
 
-Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
+Port Gellhorn is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
 and run natively, and the console's system software is reimplemented. The console's precompiled RDNA2 GPU programs
 are translated to SPIR-V for Vulkan. The game's models, textures and audio are read from your package. All of this
 happens **on your PC, from your own copy of the game**.
+
+> [!NOTE]
+> Port Gellhorn is an independent local successor to the Leonida project, which is no longer available on GitHub.
+> Every source file and the full git history were preserved under the original GPL-3.0 license. This copy has no
+> GitHub remote and is for local development only. Game-world references to Leonida in the docs and code are left
+> intact because they name places in the game, not this project.
 
 > [!IMPORTANT]
 > This repository **does not contain the game, keys or an executable**, and it does not explain how to get them. You
@@ -65,17 +71,16 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
 **The easy way:**
 
 1. Install the prerequisites below.
-2. Download this project **with its submodule**: `git clone --recursive https://github.com/ItsNotRexed/Leonida`. A
-   "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
-   and otherwise tells you what to do.
+2. Use this local copy. It already includes the `third_party/rpf9-explorer` submodule and its git history. There is
+   no GitHub remote: do not clone or publish it.
 3. Double-click **`Build.bat`**.
 
 It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents (also where Windows keeps them,
 such as in OneDrive), Games, your home folder and the top of every drive, two folders deep. It recognises the
 version from a few file sizes, without reading anything large. If you have more than one copy it asks which one, and if it finds none it asks you to paste the
 folder. Before starting it checks that everything below is installed and that there is enough free space, and it
-lists anything missing in one go. The result goes to `Documents\Leonida`. A stopped build continues where it left
-off.
+lists anything missing in one go. The result goes to `Documents\Port Gellhorn`. A stopped build continues where it
+left off.
 
 Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` archives, as plain files.
 
@@ -108,7 +113,7 @@ python -I make_game.py --find                          # list the copies found o
 python -I make_game.py --pick                          # choose the game folder in a folder dialog
 python -I make_game.py --check                         # check your copy, build nothing
 python -I make_game.py --check --full-check            # also compare SHA-256 of every file (slow)
-python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
+python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\PortGellhorn" --work "E:\portgellhorn-work"
 python -I make_game.py --stages shaders,assets         # only some stages
 python -I make_game.py --game "D:\path\to\your\package" --wav   # also decode Opus to PCM WAV (large)
 python -I make_game.py --wave64-emulate off            # auto (default), on or off; see below

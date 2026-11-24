@@ -1,7 +1,7 @@
 @echo off
-title Leonida - Game Builder
+title Port Gellhorn - Game Builder
 rem Double-click to build. Finds your copy of the game, checks what's installed, and builds into
-rem Documents\Leonida. Extra options pass through, e.g.  Build.bat --out D:\Games\Leonida
+rem Documents\Port Gellhorn. Extra options pass through, e.g.  Build.bat --out D:\Games\PortGellhorn
 setlocal
 cd /d "%~dp0"
 echo.
