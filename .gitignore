@@ -27,3 +27,7 @@ cache/
 victory.toml
 xcl.toml
 .env
+
+# Launcher
+launcher/target
+launcher/runtime
