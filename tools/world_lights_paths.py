@@ -40,7 +40,6 @@ import os
 import statistics
 import struct
 import sys
-import tempfile
 import zlib
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
@@ -50,6 +49,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 from pool_workers import process_workers  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
 
@@ -262,6 +262,11 @@ def effect_lights(meta, eo):
     return out
 
 
+def _local_light_position(light: dict, offset: list[float]) -> list[float]:
+    position = light.get("position120", light.get("posn", (0.0, 0.0, 0.0)))
+    return [position[i] + offset[i] for i in range(3)]
+
+
 def quat_rotate(q, v):
     """Rotate v by the unit quaternion q = (x, y, z, w)."""
     x, y, z, w = q
@@ -279,10 +284,14 @@ def place(
 ) -> tuple[list[float], list[float] | None]:
     """World position and direction of a model-space light under an entity's stored transform.
 
-    The stored quaternion is the inverse of the entity rotation (docs/world.md), so it is conjugated here.
+    Normalize and conjugate the stored quaternion to match the rotation used for placed geometry.
     """
     x, y, z, w = rotation
-    q = (-x, -y, -z, w)
+    length = math.hypot(x, y, z, w)
+    if length and math.isfinite(length):
+        q = (-x / length, -y / length, -z / length, w / length)
+    else:
+        q = (0.0, 0.0, 0.0, 1.0)
     xy = 1.0 if scale_xy is None else scale_xy
     z_scale = 1.0 if scale_z is None else scale_z
     scaled = [local[0] * xy, local[1] * xy, local[2] * z_scale]
@@ -386,7 +395,8 @@ def graph_stats(nodes, links, junctions):
     s["node_keys_unique"] = len(by_key)
     edges = []
     firsts = [n["first_link"] for n in nodes]
-    ranges_ok = all(firsts[i] is not None and firsts[i] <= firsts[i + 1] for i in range(len(firsts) - 1))
+    ranges_ok = (all(v is not None for v in firsts)
+                 and all(firsts[i] <= firsts[i + 1] for i in range(len(firsts) - 1)))
     s["first_link_monotonic"] = int(ranges_ok)
     for i, n in enumerate(nodes):
         a = n["first_link"]
@@ -539,7 +549,7 @@ def inspect_resource(data, lights_out=False):
                 t = _entity_transform(meta, oo)
                 if lights_out and t["position"] and t["rotation"]:
                     for L in lights:
-                        local = [off[k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
+                        local = _local_light_position(L, off)
                         p, d = place(local, L.get("direction"), t["position"], t["rotation"],
                                      t["scaleXY"], t["scaleZ"])
                         world.append(_light_row(p, d, L, "entity", t["archetypeName"]))
@@ -624,7 +634,13 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
     size = os.path.getsize(path)
     with open(path, "rb") as f:
         head = f.read(8)
-    data_start = struct.unpack_from("<I", head, 4)[0] if head[:4] == b"9FPR" else 0
+    if head[:4] == b"9FPR":
+        if len(head) < 8:
+            # unpack_from on the data-start word would raise struct.error; a truncated header is a usage error.
+            raise ValueError(f"the RPF9 header is {len(head)} bytes, the format needs 8")
+        data_start = struct.unpack_from("<I", head, 4)[0]
+    else:
+        data_start = 0
     lo = max(data_start, start or 0)
     hi = size if limit is None else min(size, lo + limit)
     # Each window walks its own byte range; a resource that starts inside it is read to its end even past the
@@ -659,6 +675,58 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
     return total
 
 
+def read_entities(path):
+    """Rows of a world_index.py ``--entities-out`` file, shape-checked: archetype hash, 3-float position,
+    4-float rotation, optional float scale (``None`` keeps a field unset, as the producer writes for
+    incomplete rows).
+
+    Raises ValueError naming file and line for any row the tool cannot use, so malformed input is refused
+    before the scan instead of crashing the summary after it. UnicodeDecodeError (binary garbage) is
+    re-raised as ValueError with the path.
+    """
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError as exc:
+                    raise ValueError("%s:%d: not valid JSON (%s)" % (path, n, exc)) from None
+                if not isinstance(e, dict):
+                    raise ValueError("%s:%d: not a JSON object" % (path, n))
+                a = e.get("archetype")
+                try:
+                    a = int(a, 16) if isinstance(a, str) else a    # world_index writes the hash as hex
+                    hash(a)
+                except ValueError:
+                    raise ValueError("%s:%d: archetype is not a hex hash: %r"
+                                     % (path, n, e.get("archetype"))) from None
+                except TypeError:
+                    raise ValueError("%s:%d: archetype is not a hash: %r"
+                                     % (path, n, e.get("archetype"))) from None
+                row = {"archetype": a}
+                for key, width in (("position", 3), ("rotation", 4)):
+                    v = e.get(key)
+                    if v is None:
+                        row[key] = None
+                    elif isinstance(v, list) and len(v) == width and all(
+                            isinstance(x, (int, float)) and not isinstance(x, bool) for x in v):
+                        row[key] = list(v)
+                    else:
+                        raise ValueError("%s:%d: %s is not %d numbers: %r" % (path, n, key, width, v))
+                for key in ("scale_xy", "scale_z"):
+                    v = e.get(key)
+                    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                        raise ValueError("%s:%d: %s is not a number: %r" % (path, n, key, v))
+                    row[key] = v
+                rows.append(row)
+    except UnicodeDecodeError:
+        raise ValueError("%s: not UTF-8 text" % path) from None
+    return rows
+
+
 def summarize(total, entities=None, lights_out=None):
     """Build the counts-only summary, and place archetype lights through the entity rows if given."""
     lights = dict(total["lights"])
@@ -669,42 +737,58 @@ def summarize(total, entities=None, lights_out=None):
         "light_value_ranges": {k: [round(v[0], 4), round(v[1], 4)] for k, v in total["ranges"].items()},
         "archetypes_with_lights": len(arch),
         "archetypes_defined_more_than_once": sum(1 for sets in arch.values() if len(sets) > 1),
-        "archetype_light_definitions_differ": sum(1 for sets in arch.values()
-                                                  if len(sets) > 1 and any(len(s) != len(sets[0]) for s in sets)),
+        "archetype_light_definitions_differ": sum(1 for sets in arch.values() if len(sets) > 1
+                                                  and any(sets[i] != sets[0] for i in range(1, len(sets)))),
     }
     placed = collections.Counter()
     out = None
+    staged = None
     try:
         if lights_out:
-            out = open(lights_out, "w", encoding="utf-8", newline="\n")
+            # Stage the report: a bad --entities row below must not truncate a report from an earlier run.
+            staged = lights_out + ".partial"
+            out = open(staged, "w", encoding="utf-8", newline="\n")
             for row in total["world_lights"]:
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
         placed["entity_lights_in_maps"] = len(total["world_lights"]) if lights_out else lights.get("lights_entity_in_map_placed", 0)
         if entities:
-            with open(entities, encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    e = json.loads(line)
-                    a = e.get("archetype")
-                    a = int(a, 16) if isinstance(a, str) else a    # world_index writes the hash as hex
-                    sets = arch.get(a)
-                    placed["entities"] += 1
-                    if not sets:
-                        continue
-                    ls = sets[0]
-                    placed["entities_with_lights"] += 1
-                    placed["archetype_lights_placed"] += len(ls)
-                    if out is not None and e.get("position") and e.get("rotation"):
-                        for L in ls:
-                            local = [L["offset"][k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
-                            p, d = place(local, L.get("direction"), e["position"], e["rotation"],
-                                         e.get("scale_xy"), e.get("scale_z"))
-                            out.write(json.dumps(_light_row(p, d, L, "archetype", a),
-                                                 separators=(",", ":")) + "\n")
+            for row in read_entities(entities):
+                a = row["archetype"]
+                sets = arch.get(a)
+                placed["entities"] += 1
+                if not sets:
+                    continue
+                ls = sets[0]
+                placed["entities_with_lights"] += 1
+                placed["archetype_lights_placed"] += len(ls)
+                if out is not None and row["position"] and row["rotation"]:
+                    for L in ls:
+                        local = _local_light_position(L, L["offset"])
+                        p, d = place(local, L.get("direction"), row["position"], row["rotation"],
+                                     row["scale_xy"], row["scale_z"])
+                        out.write(json.dumps(_light_row(p, d, L, "archetype", a),
+                                             separators=(",", ":")) + "\n")
+    except BaseException:
+        if out is not None:
+            try:
+                out.close()
+            except OSError:
+                pass
+            out = None
+        if staged is not None and os.path.exists(staged):
+            os.remove(staged)
+        raise
     finally:
         if out is not None:
             out.close()
+    if staged is not None:
+        try:
+            os.replace(staged, lights_out)
+        except BaseException:
+            # A destination that is a directory (or read-only) must not leave the staged copy behind.
+            if os.path.exists(staged):
+                os.remove(staged)
+            raise
     summary["placement"] = dict(placed)
     nodes = [n for part in total["nodes"] for n in part]
     links = [l for part in total["links"] for l in part]
@@ -721,33 +805,6 @@ def summarize(total, entities=None, lights_out=None):
     return summary
 
 
-def same_report_path(first, second):
-    first, second = os.path.realpath(first), os.path.realpath(second)
-    if os.path.normcase(first) == os.path.normcase(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        return False
-
-    first_dir, first_name = os.path.split(first)
-    second_dir, second_name = os.path.split(second)
-    if first_name.casefold() != second_name.casefold():
-        return False
-    try:
-        if not os.path.samefile(first_dir, second_dir):
-            return False
-        # normcase on POSIX does not tell us whether this volume folds case.
-        # Try the two names in a scratch directory on the destination volume before scanning.
-        with tempfile.TemporaryDirectory(prefix=".world-lights-", dir=first_dir) as probe:
-            with open(os.path.join(probe, first_name), "xb"):
-                return os.path.exists(os.path.join(probe, second_name))
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("archive")
@@ -761,6 +818,9 @@ def main(argv=None):
     if a.jobs < 1:
         print("ERROR: --jobs must be at least 1", file=sys.stderr)
         return 2
+    if a.start is not None and a.start < 0:
+        print("ERROR: --start must be non-negative", file=sys.stderr)
+        return 2
     if a.limit is not None and a.limit < 1:
         print("ERROR: --limit must be at least 1", file=sys.stderr)
         return 2
@@ -770,14 +830,44 @@ def main(argv=None):
     if a.entities and not os.path.isfile(a.entities):
         print(f"ERROR: {a.entities}: no such file", file=sys.stderr)
         return 2
+    if a.entities:
+        try:
+            read_entities(a.entities)    # refuse malformed rows before the scan, not after it
+        except (ValueError, OSError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     if a.out and a.lights_out and same_report_path(a.out, a.lights_out):
         ap.error("--out and --lights-out must use different paths")
-    total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
-    summary = summarize(total, a.entities, a.lights_out)
+    inputs = [("archive", a.archive)]
+    if a.entities:
+        inputs.append(("--entities", a.entities))
+    for rname, rpath in (("--out", a.out), ("--lights-out", a.lights_out)):
+        if not rpath:
+            continue
+        for iname, ipath in inputs:
+            if same_report_path(rpath, ipath):
+                ap.error("%s must use a different path than %s" % (rname, iname))
+    try:
+        total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
+    except ValueError as e:  # a truncated RPF9 header: one error line, not a struct.error traceback
+        print(f"ERROR: {a.archive}: {e}", file=sys.stderr)
+        return 2
+    try:
+        summary = summarize(total, a.entities, a.lights_out)
+    except ValueError as e:            # a bad --entities row, or an archetype that is not a number
+        print(f"ERROR: {a.entities}: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     text = json.dumps(summary, indent=1, sort_keys=True)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text + "\n")
+        try:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 2
     else:
         sys.stdout.write(text + "\n")
     return 0

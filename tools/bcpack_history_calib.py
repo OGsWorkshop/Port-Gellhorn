@@ -9,7 +9,8 @@ Two complementary calibration paths are supported (and may be combined):
 1. Exact reference-pair inversion (`--ref-dds POOL:INDEX=REF.dds` or
    `--ref-pairs PAIRS.json`): algebraically inverts built-in history references
    against exact BCn reference blocks, producing **confirmed** entries
-   (`class 3` for BC6H, `ConfirmedBits` for BC7, `confirmed` for BC1-BC5).
+   (`class 3` with per-field `ConfirmedBits` for BC6H, `ConfirmedBits` for BC7,
+   `confirmed` for BC1-BC5).
 2. Pool self-calibration (from TTPF `.ttpf` files or directories): combines
    exact algebraic bitstream constraints (BC6H/BC7 anchor MSB constraints and
    BC7 Mode-1 shared p-bit parity), intra-block smoothness index voting, and
@@ -327,12 +328,19 @@ def make_inverse_tile_lookup(layout, mip):
 
 def retile_mip(linear, layout, mip):
     """Place a linear DDS mip payload into its RDNA2 tiled byte buffer."""
+    out = bytearray(mip["region"])
+    _retile_mip_into(linear, layout, mip, out)
+    return bytes(out)
+
+
+def _retile_mip_into(linear: bytes, layout: dict, mip: dict, out: bytearray,
+                     known: bytearray | None = None) -> None:
+    """Write one mip's blocks into its region, which may also hold other tail mips."""
     eb = layout["element_bytes"]
     bw, bh = mip["blocks_w"], mip["blocks_h"]
     expected = bw * bh * eb
     if len(linear) < expected:
         raise ValueError(f"DDS mip payload truncated ({len(linear)} < {expected} bytes)")
-    out = bytearray(mip["region"])
     mv = memoryview(linear)
     row_stride = bw * eb
     for by in range(bh):
@@ -341,7 +349,8 @@ def retile_mip(linear, layout, mip):
             off = tiled_offset(layout, mip, bx, by)
             src = row_at + bx * eb
             out[off:off + eb] = mv[src:src + eb]
-    return bytes(out)
+            if known is not None:
+                known[off:off + eb] = b"\x01" * eb
 
 
 def read_dds(path):
@@ -912,10 +921,12 @@ class BcSimpleCalibrator:
             return (ref_blocks[at], ref_blocks[at + 1])
         return (ref_blocks[at], ref_blocks[at + 1], ref_blocks[at + 8], ref_blocks[at + 9])
 
-    def add_reference_chunk(self, lanes, ref_blocks, nblocks):
+    def add_reference_chunk(self, lanes, ref_blocks, nblocks, *, valid_blocks=None):
         """Algebraically invert direct built-in references from exact BCn blocks."""
         mods = self.mods
         for i in range(min(nblocks, 256)):
+            if valid_blocks is not None and not valid_blocks[i]:
+                continue
             d, dz = self._lane_step(lanes, i)
             if d == 0 or d <= i:
                 continue
@@ -1182,12 +1193,14 @@ class Bc6hCalibrator:
         self.d_obs = {}
         self.ep_seen = [False] * 256
 
-    def add_reference_chunk(self, lanes, ref_blocks, nblocks):
+    def add_reference_chunk(self, lanes, ref_blocks, nblocks, *, valid_blocks=None):
         """Algebraically invert direct built-in BC6H history references from exact blocks."""
         l0, l1, l15 = lanes[0], lanes[1], lanes[15]
         deint0, deint1 = bcpack._DEINT
         slot_widths = (16, 10, 6, 6)
         for i in range(min(nblocks, 256)):
+            if valid_blocks is not None and not valid_blocks[i]:
+                continue
             a, b = 2 * i, 2 * i + 1
             m_sym = l15[a]
             if m_sym > 13:
@@ -1449,6 +1462,8 @@ class Bc6hCalibrator:
     def build_document(self):
         eh = [[[0, 0, 0, 0] for _ in range(3)] for _ in range(256)]
         ih = [[0] * 16 for _ in range(256)]
+        ep_cb = [[[self.ref_ep[k][c][q][0] for q in range(4)] for c in range(3)] for k in range(256)]
+        ix_cb = [[self.ref_ix[k][p][0] for p in range(16)] for k in range(256)]
         ec = [0] * 256
         ic = [0] * 256
 
@@ -1524,6 +1539,8 @@ class Bc6hCalibrator:
             "indexHistory": ih,
             "endpointClass": ec,
             "indexClass": ic,
+            "endpointConfirmedBits": ep_cb,
+            "indexConfirmedBits": ix_cb,
         }
         stats = {
             "endpoint_confirmed": sum(1 for c in ec if c == 3),
@@ -1560,7 +1577,7 @@ class Bc7Calibrator:
         self.pbit_parity = {}
         self.ep_obs = {}
 
-    def add_reference_chunk(self, lanes, ref_blocks, nblocks):
+    def add_reference_chunk(self, lanes, ref_blocks, nblocks, *, valid_blocks=None):
         """Algebraically invert direct built-in BC7 history references from exact blocks."""
         cfg = self.tab["config"]
         rank_of = self.tab["rank_of"]
@@ -1570,6 +1587,8 @@ class Bc7Calibrator:
         deint0, deint1 = bcpack._DEINT
 
         for i in range(min(nblocks, 256)):
+            if valid_blocks is not None and not valid_blocks[i]:
+                continue
             aa, bb = 2 * i, 2 * i + 1
             s15a, s15b = l15[aa], l15[bb]
             rank = rank_of[s15a * 16 + s15b] if s15a < 32 and s15b < 16 else -1
@@ -2102,12 +2121,16 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
         lay = a["layout"]
         seen_chunks = set()
         # Build virtual-offset map of retiled DDS mip bytes.
-        tiled_ranges = []
+        tiled_ranges: dict[int, bytearray] = {}
+        known_ranges: dict[int, bytearray] = {}
         for m, mip in enumerate(lay["mips"]):
             if m >= len(mips):
                 break
-            tiled = retile_mip(mips[m], lay, mip)
-            tiled_ranges.append((d["base"] + mip["offset"], tiled))
+            start = d["base"] + mip["offset"]
+            if start not in tiled_ranges:
+                tiled_ranges[start] = bytearray(mip["region"])
+                known_ranges[start] = bytearray(mip["region"])
+            _retile_mip_into(mips[m], lay, mip, tiled_ranges[start], known_ranges[start])
         # Match every BCPack chunk touching those mips.
         for m, mip in enumerate(lay["mips"]):
             if m >= len(mips):
@@ -2122,23 +2145,27 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
                     continue
                 # Assemble the chunk's reference tiled bytes from `tiled_ranges`.
                 ref_chunk = bytearray(csize)
-                covered = 0
-                for mstart, mtiled in tiled_ranges:
+                known_chunk = bytearray(csize)
+                for mstart, mtiled in tiled_ranges.items():
                     mend = mstart + len(mtiled)
                     lo = max(virt, mstart)
                     hi = min(virt + csize, mend)
                     if lo < hi:
                         ref_chunk[lo - virt:hi - virt] = mtiled[lo - mstart:hi - mstart]
-                        covered += hi - lo
-                if covered == 0:
-                    continue
+                        known_chunk[lo - virt:hi - virt] = known_ranges[mstart][lo - mstart:hi - mstart]
                 eb = bcpack.BLOCK_BYTES[codec]
                 nblocks = csize // eb
                 max_b = min(nblocks, 256)
+                # DDS files contain visible blocks only. Tiled padding and
+                # bytes belonging to absent mips are not reference evidence.
+                valid_blocks = [all(known_chunk[i * eb:(i + 1) * eb]) for i in range(max_b)]
+                if not any(valid_blocks):
+                    continue
                 raw = pool.data[src:src + packed]
                 sym_per_blk = 1 if codec in (1, 4) else 2
                 lanes = decode_lanes_prefix(raw, codec, csize, max_b * sym_per_blk)
-                calibrators[codec].add_reference_chunk(lanes, bytes(ref_chunk), max_b)
+                calibrators[codec].add_reference_chunk(lanes, bytes(ref_chunk), max_b,
+                                                      valid_blocks=valid_blocks)
                 seen_chunks.add(key)
     finally:
         pool.close()
@@ -2149,7 +2176,7 @@ def apply_ref_pairs_file(pairs_path, calibrators):
     if not os.path.isfile(pairs_path):
         raise CliError(f"reference pairs file not found: {pairs_path}")
     try:
-        with open(pairs_path, "r", encoding="utf-8") as fh:
+        with open(pairs_path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         raise CliError(f"{pairs_path}: {exc}")

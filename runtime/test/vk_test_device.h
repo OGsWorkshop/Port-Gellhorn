@@ -102,6 +102,7 @@ public:
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
     bool sampler_filter_minmax = false;
+    bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
@@ -114,11 +115,16 @@ public:
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
+    bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
+    bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
+    bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
+    // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
+    VkDeviceSize host_pointer_alignment = 0;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -450,6 +456,36 @@ public:
                 *v13_.next() = &min_lod;
             }
         }
+        const char* divisor_extension = nullptr;
+        for (const char* name :
+             {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME}) {
+            if (std::any_of(extensions.begin(), extensions.end(),
+                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
+                divisor_extension = name;
+                break;
+            }
+        }
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor_khr{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_ext{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+        if (divisor_extension) {
+            const bool is_khr = std::strcmp(divisor_extension, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) == 0;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                            is_khr ? static_cast<void*>(&divisor_khr) : static_cast<void*>(&divisor_ext)};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            vertex_attribute_divisor = (is_khr ? divisor_khr.vertexAttributeInstanceRateDivisor
+                                               : divisor_ext.vertexAttributeInstanceRateDivisor) == VK_TRUE;
+            if (vertex_attribute_divisor) {
+                if (is_khr) {
+                    divisor_khr.pNext = *v13_.next();
+                    *v13_.next() = &divisor_khr;
+                } else {
+                    divisor_ext.pNext = *v13_.next();
+                    *v13_.next() = &divisor_ext;
+                }
+            }
+        }
         VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
         for (const auto& extension : extensions) {
@@ -479,6 +515,20 @@ public:
             }
         }
 #endif
+        // VK_EXT_mesh_shader (meshShader only), for the tests that ask for it.
+        VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+        if (request_mesh_shader && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mesh_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            mesh_shader = mesh_features.meshShader == VK_TRUE;
+        }
+        if (mesh_shader) {
+            mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, *v13_.next()};
+            mesh_features.meshShader = VK_TRUE;
+            *v13_.next() = &mesh_features;
+        }
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
@@ -500,6 +550,16 @@ public:
             *v13_.next() = &custom_border;
         }
 
+        // VK_EXT_external_memory_host where the device has it (OpenExistingHeapFromAddress).
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_memory{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host_memory};
+            instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
+            host_pointer_alignment = host_memory.minImportedHostPointerAlignment;
+        }
+
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
         device_info.pQueueCreateInfos = queue_infos.data();
@@ -507,9 +567,15 @@ public:
         enabled = enable;
         std::vector<const char*> device_extensions;
         v13_.add_extensions(device_extensions);
+        conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
+        });
+        if (conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+        if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+        if (host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
 #if defined(VK_KHR_swapchain_maintenance1)
@@ -539,6 +605,7 @@ public:
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
+        if (mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

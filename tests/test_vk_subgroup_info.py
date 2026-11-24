@@ -49,6 +49,7 @@ class FakeDevice:
 
     name: str | bytes = "Synthetic GPU"
     api_version: int = vk_info.VK_API_VERSION_1_3
+    extension_names: tuple[bytes, ...] = ()
     device_type: int = vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
     dynamic_rendering: bool = True
     synchronization2: bool = True
@@ -95,6 +96,7 @@ class FakeVulkan:
         self.queue_calls = []
         self.vkCreateInstance = _VkProc(self._create_instance)
         self.vkEnumeratePhysicalDevices = _VkProc(self._enumerate_physical_devices)
+        self.vkEnumerateDeviceExtensionProperties = _VkProc(self._enumerate_device_extension_properties)
         self.vkGetPhysicalDeviceProperties2 = _VkProc(self._get_physical_device_properties2)
         self.vkGetPhysicalDeviceFeatures2 = _VkProc(self._get_physical_device_features2)
         self.vkGetPhysicalDeviceQueueFamilyProperties = _VkProc(self._get_queue_family_properties)
@@ -153,6 +155,23 @@ class FakeVulkan:
                 arr[i] = self._device_handles[i]
         count_ptr.value = written
         return vk_info.VK_INCOMPLETE if cap < len(self._device_handles) else 0
+
+    def _enumerate_device_extension_properties(self, physical: ctypes.c_void_p, layer: None,
+                                               p_count: object, p_entries: object) -> int:
+        assert layer is None
+        names = self._devices[_ptr(physical)].extension_names
+        count = ctypes.c_uint32.from_address(_ptr(p_count))
+        addr = _ptr(p_entries)
+        if addr is None:
+            count.value = len(names)
+            return 0
+        written = min(count.value, len(names))
+        for i, name in enumerate(names[:written]):
+            entry = addr + i * 260
+            ctypes.memmove(entry, name + b"\0", len(name) + 1)
+            ctypes.c_uint32.from_address(entry + 256).value = 1
+        count.value = written
+        return vk_info.VK_INCOMPLETE if written < len(names) else 0
 
     def _get_physical_device_properties2(self, phys_dev, p_props):
         handle = _ptr(phys_dev)
@@ -225,14 +244,27 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(
                     node_addr + vk_info.F13_DYNAMIC_RENDERING
                 ).value = int(dev.dynamic_rendering)
+            elif stype == 1000044003:  # VkPhysicalDeviceDynamicRenderingFeaturesKHR
+                ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.dynamic_rendering)
+            elif stype == 1000314007:  # VkPhysicalDeviceSynchronization2FeaturesKHR
+                ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.synchronization2)
+            elif stype == 1000225002:  # VkPhysicalDeviceSubgroupSizeControlFeaturesEXT
+                ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.subgroup_size_control)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
         expected = {
+            vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-            vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+            vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR,
         }
-        if not expected.issubset(seen_types):
-            raise AssertionError(f"missing Vulkan 1.2/1.3 feature structs in pNext chain: {seen_types!r}")
+        if dev.api_version >= vk_info.VK_API_VERSION_1_3:
+            expected.add(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
+        else:
+            expected.update((1000044003, 1000314007))
+            if b"VK_EXT_subgroup_size_control" in dev.extension_names:
+                expected.add(1000225002)
+        if expected != seen_types:
+            raise AssertionError(f"unexpected feature structs in pNext chain: {seen_types!r}")
 
     def _get_queue_family_properties(self, phys_dev, p_count, p_props):
         handle = _ptr(phys_dev)
@@ -590,6 +622,39 @@ class QueryTest(unittest.TestCase):
                 self.assertEqual(res["device"], "Fallback OK")
                 self.assertEqual(vk_with_fallback.destroyed_instances, [FakeVulkan.INSTANCE_HANDLE])
 
+    def test_vulkan_1_2_khr_features_match_the_runtime_device_choice(self) -> None:
+        extensions = (b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2")
+        fallback = FakeDevice(name="Vulkan 1.3 integrated GPU", device_type=1)
+        for names, dynamic, sync in (
+            (extensions, True, True),
+            (extensions[:1], True, True),
+            (extensions[1:], True, True),
+            (extensions, False, True),
+            (extensions, True, False),
+        ):
+            with self.subTest(names=names, dynamic=dynamic, sync=sync):
+                candidate = FakeDevice(name="Vulkan 1.2 discrete GPU", api_version=(1 << 22) | (2 << 12),
+                                       extension_names=names, dynamic_rendering=dynamic, synchronization2=sync)
+                result, _ = self._run_query(fallback, candidate)
+                suitable = names == extensions and dynamic and sync
+                self.assertEqual(result["device"], candidate.name if suitable else fallback.name)
+                if suitable:
+                    self.assertFalse(result["subgroup_size_control"])
+                    self.assertFalse(result["native64"])
+
+    def test_vulkan_1_2_subgroup_size_control_extension(self):
+        base = (b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2")
+        for extension, feature, expected in ((True, True, True), (True, False, False), (False, True, False)):
+            with self.subTest(extension=extension, feature=feature):
+                extensions = base + ((b"VK_EXT_subgroup_size_control",) if extension else ())
+                result, _ = self._run_query(FakeDevice(
+                    api_version=vk_info.VK_API_VERSION_1_2, extension_names=extensions,
+                    subgroup_size=32, min_subgroup_size=32, max_subgroup_size=64,
+                    subgroup_size_control=feature, subgroup_supported_stages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT,
+                    required_subgroup_size_stages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT))
+                self.assertEqual(result["subgroup_size_control"], expected)
+                self.assertEqual(result["native64_compute"], expected)
+
     def test_accepts_graphics_bit_on_non_zero_queue_family(self):
         dev = FakeDevice(
             name="MultiQueue GPU",
@@ -749,6 +814,7 @@ class QueryTest(unittest.TestCase):
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "barycentric_fallback": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
@@ -771,6 +837,66 @@ class QueryTest(unittest.TestCase):
             with self.subTest(case=label):
                 res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
+
+    def test_barycentric_fallback(self):
+        for label, driver, want in (("anv", vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, True),
+                                    ("radv", 3, False), ("intel_windows", 5, False)):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(driver_id=driver))
+                self.assertIs(res["barycentric_fallback"], want)
+        self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
+
+    def test_barycentric_fallback_rejects_an_intel_windows_fake(self):
+        """Intel Windows uses its Windows driver ID, not ANV; the fake must carry Intel's vendor ID."""
+        res, _vk = self._run_query(FakeDevice(name="Intel Arc", vendor_id=0x8086, device_id=0xE20B,
+                                               driver_id=5))
+        self.assertFalse(res["barycentric_fallback"])
+        self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
+
+    def test_barycentric_fallback_gfx90c_amd_windows(self):
+        """#5933: gfx90c iGPUs (amdgpu's CHIP_RENOIR IDs) under AMD's proprietary driver (driver ID 1) take the
+        fallback; RADV on the same chip, other GCN 5 parts, RDNA iGPUs and other vendors do not. Literal IDs, so a
+        changed constant or table fails here."""
+        cases = (("vega8_barcelo", 0x1002, 0x15E7, 1, True), ("renoir", 0x1002, 0x1636, 1, True),
+                 ("cezanne", 0x1002, 0x1638, 1, True), ("lucienne", 0x1002, 0x164C, 1, True),
+                 ("vega8_radv", 0x1002, 0x15E7, 3, False), ("vega8_amdvlk_open", 0x1002, 0x15E7, 2, False),
+                 ("raven_gfx902", 0x1002, 0x15DD, 1, False), ("picasso_gfx902", 0x1002, 0x15D8, 1, False),
+                 ("vega10_card", 0x1002, 0x687F, 1, False), ("vega20_card", 0x1002, 0x66AF, 1, False),
+                 ("raphael_rdna2_igpu", 0x1002, 0x164E, 1, False), ("rdna3_780m", 0x1002, 0x15BF, 1, False),
+                 ("other_vendor_same_id", 0x10DE, 0x15E7, 1, False),
+                 ("intel_windows", 0x8086, 0x15E7, 5, False), ("anv", 0x8086, 0xE20B, 6, True))
+        for label, vendor, device, driver, want in cases:
+            with self.subTest(case=label):
+                self.assertIs(vk_info.barycentric_fallback(vendor, device, driver), want)
+                self.assertIs(vk_info.gfx90c_amd_windows(vendor, device, driver), want and driver == 1)
+                res, _vk = self._run_query(FakeDevice(vendor_id=vendor, device_id=device, driver_id=driver))
+                self.assertEqual((res["vendor_id"], res["device_id"], res["driver_id"]), (vendor, device, driver))
+                self.assertIs(res["barycentric_fallback"], want)
+
+    def test_barycentric_fallback_answer_is_for_the_runtime_gpu(self):
+        """A Vega 8 iGPU next to an NVIDIA card: the runtime takes the discrete card, so no fallback; alone, it does."""
+        vega8 = FakeDevice(name="AMD Radeon(TM) Graphics", device_type=1, vendor_id=0x1002, device_id=0x15E7)
+        nvidia = FakeDevice(name="NVIDIA GeForce", vendor_id=0x10DE, device_id=0x2882, driver_id=4,
+                            min_subgroup_size=32, max_subgroup_size=32)
+        for devs in ((vega8, nvidia), (nvidia, vega8)):
+            with self.subTest(order=[d.name for d in devs]):
+                res, _vk = self._run_query(*devs)
+                self.assertEqual(res["device"], "NVIDIA GeForce")
+                self.assertIs(res["barycentric_fallback"], False)
+        res, _vk = self._run_query(vega8)
+        self.assertIs(res["barycentric_fallback"], True)
+
+    def test_stage_caps_preserve_graphics_stage_bits(self):
+        supported = 0x01 | 0x08 | 0x10 | 0x20
+        required = 0x10 | 0x20
+        device = FakeDevice(subgroup_supported_stages=supported, required_subgroup_size_stages=required,
+                            max_compute_workgroup_subgroups=17)
+        vk = FakeVulkan(devices=(device,))
+        with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+            result = vk_info.query(stage_caps=True)
+        self.assertEqual(result["supported_subgroup_stages"], supported)
+        self.assertEqual(result["required_subgroup_size_stages"], required)
+        self.assertEqual(result["max_compute_workgroup_subgroups"], 17)
 
     def test_rdna2_amd_windows(self):
         """#857: RDNA2 by PCI device ID, and only under AMD's proprietary driver (RADV takes the same modules)."""

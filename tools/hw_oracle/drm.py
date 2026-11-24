@@ -9,7 +9,9 @@ driver (libdrm_amdgpu) by hw_oracle_drm.c. Standard library only. No ROCm: an as
                                   kernel driver reset the GPU, and with it everything shown on that display.
     LEONIDA_AMD_CLANG, LEONIDA_HOST_CC, LEONIDA_HW_ARCH   as in runner.py
 
-The launcher supports compute engine version 10 only: GFX10, which is RDNA1 and RDNA2.
+The launcher supports compute engine versions 10, 11 and 12: GFX10 (RDNA1 and RDNA2), GFX11 (RDNA3) and
+GFX12 (RDNA4). The registers the launcher writes sit at the same offsets on all three; only the preamble and
+the cu-mask writes differ, as hw_oracle_drm.c documents.
 """
 import glob
 import hashlib
@@ -49,8 +51,8 @@ def find_node(environ=None, sysfs="/sys/class/drm"):
     environ = os.environ if environ is None else environ
     node = environ.get("LEONIDA_HW_DRM_NODE")
     if not node:
-        raise Unavailable("set LEONIDA_HW_DRM_NODE to the render node of a GFX10 AMD GPU that drives no display "
-                          "(`ls -l /dev/dri/by-path` lists them)")
+        raise Unavailable("set LEONIDA_HW_DRM_NODE to the render node of a GFX10, GFX11 or GFX12 AMD GPU that "
+                          "drives no display (`ls -l /dev/dri/by-path` lists them)")
     if not os.path.exists(node):
         raise Unavailable(f"LEONIDA_HW_DRM_NODE={node} does not exist")
     displays = connected_displays(node, sysfs)
@@ -100,8 +102,8 @@ def kernel_registers(elf):
 
     The descriptor is where the assembler puts what a runtime must program before it starts the kernel: the
     register counts and the float mode (rounding, denormals, IEEE, DX10 clamp) in RSRC1, the user and system SGPRs
-    in RSRC2, the wave size in the code properties. The HIP runtime follows it, and so does the launcher. What the
-    launcher does not provide is refused here instead of being run differently."""
+    and the workgroup's LDS in RSRC2, the wave size in the code properties. The HIP runtime follows it, and so does
+    the launcher. What the launcher does not provide is refused here instead of being run differently."""
     sections, symbols = _symbols(elf)
     out = {}
     for name, shndx, value in symbols:
@@ -117,8 +119,15 @@ def kernel_registers(elf):
         if properties & ~0x0408 or not properties & 0x0008:
             raise RuntimeError(f"{kernel}: kernel code properties {properties:#06x}; the launcher passes the kernarg "
                                "pointer in s[0:1] and nothing else")
-        if group or private or rsrc3 or rsrc2 & 1 or (rsrc2 >> 15) & 0x1FF:
-            raise RuntimeError(f"{kernel}: LDS, scratch memory and COMPUTE_PGM_RSRC3 are not supported by the launcher")
+        if private or rsrc3 or rsrc2 & 1:
+            raise RuntimeError(f"{kernel}: scratch memory and COMPUTE_PGM_RSRC3 are not supported by the launcher")
+        # The descriptor's group segment is the workgroup's LDS, and COMPUTE_PGM_RSRC2.LDS_SIZE (bits 15..23) is the
+        # field the hardware reads, in 512-byte units. The assembler leaves that field 0 (measured on gfx1036:
+        # 4096 bytes of LDS give group 4096 and rsrc2 0x84), so the launcher programs it from the group segment, as
+        # the HIP runtime does on Windows. The hardware gives a workgroup at most 65536 bytes of LDS.
+        if group > 65536:
+            raise RuntimeError(f"{kernel}: {group} bytes of LDS; a workgroup gets at most 65536")
+        rsrc2 = (rsrc2 & ~(0x1FF << 15)) | (((group + 511) // 512) << 15)
         if (rsrc2 >> 1) & 0x1F != 2:
             raise RuntimeError(f"{kernel}: {(rsrc2 >> 1) & 0x1F} user SGPRs; the launcher fills two")
         out[kernel] = (rsrc1, rsrc2, 32 if properties & 0x0400 else 64)
@@ -186,7 +195,9 @@ class DrmOracle(runner.Oracle):
         if not head.startswith("#"):
             raise Unavailable((r.stderr.strip() or "the launcher printed no device line")[:300])
         arch = next((field[5:] for field in head.split() if field.startswith("arch=")), "")
-        return "gfx1030" if arch in ("", "gfx10xx") else arch   # every GFX10 chip takes the same encodings
+        # A chip the launcher could only label by generation (an unannounced revision): any member takes the
+        # same encodings, so a representative assembles for it. asm.family() groups the names the same way.
+        return {"": "gfx1030", "gfx10xx": "gfx1030", "gfx11xx": "gfx1100", "gfx12xx": "gfx1201"}.get(arch, arch)
 
     def _assemble(self, text, wave=32):
         s = os.path.join(self.workdir, "k.s")

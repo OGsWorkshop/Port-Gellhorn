@@ -544,5 +544,70 @@ class RoundtripTests(unittest.TestCase):
                 self.assertEqual(got & 0xFFFF0000, OLD_HIGH)
 
 
+class HalfNanRuleTests(unittest.TestCase):
+    """si.half_to_float / si.float_to_half pin one NaN rule on every Python version.
+
+    struct's '<e' format drops NaN payloads before Python 3.14 and keeps them from 3.14 (CPython gh-130317), so
+    the old struct-based helpers returned version-dependent words for NaN operands while the expected words here
+    and the docs rows are pinned to the pre-3.14 behaviour (CI runs 3.12). The helpers are bit-level now with the
+    chosen rule: a NaN keeps its sign and loses its payload to the canonical quiet NaN (f16 0x7E00/0xFE00, f32
+    0x7FC00000/0xFFC00000). These tests hold that rule on any Python; the non-NaN spot checks pin the exact
+    conversion the helpers must keep providing alongside it.
+    """
+
+    def test_half_to_float_nan_canonicalizes_payload_keeps_sign(self):
+        cases = [(0x7E00, 0x7FC00000), (0xFE00, 0xFFC00000), (0x7C01, 0x7FC00000), (0x7FFF, 0x7FC00000),
+                 (0x7F01, 0x7FC00000), (0xFE01, 0xFFC00000), (0xFF01, 0xFFC00000), (0xFFFF, 0xFFC00000)]
+        for h, want in cases:
+            with self.subTest(h=hex(h)):
+                self.assertEqual(f32_to_bits(si.half_to_float(h)), want)
+
+    def test_float_to_half_nan_canonicalizes_payload_keeps_sign(self):
+        cases = [(0x7FC00000, 0x7E00), (0x7F800001, 0x7E00), (0x7FA00000, 0x7E00), (0x7FFFFFFF, 0x7E00),
+                 (0xFFC00000, 0xFE00), (0xFF800001, 0xFE00), (0xFFA00000, 0xFE00), (0xFFFFFFFF, 0xFE00)]
+        for bits, want in cases:
+            with self.subTest(bits=hex(bits)):
+                self.assertEqual(si.float_to_half(bits_to_f32(bits)), want)
+
+    def test_non_nan_values_are_unchanged(self):
+        self.assertEqual(f32_to_bits(si.half_to_float(0x7C00)), 0x7F800000)
+        self.assertEqual(f32_to_bits(si.half_to_float(0xFC00)), 0xFF800000)
+        self.assertEqual(f32_to_bits(si.half_to_float(0x0001)), 0x33800000)
+        self.assertEqual(f32_to_bits(si.half_to_float(0x03FF)), 0x387FC000)
+        self.assertEqual(f32_to_bits(si.half_to_float(0x8000)), 0x80000000)
+        self.assertEqual(si.float_to_half(bits_to_f32(0x7F800000)), 0x7C00)
+        self.assertEqual(si.float_to_half(bits_to_f32(0xFF800000)), 0xFC00)
+        self.assertEqual(si.float_to_half(bits_to_f32(0x33800000)), 0x0001)
+        self.assertEqual(si.float_to_half(bits_to_f32(0x387FC000)), 0x03FF)
+        self.assertEqual(si.float_to_half(bits_to_f32(0x477FE000)), 0x7BFF)      # 65504, max finite
+        self.assertEqual(si.float_to_half(bits_to_f32(0x477FF000)), 0x7C00)      # 65520 RNE tie -> inf
+
+    def test_float_to_half_rounds_ties_to_even(self):
+        # float_to_half rounds by hand, so its tie rule needs direct cases. The v_cvt_f16_f32 tie tests above do
+        # not reach it: the translator lowers that opcode with its own integer RNE. The helper backs PackHalf2x16
+        # and OpQuantizeToF16. Round-half-up in either path (normal or subnormal) fails at least one row here.
+        cases = [
+            # Normal path: the dropped 13 bits are exactly 0x1000.
+            (0x3F801000, 0x3C00),   # 1 + 2^-11, between 0x3C00 and 0x3C01 -> even 0x3C00
+            (0xBF801000, 0xBC00),   # negative of the above
+            (0x3F803000, 0x3C02),   # 1 + 3 * 2^-11, between 0x3C01 and 0x3C02 -> even 0x3C02
+            (0x3F800FFF, 0x3C00),   # just below the first tie
+            (0x3F801001, 0x3C01),   # just above the first tie
+            (0x3FFFF000, 0x4000),   # tie above 0x3FFF -> even, mantissa carry into the exponent (2.0)
+            (0x477FD000, 0x7BFE),   # 65488, between 65472 and 65504 -> even 0x7BFE
+            (0x477FEFFF, 0x7BFF),   # largest f32 below 65520 stays at max finite 65504
+            (0xC77FF000, 0xFC00),   # -65520 tie -> -inf
+            # Subnormal path: n = value / 2^-24 has a fraction of exactly one half.
+            (0x33000000, 0x0000),   # 0.5 -> even 0
+            (0xB3000000, 0x8000),   # -0.5 -> -0
+            (0x33C00000, 0x0002),   # 1.5 -> even 2
+            (0x34200000, 0x0002),   # 2.5 -> even 2
+            (0x387FE000, 0x0400),   # 1023.5 -> even 1024, the smallest normal
+        ]
+        for bits, want in cases:
+            with self.subTest(bits=hex(bits)):
+                self.assertEqual(si.float_to_half(bits_to_f32(bits)), want)
+
+
 if __name__ == "__main__":
     unittest.main()

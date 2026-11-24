@@ -31,17 +31,21 @@ def tag(typ, offset, size):
     return (typ << 56) | (size << 28) | offset
 
 
-def build_music_bank(toc, samples, rate=48000):
-    """One 0x48 stream with a header subblock and a data subblock for one channel."""
-    desc = bytearray(28)
-    struct.pack_into("<III", desc, 0, 1, 4096, 1)
-    struct.pack_into("<II", desc, 12, 0x1234, samples)
-    struct.pack_into("<H", desc, 22, rate)
-    desc[24] = 0x0B
-    data = bytearray(4096)
-    struct.pack_into("<I", data, 4, 1)       # one subblock
-    struct.pack_into("<H", data, 2048, 1)
-    data[2050] = toc
+def build_music_bank(toc: int, samples: int, rate: int = 48000, *, duplicate_toc: int | None = None) -> bytes:
+    """One descriptor and one block, with one packet subblock per channel."""
+    tocs = (toc,) if duplicate_toc is None else (toc, duplicate_toc)
+    desc = bytearray(12 + 16 * len(tocs))
+    struct.pack_into("<III", desc, 0, 1, 2048 * (1 + len(tocs)), len(tocs))
+    data = bytearray(2048 * (1 + len(tocs)))
+    for i, packet in enumerate(tocs):
+        channel = 12 + 16 * i
+        struct.pack_into("<II", desc, channel, 0x1234, samples)
+        struct.pack_into("<H", desc, channel + 10, rate)
+        desc[channel + 12] = 0x0B
+        struct.pack_into("<I", data, 24 * i + 4, 1)
+        subblock = 2048 * (i + 1)
+        struct.pack_into("<H", data, subblock, 1)
+        data[subblock + 2] = packet
     header = 16 + 4 + 2 * 8
     out = bytearray(b"ADAT" + struct.pack("<III", 0, 1, header))
     out += struct.pack("<I", 0x1234 | (2 << 29))
@@ -100,6 +104,22 @@ class ShortsTest(unittest.TestCase):
         self.assertEqual(shorts.export_bank(path, self.out, 9, 11)[0]["channels"], 1)
         self.assertEqual(shorts.export_bank(path, self.out, 4, 6), [])
 
+    def test_duplicate_selected_channels_keep_both_packet_streams(self) -> None:
+        path = os.path.join(self.tmp.name, "duplicate.awc")
+        with open(path, "wb") as bank:
+            bank.write(build_music_bank(0x78, 960, duplicate_toc=0xFC))
+
+        rows = shorts.export_bank(path, self.out, 0, 1)
+        self.assertEqual([row["stream"] for row in rows], ["00001234", "00001234"])
+        self.assertEqual([row["file"] for row in rows], [
+            "duplicate/00001234.ogg", "duplicate/00001234~2.ogg",
+        ])
+        for row, toc, channels in zip(rows, (0x78, 0xFC), (1, 2)):
+            with open(os.path.join(self.out, row["file"]), "rb") as clip:
+                ogg = clip.read()
+            self.assertEqual(ogg[-1:], bytes([toc]))
+            self.assertEqual(ogg_head_and_last_granule(ogg)[0], channels)
+
     def test_cli_writes_csv(self):
         path = self.write("cli.awc", 0xFC, 480000)
         argv = [path, self.out, "--min-seconds", "4", "--max-seconds", "6", "--jobs", "1"]
@@ -115,6 +135,25 @@ class ShortsTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["channels"], "2")
         self.assertTrue(rows[0]["file"].endswith("00001234.ogg"))
+
+    def test_bank_extensions_cannot_collapse_two_banks_into_one_export(self):
+        first = self.write("clip.awc", 0x78, 480000)
+        second = os.path.join(self.tmp.name, "clip.AWC")
+        if os.path.exists(second):
+            self.skipTest("input volume does not support case-distinct files")
+        self.write("clip.AWC", 0xFC, 480000)
+        os.makedirs(self.out)
+        catalog = os.path.join(self.out, "shorts.csv")
+        with open(catalog, "wb") as f:
+            f.write(b"previous catalog\n")
+        for jobs in ("1", "2"):
+            with self.subTest(jobs=jobs), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(shorts.main([self.tmp.name, self.out, "--jobs", jobs]), 2)
+            self.assertIn(first, err.getvalue())
+            self.assertIn(second, err.getvalue())
+            self.assertEqual(os.listdir(self.out), ["shorts.csv"])
+            with open(catalog, "rb") as f:
+                self.assertEqual(f.read(), b"previous catalog\n")
 
     def test_rejects_nonpositive_job_counts(self):
         for jobs in ("0", "-1"):
@@ -147,6 +186,14 @@ class ShortsTest(unittest.TestCase):
         self.assertIn("missing.awc", err.getvalue())
         self.assertEqual(len(err.getvalue().splitlines()), 1)
 
+    def test_missing_source_names_the_path_as_typed(self):
+        """The path is printed as typed: repr() doubles every Windows backslash, so `C:\\a\\b` came out `C:\\\\a\\\\b`."""
+        missing = os.path.join(self.tmp.name, "missing.awc")
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            self.assertEqual(shorts.main([missing, self.out]), 2)
+        self.assertIn(missing, stderr.getvalue())
+
     def test_clip_write_error_preserves_catalog_in_both_worker_modes(self):
         path = self.write("blocked.awc", 0xFC, 480000)
         os.makedirs(os.path.join(self.out, "blocked", "00001234.ogg"))
@@ -157,7 +204,7 @@ class ShortsTest(unittest.TestCase):
         for jobs in ("1", "2"):
             with self.subTest(jobs=jobs):
                 result = subprocess.run([sys.executable, "-I", tool, path, self.out, "--jobs", jobs],
-                                        capture_output=True, text=True, timeout=60)
+                                        capture_output=True, text=True, errors="replace", timeout=60)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("blocked", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
@@ -178,6 +225,18 @@ class ShortsTest(unittest.TestCase):
         with open(index, "rb") as f:
             self.assertEqual(f.read(), b"previous catalog\n")
         self.assertEqual(sorted(os.listdir(self.out)), ["good", "shorts.csv"])
+
+    def test_replace_retry_failure_preserves_catalog(self):
+        previous = "bank,stream,duration_s,channels,packets,file\n"
+        os.makedirs(self.out, exist_ok=True)
+        index = os.path.join(self.out, "shorts.csv")
+        with open(index, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(shorts, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                shorts._write_catalog(index, [])
+        with open(index, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
 
     def test_nan_duration_bounds(self):
         path = self.write("good.awc", 0x78, 960)

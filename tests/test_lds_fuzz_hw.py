@@ -39,9 +39,23 @@ class DsSpelling(unittest.TestCase):
     def test_cmpstore_takes_the_store_value_first_on_gfx11(self):
         line = "ds_cmpst_rtn_b32 v22, v6, v28, v35 offset:12"          # vdst, vaddr, compare, store
         self.assertEqual(asm.ds_line(line, "gfx1150"), "ds_cmpstore_rtn_b32 v22, v6, v35, v28 offset:12")
+        self.assertEqual(asm.ds_line(line, "gfx1201"), "ds_cmpstore_rtn_b32 v22, v6, v35, v28 offset:12")
         self.assertEqual(asm.ds_line(line, "gfx1030"), line)
+        nortn = "ds_cmpst_b32 v6, v28, v35"                                  # vaddr, compare, store
+        for arch in ("gfx1150", "gfx1201"):                                  # measured on gfx1100 and gfx1201
+            self.assertEqual(asm.ds_line(nortn, arch), "ds_cmpstore_b32 v6, v35, v28")
+        self.assertEqual(asm.ds_line(nortn, "gfx1030"), nortn)
         with self.assertRaises(ValueError):
             asm.ds_line("ds_cmpst_rtn_b32 v22, v6, 5", "gfx1150")
+
+    def test_gfx12_spells_the_barrier_and_the_lds_wait_its_own_way(self):
+        self.assertEqual(asm.sync_lines("s_barrier", "gfx1201"), ["s_barrier_signal -1", "s_barrier_wait -1"])
+        self.assertEqual(asm.sync_lines("s_waitcnt lgkmcnt(0)", "gfx1201"), ["s_wait_dscnt 0"])
+        for arch in ("gfx1030", "gfx1150"):
+            for line in ("s_barrier", "s_waitcnt lgkmcnt(0)"):
+                self.assertEqual(asm.sync_lines(line, arch), [line])
+        for line in ("s_waitcnt vmcnt(0)", "ds_bpermute_b32 v1, v2, v3", "s_endpgm"):
+            self.assertEqual(asm.sync_lines(line, "gfx1201"), [line])
 
     def test_kernel_carries_its_lds_size_and_registers(self):
         k = asm.Kernel(["s_endpgm"], 64, 64, 8, raw=True, lds=4096, vgprs=40)
@@ -299,10 +313,54 @@ class RunHw(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.run_hw(Broken(progs), progs)
 
-    def test_gfx12_skips_cmpst_programs(self):
+    def test_gfx12_runs_cmpst_programs(self):
+        # The ds_cmpstore operand order is measured on gfx1201 too, so these are no longer skipped there.
         with_cmpst = next(p for p in f.programs(1, 60, (32,)) if any(o["kind"] == "cmpst" for o in p.ops))
-        self.assertIn("GFX11", f.hw_skip_reason(with_cmpst, "gfx1201"))
-        self.assertIsNone(f.hw_skip_reason(with_cmpst, "gfx1150"))
+        for arch in ("gfx1201", "gfx1150", "gfx1030"):
+            self.assertIsNone(f.hw_skip_reason(with_cmpst, arch), arch)
+
+    def test_gfx12_skips_only_wave64_programs_with_a_bpermute(self):
+        has_bp = lambda p: any(o["kind"] == "bpermute" for o in p.ops)
+        w64 = next(p for p in f.programs(1, 60, (64,)) if has_bp(p))
+        w32 = next(p for p in f.programs(1, 60, (32,)) if has_bp(p))
+        plain = next(p for p in f.programs(1, 60, (64,)) if not has_bp(p))
+        self.assertIn("all 64 lanes", f.hw_skip_reason(w64, "gfx1201"))
+        self.assertIsNone(f.hw_skip_reason(w32, "gfx1201"))
+        self.assertIsNone(f.hw_skip_reason(plain, "gfx1201"))
+        for arch in ("gfx1150", "gfx1030"):                   # halves stay separate there (measured)
+            self.assertIsNone(f.hw_skip_reason(w64, arch), arch)
+        f.PERTURB.add("bpermute_wave64_cross")                 # the model that crosses halves can run them
+        try:
+            self.assertIsNone(f.hw_skip_reason(w64, "gfx1201"))
+        finally:
+            f.PERTURB.discard("bpermute_wave64_cross")
+
+    def test_gfx12_skips_wave64_permute_programs_the_same_way(self):
+        # measured on an RX 9070 (gfx1201): a wave64 ds_permute_b32 delivers to lane (l + 32) & 63, like bpermute
+        has_pm = lambda p: any(o["kind"] == "permute" for o in p.ops)
+        w64 = next(p for p in f.programs(1, 60, (64,), permute=True) if has_pm(p) and
+                   not any(o["kind"] == "bpermute" for o in p.ops))
+        w32 = next(p for p in f.programs(1, 60, (32,), permute=True) if has_pm(p))
+        self.assertIn("all 64 lanes", f.hw_skip_reason(w64, "gfx1201"))
+        self.assertIsNone(f.hw_skip_reason(w32, "gfx1201"))
+        for arch in ("gfx1150", "gfx1030"):                   # halves stay separate there (measured)
+            self.assertIsNone(f.hw_skip_reason(w64, arch), arch)
+        f.PERTURB.add("permute_wave64_cross")                  # the model that crosses halves can run them
+        try:
+            self.assertIsNone(f.hw_skip_reason(w64, "gfx1201"))
+        finally:
+            f.PERTURB.discard("permute_wave64_cross")
+
+    def test_gfx12_kernels_use_its_barrier_and_lds_wait(self):
+        p = f.programs(1, 1, (64,))[0]               # every kernel waits and barriers after each op
+        g12, g11 = p.hw_lines("gfx1201"), p.hw_lines("gfx1150")
+        self.assertIn("s_barrier", g11)
+        self.assertNotIn("s_barrier", g12)
+        self.assertNotIn("s_waitcnt lgkmcnt(0)", g12)
+        self.assertEqual(g12.count("s_barrier_signal -1"), g11.count("s_barrier"))
+        self.assertEqual(g12.count("s_barrier_wait -1"), g11.count("s_barrier"))
+        self.assertEqual(g12.count("s_wait_dscnt 0"), g11.count("s_waitcnt lgkmcnt(0)"))
+        self.assertEqual(p.hw_lines("gfx1030").count("s_barrier"), g11.count("s_barrier"))
 
     def test_a_flipped_word_is_a_mismatch(self):
         progs = f.programs(1, 4, (32,))
@@ -372,6 +430,19 @@ class Main(unittest.TestCase):
             rc, out = self.main("--oracle", "hw", "--programs", "2")
         self.assertEqual(rc, 77)
         self.assertIn("hardware oracle unavailable: no AMD clang", out)
+
+    def test_an_rdna4_gpu_is_supported(self):
+        # the blanket exit 77 for gfx1170+ is gone: the tool runs there (asm.sync_lines respells GFX12, the
+        # per-program hw_skip_reason skips a wave64 bpermute), so a fake oracle gets past the gate and runs
+        for arch in ("gfx1201", "gfx1170"):
+            oracle = FakeOracle([])
+            oracle.arch = arch
+            with patch.object(runner, "open_oracle", return_value=oracle):
+                oracle.by_text = {tuple(p.hw_lines(arch)): p for p in f.programs(1, 6, (32,))}
+                rc, out = self.main("--oracle", "hw", "--programs", "6", "--wave", "32")
+            self.assertEqual(rc, 0, (arch, out))
+            self.assertIn("hardware oracle: fake", out)
+            self.assertNotIn("hardware oracle unavailable", out)
 
     def test_exit_77_with_a_missing_compiler(self):
         with patch.dict(os.environ, {"LEONIDA_AMD_CLANG": str(TOOLS / "no-such-clang.exe")}):

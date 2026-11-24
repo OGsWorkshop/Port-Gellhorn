@@ -23,8 +23,46 @@ TOOL = os.path.join(ROOT, "tools", "audio_wav.py")
 FFMPEG = shutil.which("ffmpeg")
 
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
 import audio_wav  # noqa: E402
 import awc_opus  # noqa: E402
+import winbatch  # noqa: E402
+
+
+class DecodeQueueTest(unittest.TestCase):
+    def test_failure_summary_counts_all_but_prints_only_ten_first_lines(self):
+        items = [(str(i), str(i)) for i in range(13)]
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(audio_wav, "collect", return_value=(items, 0)), \
+                mock.patch.object(audio_wav, "plan_outputs", return_value=(items, 0, 0)), \
+                mock.patch.object(audio_wav, "find_ffmpeg", return_value="unused"), \
+                mock.patch.object(audio_wav, "decode", return_value=(False, "\n  first line\nextra detail")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            status = audio_wav.main([root, "--jobs", "2"])
+        self.assertEqual(status, 1)
+        self.assertIn("13 failed", out.getvalue())
+        self.assertEqual(out.getvalue().count(": first line"), 10)
+        self.assertNotIn("extra detail", out.getvalue())
+        self.assertIn("and 3 more failures", out.getvalue())
+
+    def test_submission_stays_within_worker_window(self):
+        workers, consumed = 2, 0
+        expected = {str(i) for i in range(1000)}
+        received = set()
+
+        def jobs():
+            for submitted, name in enumerate(sorted(expected), 1):
+                self.assertLessEqual(submitted - consumed, workers)
+                yield name, name, name + ".wav"
+
+        with audio_wav.concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool, \
+                mock.patch.object(audio_wav, "decode", new=lambda _, src, dst: (src, dst)):
+            for rel, future in audio_wav._decode_jobs(pool, "unused", jobs(), workers):
+                self.assertEqual(future.result(), (rel, rel + ".wav"))
+                consumed += 1
+                received.add(rel)
+        self.assertEqual(received, expected)
+        self.assertEqual(consumed, len(expected))
 
 
 @unittest.skipUnless(FFMPEG, "ffmpeg is not on PATH")
@@ -287,6 +325,39 @@ class OpusInputSelectionTest(unittest.TestCase):
         self.assertEqual([stem for _, stem in found], ["opus"])
         self.assertEqual(skipped, 2)
 
+    def test_plan_outputs_does_not_reserve_rejected_wav_slots_for_later_inputs(self) -> None:
+        from collections import Counter
+        from unittest.mock import patch
+
+        src = os.path.join("fake_src")
+        out = os.path.join("fake_out")
+        p0 = os.path.join(src, "a.ogg.opus")
+        p1 = os.path.join(src, "a.ogg~2.opus")
+        items = [(p0, "a.ogg"), (p1, "a.ogg~2")]
+        src_dig = {p0: "D0", p1: "D1"}
+        wav_dig = {
+            os.path.join(out, "a.ogg.wav"): "DX",
+            os.path.join(out, "a.ogg~2.wav"): "DY",
+            os.path.join(out, "a.ogg~3.wav"): "D1",
+            os.path.join(out, "a.ogg~4.wav"): "D0",
+        }
+        dst_calls = Counter()
+
+        def fake_digest(_ff, p, source=False):
+            if source:
+                return src_dig[p]
+            dst_calls[p] += 1
+            return wav_dig.get(p)
+
+        with patch.object(audio_wav, "audio_digest", side_effect=fake_digest), \
+                patch("os.path.lexists", side_effect=lambda p: p in wav_dig), \
+                patch("os.path.isfile", side_effect=lambda p: p in wav_dig):
+            planned, renamed, moved = audio_wav.plan_outputs(items, src, out, "ffmpeg")
+        self.assertEqual([(os.path.basename(p), stem) for p, stem in planned],
+                         [("a.ogg.opus", "a.ogg~4"), ("a.ogg~2.opus", "a.ogg~3")])
+        self.assertEqual((renamed, moved), (0, 2))
+        self.assertEqual(max(dst_calls.values()), 1)
+
 
 class GranuleTest(unittest.TestCase):
     def test_trim_requires_identifiable_matching_endpoints(self):
@@ -383,9 +454,7 @@ def write_fake_ffmpeg(directory, source=FAKE_FFMPEG):
     with open(script, "w", encoding="utf-8") as f:
         f.write(source)
     if os.name == "nt":
-        ffmpeg = os.path.join(directory, "ffmpeg.cmd")
-        with open(ffmpeg, "w", encoding="utf-8") as f:
-            f.write(f'@"{sys.executable}" "{script}" %*\n')
+        ffmpeg = winbatch.write_python_cmd(os.path.join(directory, "ffmpeg.cmd"), sys.executable, script)
     else:
         ffmpeg = os.path.join(directory, "ffmpeg")
         with open(ffmpeg, "w", encoding="utf-8") as f:
@@ -655,10 +724,26 @@ class AudioWavCliTest(unittest.TestCase):
         out_file = os.path.join(self.dir, "out_file")
         with open(out_file, "wb") as f:
             f.write(b"content")
-        p = subprocess.run([sys.executable, "-I", TOOL, self.src_dir, "--out", out_file],
-                           capture_output=True, text=True)
-        self.assertEqual(p.returncode, 2)
-        self.assertIn("is a file, not a folder", p.stderr)
+        for suffix in ("", os.sep, os.sep + "."):
+            with self.subTest(suffix=suffix):
+                out = out_file + suffix
+                p = subprocess.run([sys.executable, "-I", TOOL, self.src_dir, "--out", out],
+                                   capture_output=True, text=True, timeout=10)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertIn(f"{out} is a file, not a folder", p.stderr)
+        with open(out_file, "rb") as f:
+            self.assertEqual(f.read(), b"content")
+
+    def test_cli_subprocess_accepts_normalized_output_directory(self):
+        directory = os.path.join(self.dir, "output")
+        os.mkdir(directory)
+        missing_ffmpeg = os.path.join(self.dir, "no-ffmpeg")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src_dir, "--out", directory + os.sep + ".",
+                            "--ffmpeg", missing_ffmpeg], capture_output=True, text=True, timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stderr, "")
+        self.assertIn("Nothing to do: no Ogg Opus files found", p.stdout)
 
     def test_cli_rejects_missing_source(self):
         missing = os.path.join(self.dir, "nonexistent")

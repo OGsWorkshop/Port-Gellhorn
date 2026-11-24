@@ -33,13 +33,17 @@ try
     string failed = Path.Combine(dir, "b.dds");
     try { Util.WriteAtomic(failed, t => { File.WriteAllBytes(t, [9]); throw new IOException("disk full"); }); Check(false, "error propagates"); }
     catch (IOException) { }
-    Check(!File.Exists(failed) && !File.Exists(failed + ".partial"), "a failed write leaves neither file");
+    Check(!File.Exists(failed) && Directory.GetFiles(dir, "b.dds*partial").Length == 0,
+        "a failed write leaves neither file nor a .partial");
 
     // A stopped run's leftover .partial must not block a writer that opens with FileMode.CreateNew.
     string stale = Path.Combine(dir, "c.xma.wav");
     File.WriteAllBytes(stale + ".partial", [7]);
     Util.WriteAtomic(stale, t => { using var f = new FileStream(t, FileMode.CreateNew); f.WriteByte(5); });
-    Check(File.ReadAllBytes(stale).SequenceEqual(new byte[] { 5 }) && !File.Exists(stale + ".partial"), "stale .partial is replaced");
+    Check(File.ReadAllBytes(stale).SequenceEqual(new byte[] { 5 })
+         && !File.Exists(stale + ".partial")
+         && Directory.GetFiles(dir, "c.xma.wav*partial").Length == 0,
+         "stale .partial is replaced");
 }
 finally { Directory.Delete(dir, true); }
 Console.WriteLine("Atomic write tests passed.");
@@ -114,10 +118,23 @@ Console.WriteLine("Mesh key tests passed.");
 }
 Console.WriteLine("Recovered segment tests passed.");
 
+// Only a full scan replaces rpf9dump's own: rpf9-explorer saves partial model indexes while indexing and on cancel.
+Check(!ScanCounts.IsFullScan(Index("Dictionary-aware model scan in progress \u00B7 1,001/183,801 containers validated.", false)), "GUI index saved while indexing");
+Check(!ScanCounts.IsFullScan(Index("Dictionary-aware model scan canceled. Validated models are retained; discovery will resume on reopen.", false)), "GUI index saved on cancel");
+Check(ScanCounts.IsFullScan(Index("Full 1,234,567-byte model-container scan \u00B7 149,811 supported models including drawable dictionary children.", true)), "GUI index marked complete");
+Check(ScanCounts.IsFullScan(Index(ScanCounts.Coverage(183801, 149811), true)), "rpf9dump index");
+Check(ScanCounts.IsFullScan(Index(ScanCounts.Coverage(183801, 149811), false)), "rpf9dump index saved without the complete mark");
+Check(ScanCounts.IsFullScan(Index(string.Format(System.Globalization.CultureInfo.GetCultureInfo("de-CH"), "rpf9dump full scan, {0:N0} candidates, {1:N0} recovered", 183801, 149811), false)), "culture-formatted rpf9dump index");
+Check(!ScanCounts.IsFullScan(null), "no cached index");
+Console.WriteLine("Cached index tests passed.");
+
 static void Check(bool ok, string what)
 {
     if (!ok) throw new Exception($"Failed: {what}");
 }
+
+static RecoveryIndexCache.CachedIndex Index(string coverage, bool complete) =>
+    new("rpfpreview-payload-index/models/4", "models", "levels.rpf", 0, 0, "", coverage, []) { IsComplete = complete };
 
 static void Expect(ReadOnlySpan<byte> system, int graphicsBytes, string expected)
 {

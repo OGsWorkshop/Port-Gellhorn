@@ -9,6 +9,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -348,13 +349,15 @@ class HeaderTests(unittest.TestCase):
             dds.parse_dds_header(dds_buffer(4, 4, flags=DDPF_FOURCC, fourcc=b"XXXX"))
         self.assertIn("FourCC", str(ctx.exception))
 
-    def test_rejects_non_32_bit_rgb(self):
-        with self.assertRaises(dds.DdsError) as ctx:
-            dds.parse_dds_header(
-                dds_buffer(4, 4, flags=DDPF_RGB, bit_count=24,
-                           masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0))
-            )
-        self.assertIn("24", str(ctx.exception))
+    def test_rejects_non_24_or_32_bit_rgb(self):
+        for bit_count in (8, 16):
+            with self.subTest(bit_count=bit_count):
+                with self.assertRaises(dds.DdsError) as ctx:
+                    dds.parse_dds_header(
+                        dds_buffer(4, 4, flags=DDPF_RGB, bit_count=bit_count,
+                                   masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0))
+                    )
+                self.assertIn("bit count", str(ctx.exception))
 
     def test_rejects_zero_rgb_masks(self):
         with self.assertRaises(dds.DdsError):
@@ -516,6 +519,79 @@ class UncompressedTests(unittest.TestCase):
         )
         _, _, rgba = dds.decode_dds(bytearray(buf))
         self.assertEqual(pixels(rgba), [(9, 8, 7, 6)])
+
+
+class Rgb24Tests(unittest.TestCase):
+    """Legacy 24-bit RGB layouts (D3DFMT_R8G8B8 stores bytes B, G, R; no alpha)."""
+
+    def test_bgr8_header_and_opaque_decode(self):
+        payload = bytes((0x10, 0x20, 0x30, 0x40, 0x50, 0x60))
+        data = dds_buffer(
+            2, 1, payload, flags=DDPF_RGB, bit_count=24,
+            masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0x00000000),
+        )
+        info = dds.parse_dds_header(data)
+        self.assertEqual(info["format"], "BGR8")
+        self.assertIsNone(info["dxgi_format"])
+        self.assertEqual(info["data_offset"], 128)
+        self.assertEqual(dds.decode_dds(data),
+                         (2, 1, bytes((0x30, 0x20, 0x10, 255, 0x60, 0x50, 0x40, 255))))
+
+    def test_rgb8_byte_order(self):
+        payload = bytes((0x10, 0x20, 0x30, 0x40, 0x50, 0x60))
+        data = dds_buffer(
+            2, 1, payload, flags=DDPF_RGB, bit_count=24,
+            masks=(0x000000FF, 0x0000FF00, 0x00FF0000, 0x00000000),
+        )
+        self.assertEqual(dds.parse_dds_header(data)["format"], "RGB8")
+        self.assertEqual(dds.decode_dds(data),
+                         (2, 1, bytes((0x10, 0x20, 0x30, 255, 0x40, 0x50, 0x60, 255))))
+
+    def test_padded_rows_are_removed(self):
+        # width 2 -> 6 data bytes per row, padded to the 8-byte pitch some writers emit.
+        payload = bytes((1, 2, 3, 4, 5, 6)) + b"\x99" * 2 + bytes((7, 8, 9, 10, 11, 12)) + b"\x99" * 2
+        data = dds_buffer(
+            2, 2, payload, flags=DDPF_RGB, bit_count=24, pitch=8,
+            masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0x00000000),
+        )
+        self.assertEqual(pixels(dds.decode_dds(data)[2]),
+                         [(3, 2, 1, 255), (6, 5, 4, 255), (9, 8, 7, 255), (12, 11, 10, 255)])
+
+    def test_alpha_flag_with_zero_mask_still_decodes(self):
+        # Some writers set DDPF_ALPHAPIXELS on 24-bit headers with a zero alpha mask.
+        payload = bytes((1, 2, 3))
+        data = dds_buffer(
+            1, 1, payload, flags=DDPF_RGB | DDPF_ALPHAPIXELS, bit_count=24,
+            masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0x00000000),
+        )
+        self.assertEqual(dds.decode_dds(data), (1, 1, bytes((3, 2, 1, 255))))
+
+    def test_pitch_and_truncation_errors_are_reported(self):
+        header = dict(flags=DDPF_RGB, bit_count=24,
+                      masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0x00000000))
+        with self.assertRaisesRegex(dds.DdsError, "pitch"):
+            dds.decode_dds(dds_buffer(2, 2, b"\x00" * 6, pitch=5, **header))
+        with self.assertRaisesRegex(dds.DdsError, "Truncated"):
+            dds.decode_dds(dds_buffer(2, 2, b"\x00" * 9, pitch=6, **header))
+
+    def test_unsupported_24_bit_mask_layouts_are_rejected(self):
+        for masks in ((0x000000FF, 0x00000000, 0x00000000, 0x00000000),
+                      (0x000000FF, 0x000000FF, 0x000000FF, 0x00000000),
+                      (0x00000FFF, 0x000FF000, 0x0FF00000, 0x00000000)):
+            with self.subTest(masks=masks):
+                data = dds_buffer(1, 1, flags=DDPF_RGB, bit_count=24, masks=masks)
+                with self.assertRaisesRegex(dds.DdsError, "24-bit RGB bitmask layout"):
+                    dds.decode_dds(data)
+
+    def test_png_preview_round_trip(self):
+        payload = bytes((0x10, 0x20, 0x30, 0x40, 0x50, 0x60))
+        data = dds_buffer(
+            2, 1, payload, flags=DDPF_RGB, bit_count=24,
+            masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0x00000000),
+        )
+        png = dds.dds_to_png_bytes(data)
+        self.assertEqual(png[:8], dds.PNG_SIGNATURE)
+        self.assertEqual(struct.unpack(">II", png[16:24]), (2, 1))
 
 
 class AlphaModeTests(unittest.TestCase):
@@ -883,6 +959,24 @@ class PngTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dds.encode_png(2, 1, b"\x00" * 7)
 
+    def test_packed_r11g11b10_preview_respects_row_pitch_and_channel_bits(self) -> None:
+        def packed(red: int, green: int, blue: int) -> int:
+            return red | (green << 11) | (blue << 22)
+
+        bright = packed(15 << 6, 14 << 6, 13 << 5)  # 1.0, 0.5, 0.25
+        fractions = packed((14 << 6) | 32, (13 << 6) | 32, (14 << 5) | 8)  # 0.75, 0.375, 0.625
+        edge = packed(0, 1, 31 << 5)  # zero, subnormal, infinity
+        nan_hdr = packed((31 << 6) | 1, 16 << 6, 31)  # NaN, 2.0, subnormal
+        payload = struct.pack("<II", bright, fractions) + b"\xee" * 4 + struct.pack("<II", edge, nan_hdr)
+        data = dds_buffer(2, 2, payload, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=26, pitch=12)
+
+        chunks = png_chunks(dds.dds_to_png_bytes(data))
+        self.assertEqual(struct.unpack(">II", chunks[0][1][:8]), (2, 2))
+        self.assertEqual(zlib.decompress(chunks[1][1]), bytes((
+            0, 255, 128, 64, 255, 191, 96, 159, 255,
+            0, 0, 0, 255, 255, 0, 255, 0, 255,
+        )))
+
     def test_dds_to_png_roundtrip(self):
         payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
         png = dds.dds_to_png_bytes(dds_buffer(
@@ -919,6 +1013,53 @@ class PngTests(unittest.TestCase):
                 chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
                 self.assertEqual(struct.unpack(">II", chunks[0][1][:8]), (1, 1))
                 self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, *expected)))
+
+    def test_png_downscale_filters_tagged_srgb_in_linear_light(self):
+        rgba = bytes((0, 32, 0, 255, 255, 160, 10, 255))
+        # BC1 indices 1 and 0 select black and white in the first two texels.
+        bc1 = bc1_block(0xFFFF, 0, [1, 0, 0, 0])
+        for dxgi, payload, expected in (
+            (29, rgba, (188, 119, 5, 255)),
+            (28, rgba, (128, 96, 5, 255)),
+            (72, bc1, (188, 188, 188, 255)),
+            (71, bc1, (128, 128, 128, 255)),
+        ):
+            with self.subTest(dxgi=dxgi):
+                data = dds_buffer(2, 1, payload, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi)
+                chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+                self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, *expected)))
+
+        data = dds_buffer(2, 1, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=29)
+        for max_size in (0, 2):
+            chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=max_size))
+            self.assertEqual(zlib.decompress(chunks[1][1]), b"\0" + rgba)
+
+    def test_srgb_downscale_weights_linear_color_by_alpha(self):
+        # Opaque red, half-covered green and invisible blue. Alpha is linear.
+        rgba = bytes((255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0))
+        data = dds_buffer(3, 1, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=29)
+        chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+        self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, 213, 156, 0, 128)))
+
+    def test_srgb_linear_segment_rounds_half_bytes_up(self):
+        # All channels lie on the linear segment. Their means are 5.5, 5.5 and 3.5.
+        for alpha in (128, 255):
+            left = bytes((2, 5, 6, alpha))
+            right = bytes((9, 6, 1, alpha))
+            for rgba in (left + right, right + left):
+                with self.subTest(rgba=rgba):
+                    data = dds_buffer(2, 1, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=29)
+                    chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+                    self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, 6, 6, 4, alpha)))
+
+    def test_srgb_downscale_across_two_levels(self):
+        # An opaque white first row and three black rows give 25% linear light.
+        for width in (1, 4):
+            with self.subTest(width=width):
+                rgba = b"\xff" * (4 * width) + bytes((0, 0, 0, 255)) * (3 * width)
+                data = dds_buffer(width, 4, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=29)
+                chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+                self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, 137, 137, 137, 255)))
 
     def test_dds_to_png_rejects_negative_max_size(self):
         payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
@@ -957,6 +1098,43 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertIn("output must not overwrite the input DDS", stderr.getvalue())
 
+    def test_cli_publishes_only_after_a_complete_write(self):
+        original = dds_buffer(4, 4, bc1_block(0xFFFF, 0, [0, 0, 0, 0]),
+                              flags=DDPF_FOURCC, fourcc=b"DXT1")
+        previous = dds.encode_png(1, 1, b"\x10\x20\x30\xff")
+        replacement = dds.dds_to_png_bytes(original)
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "in.dds")
+                dst = os.path.join(tmp, "out.png")
+                with open(src, "wb") as f:
+                    f.write(original)
+                if existing:
+                    with open(dst, "wb") as f:
+                        f.write(previous)
+
+                @contextlib.contextmanager
+                def fail_partial_write(path, mode):
+                    with open(path, mode) as f:
+                        def write(data):
+                            f.write(data[:4])
+                            raise OSError("synthetic disk-full write")
+
+                        yield mock.Mock(write=write) if mode == "wb" else f
+
+                err = io.StringIO()
+                with mock.patch.object(dds, "open", side_effect=fail_partial_write, create=True), \
+                        contextlib.redirect_stderr(err):
+                    self.assertEqual(dds.main([src, dst]), 1)
+                self.assertIn("synthetic disk-full write", err.getvalue())
+                self.assertCountEqual(os.listdir(tmp), ["in.dds", "out.png"] if existing else ["in.dds"])
+                if existing:
+                    with open(dst, "rb") as f:
+                        self.assertEqual(f.read(), previous)
+                self.assertEqual(dds.main([src, dst]), 0)
+                with open(dst, "rb") as f:
+                    self.assertEqual(f.read(), replacement)
+
     def test_cli_reports_unsupported_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in.dds")
@@ -993,6 +1171,102 @@ class CliTests(unittest.TestCase):
             self.assertEqual(dds.main([src, dst, "--max-size", "0"]), 0)
             with open(dst, "rb") as f:
                 self.assertEqual(f.read(8), dds.PNG_SIGNATURE)
+
+
+def halves(*codes):
+    return struct.pack(f"<{len(codes)}H", *codes)
+
+
+HALF_FLOAT = dict(flags=DDPF_FOURCC, fourcc=b"DX10")
+
+
+class HalfFloatTests(unittest.TestCase):
+    """DXGI 54 (R16_FLOAT) and 10 (R16G16B16A16_FLOAT): clamp to [0, 1], round(v * 255) half up."""
+
+    def test_header_names_the_half_float_formats(self):
+        for dxgi, name in ((54, "R16_FLOAT"), (10, "RGBA16_FLOAT")):
+            with self.subTest(dxgi=dxgi):
+                info = dds.parse_dds_header(dds_buffer(1, 1, dxgi=dxgi, **HALF_FLOAT))
+                self.assertEqual((info["format"], info["dxgi_format"]), (name, dxgi))
+
+    def test_r16_float_fills_red_and_skips_row_padding(self):
+        # 1.0, 0.5 | 2^-8, 2.0 with four padding bytes after each 4-byte row.
+        payload = halves(0x3C00, 0x3800) + b"\xcc" * 4 + halves(0x1C00, 0x4000)
+        width, height, rgba = dds.decode_dds(dds_buffer(2, 2, payload, pitch=8, dxgi=54, **HALF_FLOAT))
+        self.assertEqual((width, height), (2, 2))
+        self.assertEqual(pixels(rgba), [(255, 0, 0, 255), (128, 0, 0, 255), (1, 0, 0, 255), (255, 0, 0, 255)])
+
+    def test_rgba16_float_keeps_alpha_and_skips_row_padding(self):
+        payload = (halves(0x3C00, 0x3800, 0x0000, 0x3C00) + b"\xcc" * 4
+                   + halves(0x3555, 0x1C00, 0x3BFF, 0x3800))
+        width, height, rgba = dds.decode_dds(dds_buffer(1, 2, payload, pitch=12, dxgi=10, **HALF_FLOAT))
+        self.assertEqual((width, height), (1, 2))
+        # 0x3555 = 0.333252 -> 85; 0x3BFF = 0.999512 -> 255.
+        self.assertEqual(pixels(rgba), [(255, 128, 0, 255), (85, 1, 255, 128)])
+
+    def test_tightly_packed_rows_without_a_pitch(self):
+        payload = halves(0x3800, 0x3C00, 0x0000, 0x3400)  # 0.5, 1, 0, 0.25
+        for pitch in (None, 0):
+            with self.subTest(pitch=pitch):
+                self.assertEqual(dds.decode_dds(dds_buffer(2, 2, payload, pitch=pitch, dxgi=54, **HALF_FLOAT)),
+                                 (2, 2, bytes((128, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255, 64, 0, 0, 255))))
+
+    def test_nonfinite_negative_and_subnormal_values(self):
+        cases = (
+            (0x7C00, 255),  # +inf
+            (0xFC00, 0),  # -inf
+            (0x7E00, 0),  # quiet NaN
+            (0x7C01, 0),  # signalling NaN
+            (0xFFFF, 0),  # negative NaN
+            (0x8000, 0),  # -0
+            (0xBC00, 0),  # -1
+            (0x7BFF, 255),  # 65504, largest finite
+            (0x0001, 0),  # smallest subnormal
+            (0x0000, 0),
+        )
+        payload = halves(*(code for code, _ in cases))
+        _, _, r16 = dds.decode_dds(dds_buffer(len(cases), 1, payload, dxgi=54, **HALF_FLOAT))
+        self.assertEqual(list(r16[0::4]), [v for _, v in cases])
+        self.assertEqual(set(r16[3::4]), {255})
+        # Same codes in every RGBA16_FLOAT channel, alpha included.
+        rgba_payload = b"".join(halves(code, code, code, code) for code, _ in cases)
+        _, _, rgba = dds.decode_dds(dds_buffer(len(cases), 1, rgba_payload, dxgi=10, **HALF_FLOAT))
+        self.assertEqual(pixels(rgba), [(v, v, v, v) for _, v in cases])
+
+    def test_every_half_code_maps_deterministically(self):
+        payload = struct.pack("<65536H", *range(65536))
+        data = dds_buffer(256, 256, payload, dxgi=54, **HALF_FLOAT)
+        _, _, rgba = dds.decode_dds(data)
+        red = rgba[0::4]
+        self.assertEqual(dds.decode_dds(data)[2], rgba)
+        positive = red[:0x7C00]  # +0 up to 65504, in increasing order
+        self.assertTrue(all(a <= b for a, b in zip(positive, positive[1:])))
+        self.assertEqual((red[0x3C00], red[0x7C00]), (255, 255))
+        self.assertFalse(any(red[0x7C01:0x8000]), "NaN must be 0")
+        self.assertFalse(any(red[0x8000:]), "the sign bit must give 0")
+
+    def test_pitch_and_truncation_errors(self):
+        with self.assertRaisesRegex(dds.DdsError, "RGBA16_FLOAT row pitch"):
+            dds.decode_dds(dds_buffer(1, 2, bytes(16), pitch=4, dxgi=10, **HALF_FLOAT))
+        with self.assertRaisesRegex(dds.DdsError, "Truncated R16_FLOAT"):
+            dds.decode_dds(dds_buffer(2, 2, bytes(11), pitch=8, dxgi=54, **HALF_FLOAT))
+        # The last row needs only its own bytes, not a full pitch.
+        self.assertEqual(dds.decode_dds(dds_buffer(2, 2, bytes(12), pitch=8, dxgi=54, **HALF_FLOAT))[0:2], (2, 2))
+
+    def test_cli_writes_the_png(self):
+        payload = halves(0x3C00, 0x0000, 0x3800, 0x3C00, 0x7E00, 0x7C00, 0x3400, 0x3800)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            dst = os.path.join(tmp, "out.png")
+            with open(src, "wb") as f:
+                f.write(dds_buffer(2, 1, payload, pitch=16, dxgi=10, **HALF_FLOAT))
+            self.assertEqual(dds.main([src, dst]), 0)
+            with open(dst, "rb") as f:
+                chunks = png_chunks(f.read())
+        ihdr = next(p for t, p, _ in chunks if t == b"IHDR")
+        self.assertEqual(struct.unpack(">II", ihdr[:8]), (2, 1))
+        raw = zlib.decompress(b"".join(p for t, p, _ in chunks if t == b"IDAT"))
+        self.assertEqual(raw[1:], bytes((255, 0, 128, 255, 0, 255, 64, 128)))
 
 
 if __name__ == "__main__":

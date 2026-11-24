@@ -1,9 +1,24 @@
 // GameInput shim on SDL3: runtime-side controls and test seams. The GameInput API itself is reached the way a title
 // reaches it, through GameInputCreate in the shim registry (gameinput.dll / xgameruntime.dll). See docs/gameinput.md.
 #pragma once
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <vector>
+
+#include "../src/active_input.h"  // leonida::InputFamily (and std::optional) for Config::prompts and active_input()
 
 namespace rt::gameinput {
+
+// Takes a reference on a reference-counted object only while it is alive, that is while its count isn't 0. A thread
+// that finds the object in a shared list (the poll thread and a device's force-feedback effects) then can't revive one
+// whose last Release has already run and whose destructor is waiting for the lock to unlink it. False: leave it be.
+template <class Count>
+bool add_ref_if_live(std::atomic<Count>& refs) {
+    Count n = refs.load();
+    while (n != 0 && !refs.compare_exchange_weak(n, n + 1)) {}
+    return n != 0;
+}
 
 // How the impulse-trigger motors (GameInputRumbleParams::leftTrigger/rightTrigger) reach a DualSense.
 enum class DsTriggerMode { Off, Rumble, Resistance };
@@ -13,6 +28,10 @@ enum class DsTriggerMode { Off, Rumble, Resistance };
 enum class KeyboardPadMode { Off, Focused, Always };
 
 struct Config {
+    // LEONIDA_PROMPTS=auto|xbox|playstation|ps5|ps4|ps3|nintendo|keyboard: a family that active_input() reports
+    // whatever is in use; unset or auto follows the devices.
+    std::optional<leonida::InputFamily> prompts;
+    uint32_t prompts_switch_ms = 300;  // LEONIDA_PROMPTS_SWITCH_MS, 0..2000: shortest time between two changes
     DsTriggerMode ds_triggers = DsTriggerMode::Rumble;  // LEONIDA_DS_TRIGGERS=off|rumble|resistance
     float ds_trigger_gain = 1.0f;                       // LEONIDA_DS_TRIGGER_GAIN, 0..4, scales the effect strength
     float mouse_sensitivity = 1.0f;                     // LEONIDA_MOUSE_SENSITIVITY, 0.1..10, scales mouse movement
@@ -37,6 +56,17 @@ void poll();
 
 // Number of gamepads currently open by the backend (tests, gameinput_probe).
 int connected_count();
+
+// The kind of device the player used last (src/active_input.h has the rules), or the one LEONIDA_PROMPTS forces.
+// The title is told every pad is an Xbox One pad; this is for the runtime's own use, such as button prompt glyphs.
+// Safe from any thread. `generation` goes up by one with each change of `family`, so a reader can check it every
+// frame and act only when it moved. Xbox, generation 0, until the first deliberate input.
+struct ActiveInput {
+    leonida::InputFamily family = leonida::InputFamily::Xbox;
+    uint64_t generation = 0;
+    bool forced = false;  // LEONIDA_PROMPTS set the family
+};
+ActiveInput active_input();
 
 // The SDL haptic calls the shim makes, one entry per call, so a test can stand in for them: SDL's virtual joysticks
 // report no haptics, and a pad that does is the only other way to reach this path. `joystick` is the SDL_Joystick the
@@ -67,6 +97,12 @@ struct OutputState {
     bool trigger_rumble = false;          // the pad takes SDL_RumbleGamepadTriggers
     bool force_feedback = false;          // SDL opened the pad as a haptic device
     uint32_t haptic_motors = 0;           // haptic motors the pad reports (0 or 2)
+    // The last force-feedback effect the shim asked SDL for: SDL_CreateHapticEffect's id (-1 when SDL refused),
+    // whether SDL_RunHapticEffect then returned true, and SDL's error text when a call failed. `force_feedback` only
+    // says a haptic device was opened; an effect SDL creates but will not run, or refuses outright, shows up here.
+    int effect_id = -1;
+    bool effect_ran = false;
+    char effect_error[128] = {};
 };
 bool output_state(int i, OutputState* out);
 
@@ -80,6 +116,37 @@ void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus);
 // replaces GetCursorPos. nullptr restores the default.
 using CursorPosFn = bool (*)(int* x, int* y);
 void set_cursor_source(CursorPosFn cursor_pos);
+
+// Raw HID (RT-175, docs/gameinput.md "Raw HID"). One report a HID report descriptor declares: its kind
+// (GameInputRawDeviceReportKind: 0 input, 1 output, 2 feature), its report id (0 when the descriptor declares none)
+// and its payload size in bytes, without the id byte.
+struct RawReportSize {
+    int kind;
+    uint32_t id;
+    uint32_t bytes;
+};
+// Reads the reports out of a HID report descriptor, sorted by kind then id. Main items Input/Output/Feature add
+// Report Size x Report Count bits to the current report id; Push and Pop save and restore the globals; long items are
+// skipped. False on a truncated descriptor, a Report ID of 0 or above 255, a Pop without a Push, or a report over
+// 64 KiB.
+bool parse_report_descriptor(const uint8_t* data, size_t size, std::vector<RawReportSize>* out);
+
+// Where the shim does a pad's HID I/O. The default is SDL's hidapi (SDL_hid_*). Report buffers follow hidapi: they
+// start with the report id byte (0 for a device without ids) for write, get_feature and send_feature, and read
+// returns it first only when the device uses ids. read never blocks: it returns 0 when nothing is pending. Every
+// call returns a byte count, or a negative value on error.
+struct HidBackend {
+    void* (*open)(const char* path, uint16_t vendor, uint16_t product);  // nullptr: no HID device for this pad
+    void (*close)(void* hid);
+    int (*descriptor)(void* hid, uint8_t* buf, size_t size);
+    int (*read)(void* hid, uint8_t* buf, size_t size);
+    int (*write)(void* hid, const uint8_t* buf, size_t size);
+    int (*get_feature)(void* hid, uint8_t* buf, size_t size);
+    int (*send_feature)(void* hid, const uint8_t* buf, size_t size);
+};
+// Test seam: the backend for pads opened from now on (pads already open keep theirs until they reconnect). nullptr
+// restores SDL's.
+void set_hid_backend(const HidBackend* backend);
 
 // One row of the keyboard pad's key map: a Windows virtual-key code and the SDL gamepad button it presses.
 struct KeyBinding {

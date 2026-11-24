@@ -2,7 +2,8 @@
 
     python -I tests/test_tile_probe.py
 
-The tool needs numpy, so the tests skip without it.
+The probe needs numpy, so those tests skip without it; the checks that run before it are also tested with numpy
+blocked.
 """
 import importlib.util
 import os
@@ -35,7 +36,7 @@ class TileProbeInputTest(unittest.TestCase):
 
     def test_missing_file_is_a_message_not_a_traceback(self):
         p = self.run_tool(os.path.join(self.tmp.name, "missing.bin"))
-        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("missing.bin", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
@@ -88,6 +89,13 @@ class TileProbeInputTest(unittest.TestCase):
         self.assertIn("is a directory", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_out_under_a_regular_file_is_a_message_not_a_traceback(self):
+        # Before: os.makedirs raised FileExistsError (NotADirectoryError on Windows) out of check_preview_path.
+        p = self.run_tool(self.blob, "--out", os.path.join(self.blob, "sub", "p.png"))
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("--out", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
     def test_out_creates_a_missing_folder(self):
         sys.path.insert(0, os.path.join(ROOT, "tools"))
         import tile_probe
@@ -107,6 +115,76 @@ class TileProbeInputTest(unittest.TestCase):
         p = self.run_tool(self.blob, "--offset", "0")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("score", p.stdout)
+
+    def test_block_feature_rejects_unsupported_bpe(self):
+        import numpy as np
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import tile_probe
+
+        for bad_bpe in (1, 2, 4, 12):
+            with self.subTest(bpe=bad_bpe), self.assertRaises(ValueError):
+                tile_probe.block_feature(np.zeros((4, bad_bpe), np.uint8), bad_bpe)
+
+    def test_render_packs_ddscaps_texture_and_rejects_unfitting_layout(self):
+        import struct
+        import types
+        from unittest import mock
+
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import tile_probe
+
+        captured = []
+
+        class _FakeImage:
+            size = (256, 64)
+
+            def convert(self, _mode):
+                return self
+
+            def save(self, _out):
+                pass
+
+        fake_image_mod = types.SimpleNamespace(open=lambda bio: (captured.append(bio.getvalue()), _FakeImage())[1])
+        fake_pil = types.SimpleNamespace(Image=fake_image_mod)
+        blob = bytes(256 * 256)
+        with mock.patch.dict(sys.modules, {"PIL": fake_pil, "PIL.Image": fake_image_mod}):
+            tile_probe.render(blob, 0, 8, 256, "4k", os.path.join(self.tmp.name, "ok.png"))
+            self.assertEqual(len(captured), 1)
+            caps = struct.unpack_from("<I", captured[0], 108)[0]
+            self.assertEqual(caps, 0x1000)
+
+            with self.assertRaises(ValueError):
+                tile_probe.render(blob, 0, 8, 256, "64k", os.path.join(self.tmp.name, "bad.png"))
+
+
+# `import numpy` raises ImportError in the child, as on a Python without numpy (CI's standard-library job)
+WITHOUT_NUMPY = ("import runpy, sys; sys.modules['numpy'] = None; sys.argv = sys.argv[1:]; "
+                 "runpy.run_path(sys.argv[0], run_name='__main__')")
+
+
+class TileProbeWithoutNumpyTest(unittest.TestCase):
+    """The input checks need no numpy, and the missing numpy itself is one line, not a traceback."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", "-c", WITHOUT_NUMPY, TOOL, *args],
+                              capture_output=True, text=True, timeout=120)
+
+    def test_missing_file_is_a_usage_error_without_numpy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self.run_tool(os.path.join(tmp, "missing.bin"))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("missing.bin", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_missing_numpy_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "blob.bin")
+            with open(blob, "wb") as f:
+                f.write(bytes(range(256)) * 64)
+            p = self.run_tool(blob)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(p.stderr.strip().splitlines(),
+                         ["ERROR: tile_probe.py needs numpy (python -m pip install numpy)"])
 
 
 if __name__ == "__main__":

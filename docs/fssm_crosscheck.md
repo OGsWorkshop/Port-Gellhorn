@@ -25,9 +25,9 @@ The short version:
   contain no numeric encodings apart from the standard VOP3 base-plus-offset convention.
 - SCARAB's family classifier is sound; its VOP1/VOP2/SOP1 **mnemonic tables and length
   model** are not. Leonida's `llvm-mc` path is the better decoder.
-- **Leonida bug found:** `xdat_entries` keys by tag, so a container with two `0x0D` entries
-  silently keeps only the last. 195/26,503 containers have two distinct `XBCH` payloads.
-  A repro test is in `tests/test_fssm_crosscheck.py`; the fix is out of scope here.
+- **Leonida bug found, since fixed:** `xdat_entries` kept only the last of a container's two
+  `0x0D` entries. 195/26,503 containers have two distinct `XBCH` payloads. #2479 added
+  `xdat_entries_all` and a `payload=` choice; `tests/test_fssm_crosscheck.py` pins both.
 
 ## 1. Container and unwrap
 
@@ -40,7 +40,7 @@ The short version:
 | The unwrap is a full chain `.dxbc -> DXIL chunk -> XBCH -> zlib -> FSSM`. | `fssm_lib.fssm_from_dxbc()` | `fssm_unpack.unpack()` does the same, but selects the `XBCH` by XDAT tag and checks the decompressed length. SCARAB scans for `XBCH` (the extractor additionally requires version 3) and does not check the length. | **Equivalent in result, different in mechanism** |
 | A bare `FSSM` blob is accepted as input. | `fssm_to_rdna2.unwrap()` | `fssm_unpack.unpack()` accepts only `.dxbc`; the rest of Leonida (`shader_disasm.py`) accepts a bare `.fssm`. | **Minor input-form gap** |
 | `FSSM` magic is asserted after decompression. | `fssm_lib.fssm_from_dxbc()` | `fssm_unpack.unpack()` also rejects a payload that doesn't start with `FSSM` (`ValueError`, counted as a problem, nothing written). All 26,503 are `FSSM`, so there is no corpus failure. | **Verified** |
-| **Duplicate XDAT tag `0x0D`.** | `fssm_lib` / `fssm_to_rdna2` pick the **first** version-3 `XBCH` | `xdat_entries` is a dict, so the **last** tag-`0x0D` entry wins. 195/26,503 containers (all `$VS_*` VoxelizeGeneric) have **two different** tag-`0x0D` payloads; the two FSSM payloads differ in code size and content. Neither tool exposes both. | **Corrected — real Leonida bug** |
+| **Duplicate XDAT tag `0x0D`.** | `fssm_lib` / `fssm_to_rdna2` pick the **first** version-3 `XBCH` | `xdat_entries` was a dict, so the **last** tag-`0x0D` entry won. 195/26,503 containers (all `$VS_*` VoxelizeGeneric) have **two different** tag-`0x0D` payloads; the two FSSM payloads differ in code size and content. Since #2479 `xdat_entries_all` returns every entry in directory order and `unpack(payload=…)` picks one; `xdat_entries` keeps the last-wins view for old callers. | **Corrected — real Leonida bug, fixed in #2479** |
 
 ### The duplicate-XBCH exception (the important one)
 
@@ -62,14 +62,16 @@ In the measured pair the first is 3,679 bytes and starts with a GS/ES-like prolo
 instructions. The 24-byte descriptor at `code_off + 0x10` is identical in the measured
 pairs, so they belong to the same container record.
 
-Leonida currently writes only the second payload as `<name>.fssm`; SCARAB scans from the
-start and takes the first. The two projects therefore extract **different payloads** for
-these containers. The authoritative mapping (which payload the game's pipeline uses) is
-not established here.
+Leonida writes the second payload as `<name>.fssm` by default; `fssm_unpack.py --payload first`
+writes the first instead, which is the one SCARAB takes when it scans from the start. The
+default is unchanged, so the two projects still extract **different payloads** for these
+containers unless that flag is passed. The authoritative mapping (which payload the game's
+pipeline uses) is not established here.
 
-Repro: `tests/test_fssm_crosscheck.py::DuplicateXbchTest::test_duplicate_tag_0d_is_preserved`
-is an `expectedFailure`; the passing test above it documents the current last-wins
-behaviour. Fixing `fssm_unpack.py` is deliberately out of scope for this change.
+Covered by `tests/test_fssm_crosscheck.py::DuplicateXbchTest`:
+`test_xdat_entries_all_preserves_both_payloads_in_order` pins the directory order,
+`test_xdat_entries_keeps_the_last_payload_per_tag` the compatibility view, and
+`test_unpack_selects_first_or_last_payload` the `payload=` choice.
 
 ## 2. FSSM header and code range
 
@@ -101,6 +103,53 @@ Leonida's rule is `u32[0xC0] + 0x28` to the last `s_endpgm` (also `docs/design.m
 "Disassembling shaders"). The 17 `code_end = DEAD` blobs are handled because the last
 `s_endpgm` is used instead of `code_end`.
 
+### Initial float mode (SHADER-190)
+
+The 1.0.2.1 scan tested 88 aligned little-endian words in each of the 26,503 indexed FSSM blobs as possible
+packed `PGM_RSRC1` registers carrying `FLOAT_MODE`, `DX10_CLAMP` and `IEEE`. It covered 78 word starts at
+FSSM offsets `0x00` through `0x134` and 10 at `code_off + 0x00` through `code_off + 0x24`, inclusive.
+Local Python scripts walked the exported DXBC `index.json`, opened the matching `fssm/<stem>.fssm` for each row,
+and read each candidate with `struct.unpack_from("<I", ...)`. For the standalone check, the scripts intersected
+the sets of header offsets containing `0xC0` across all rows.
+
+The VGPR allocation field provides an independent check on that interpretation. Of 2,689 compute shaders, 1,675
+had zero reported invalid words and at least one explicit VGPR in the instruction listing. For each of these,
+the minimum allocation must cover the highest numbered VGPR, including range endpoints. The tested capacity was
+the low six bits of the candidate word plus one, multiplied by 8 for wave32 or 4 for wave64 (FSSM flag at
+`0xD4`, bit 5). Graphics stages can share register allocations across merged stages and were excluded from this check.
+
+Of the 88 positions, 63 gave too little capacity for at least one qualifying compute shader. Each of the other 25
+exceeded the minimum whole-granule allocation in all 1,675. Over-allocation is possible, and the mode fields could
+be stored separately or supplied by pipeline state. The initial float mode remains unresolved.
+
+#### Standalone FLOAT_MODE candidate at +0x104
+
+@465d6a0eac proposed that FSSM stores the eight mode bits in their own word. Across all 26,503 indexed
+1.0.2.1 headers, `+0x104` is the only aligned word below `+0x138` that always equals `0x000000C0`.
+Reading it as packed RSRC1 gives too few VGPRs in 1,578 of the 1,675 qualifying compute shaders.
+A standalone mode field makes no VGPR allocation prediction. The contributor also reports the same value in
+52 BVH-builder DLL shaders, outside this replay.
+
+The adjacent words provide two cross-checks. The low byte at `+0x100` matches the stage in every row
+(GS 3, VS 4, PS 5, CS 6, MS 7). The VS word is `0x00020004`; the GS word is `0x00020203`.
+Only the 2,236 VS have zero in bits 15:8 and match the full `0x000200NN` pattern.
+The corresponding byte is 1 for PS, 3 for CS and 6 for MS. The word at `+0x108` is always zero. For every one of the 2,689 CS,
+rounding the byte count at `+0x10C` up to 512-byte blocks predicts the independently decoded
+`COMPUTE_PGM_RSRC2.LDS_SIZE` at `+0x138[23:15]`, including all 485 nonzero allocations. Five MS also
+have a nonzero count. This varying LDS measurement locates stage state near the candidate.
+
+Under the AMD FLOAT_MODE layout, `0xC0` selects round-to-nearest for both precision groups, flushes f32
+denormals on input and output, and preserves f16/f64 denormals on both. All 29 [FSPX programs](fspx.md)
+have the same mode byte in an inferred packed RSRC1 whose VGPR allocation varies. That supports a plausible
+compiler default across formats. The 102,365 reported f32 output modifiers agree with f32 flushing.
+The absence of f16 output modifiers leaves f16 preservation open, and explicit rounding updates give no
+initial value. IEEE and DX10_CLAMP lie outside the proposed byte.
+
+A fixed header-layout value also fits the census: `0xC0` is the offset of the established `code_off` field.
+Whether `+0x104` refers to that field is itself unverified. A loader read mapping `+0x104` to the mode bits,
+or an FSSM with the same layout and an independently known different mode correctly predicted there, would
+distinguish the readings. SHADER-190 remains open.
+
 ## 3. ISA, RDNA2 classification and the "XBSC" notes
 
 | Claim | SCARAB source | Leonida behaviour / measurement | Verdict |
@@ -125,10 +174,10 @@ Adopt:
 
 1. **Keep `+0x28`.** Leonida already does. The regression test in
    `tests/test_fssm_crosscheck.py` pins it, including the `code_end = DEAD` case.
-2. **Preserve duplicate XBCH payloads.** This is the one real Leonida bug found. A follow-up
-   should make `xdat_entries` keep all entries for a tag (or make `unpack` iterate the
-   directory and emit one FSSM per tag-`0x0D` entry with a suffix). The repro test is
-   `expectedFailure` until then.
+2. **Preserve duplicate XBCH payloads.** This is the one real Leonida bug found, and #2479
+   did it: `xdat_entries_all` keeps every entry for a tag in directory order,
+   `unpack(payload="first"|"last")` and the CLI's `--payload` choose between them, and
+   `xdat_entries` keeps the last-wins view for old callers.
 3. **Treat `0xDEADBEEFDEADBEEF` as an unset `code_end`** (and `meta_ptr`). If a future tool
    reads `0xE8`, it must fall back to `code_off + code_size` or the last `s_endpgm`.
    Leonida's last-`s_endpgm` rule already does this implicitly; document it.
@@ -177,7 +226,15 @@ PR description.
   measured on the Leonida corpus; the shared FSSM v0x101/DXBC shape makes the same layout
   likely, but it is not directly verified against SCARAB's title.
 - Which of the two `$VS_*` XBCH payloads the game's pipeline actually uses is not
-  established. The 24-byte descriptor is the same in both, so it does not disambiguate.
+  established against pipeline bytes. The 24-byte descriptor is the same in both, so
+  it does not disambiguate, but the PAL stage descriptors do name two different
+  hardware stages for them (`tools/pal_stages.py`): the first payload is stage 2
+  (`es`) and the last stage 4 (`vs`), and `scripts/vs_layout_census.py` confirms the
+  code matches those stages — the ES payload has no `exp` (it writes the vertex
+  outputs to LDS for the geometry stage), takes its lane id from `v_mbcnt` and reads
+  `v5`, `v9`-`v11` and `v13`-`v14` on entry, while the VS payload is the legacy non-NGG VS of
+  `docs/design.md`. `fssm_unpack.py` defaults to the last payload, so the translated
+  one is the VS variant; which payload a GS-bound pipeline selects is still open.
 - The meaning of the 24-byte descriptor (two 12-byte records with a `0xD580` tag) is not
   established. It is a fixed header, not code.
 - The vendor disassembler's `asic(CI)` label is unexplained; it does not override the
@@ -191,7 +248,7 @@ PR description.
 
 ```
 python -I tests/test_fssm_crosscheck.py
-# 4 tests, 1 expected failure (the duplicate-XBCH loss)
+# 6 tests, all pass (the duplicate-XBCH payloads are pinned; no expected failure)
 ```
 
 The test uses synthetic `FSSM` and `DXBC` bytes only. No game data is read or written.

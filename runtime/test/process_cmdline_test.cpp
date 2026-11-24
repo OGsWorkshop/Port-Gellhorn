@@ -6,6 +6,9 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <fcntl.h>
+#include <io.h>
+
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -28,8 +31,23 @@ char** argv() {
     return *reinterpret_cast<Fn>(rt::shims::find("ucrtbase.dll", "__p___argv"))();
 }
 
+int configure(bool wide, int mode) {
+    using Fn = int(__cdecl*)(int);
+    const auto fn = reinterpret_cast<Fn>(rt::shims::find(
+        "ucrtbase.dll", wide ? "_configure_wide_argv" : "_configure_narrow_argv"));
+    if (fn) return fn(mode);
+    std::fprintf(stderr, "FAIL missing argv configuration shim\n");
+    ++failures;
+    return -1;
+}
+
 void round_trip(const std::vector<std::wstring>& args, const char* what) {
     rt::process::set_command_line(L"game.exe", args);
+    if (configure(false, 1) || configure(true, 1)) {
+        std::fprintf(stderr, "FAIL %s: unexpanded argv configuration\n", what);
+        ++failures;
+        return;
+    }
     using Fn = LPWSTR(WINAPI*)();
     const LPWSTR line = reinterpret_cast<Fn>(rt::shims::find("kernel32.dll", "GetCommandLineW"))();
     int count = 0;
@@ -41,6 +59,34 @@ void round_trip(const std::vector<std::wstring>& args, const char* what) {
         ++failures;
     }
     LocalFree(parsed);
+}
+
+void check_argv_reset() {
+    const int host_argc = __argc;
+    char** const host_argv = __argv;
+    wchar_t** const host_wargv = __wargv;
+    using Argc = int*(__cdecl*)();
+    const auto count = reinterpret_cast<Argc>(rt::shims::find("ucrtbase.dll", "__p___argc"));
+    auto check = [](bool ok, const char* what) {
+        if (!ok) { std::fprintf(stderr, "FAIL argv state: %s\n", what); ++failures; }
+    };
+    rt::process::set_command_line(L"first.exe", {L"one", L"two"});
+    check(*count() == 0 && !argv() && !wargv(), "new run starts unconfigured");
+    check(configure(false, 0) == 0 && configure(true, 0) == 0 && *count() == 0 && !argv() && !wargv(),
+          "no-argument startup leaves the initial state alone");
+    check(configure(false, 1) == 0 && *count() == 3 && argv() && !wargv(), "configure only narrow argv");
+    char** const narrow = argv();
+    check(configure(true, 1) == 0 && *count() == 3 && argv() == narrow && wargv(),
+          "wide configuration retains the narrow table");
+    wchar_t** const wide = wargv();
+    check(configure(false, 0) == 0 && configure(true, 0) == 0 && *count() == 3 && argv() == narrow && wargv() == wide,
+          "no-argument mode preserves configured counts and pointers");
+    rt::process::set_command_line(L"second.exe", {L"new"});
+    check(*count() == 0 && !argv() && !wargv(), "another run forgets both configured widths");
+    check(configure(true, 1) == 0 && *count() == 2 && !argv() && wargv() &&
+              std::wcscmp(wargv()[0], L"second.exe") == 0 && std::wcscmp(wargv()[1], L"new") == 0 && !wargv()[2],
+          "the new run configures its own program name and arguments");
+    check(__argc == host_argc && __argv == host_argv && __wargv == host_wargv, "host CRT argument globals are untouched");
 }
 
 // __wargv[1] must be `want` exactly, and the narrow argv[1] its ANSI code page text (the CRT's replacement for a
@@ -186,12 +232,212 @@ int main() {
     check_non_ascii(L"\u0394\u0416\u6F22 x", "an argument outside any single-byte code page");
 
     check_import_names();
+    check_argv_reset();
     check_getmainargs_environment();
     check_winmain(L"game.exe", {L"-foo", L"with space"}, L"-foo \"with space\"", "arguments after a plain name");
     check_winmain(L"C:\\My Games\\game.exe", {L"-x"}, L"-x", "a quoted program name with a space");
     check_winmain(L"game.exe", {}, L"", "no arguments");
     // A byte above 0x7f in the narrow program name is part of the name, not the end of it.
     check_winmain(L"caf\u00e9.exe", {L"-x"}, L"-x", "a non-ASCII program name");
+
+    // If the entry thread exits via ExitThread() without going through end_run(), run_entry() must preserve its exit
+    // code (and claim g_exited before closing g_done).
+    {
+        auto exit_thread_entry = +[](void*) -> DWORD { ExitThread(42); };
+        const int code = rt::process::run_entry(reinterpret_cast<void*>(exit_thread_entry), 0);
+        if (code != 42) {
+            std::fprintf(stderr, "FAIL run_entry with ExitThread(42) returned %d, want 42\n", code);
+            ++failures;
+        }
+    }
+
+    // A console title pins threads to cores the host may lack. SetThreadAffinityMask must then not fail: it leaves the
+    // thread where it is and answers with the process mask. A bad handle still fails, and a mask the host accepts is
+    // applied and answers with the mask the thread had. SetThreadpoolAffinityMask (console-only) succeeds.
+    {
+        using SetMask = DWORD_PTR(WINAPI*)(HANDLE, DWORD_PTR);
+        using SetPool = BOOL(WINAPI*)(PTP_POOL, DWORD_PTR);
+        const auto set_mask = reinterpret_cast<SetMask>(rt::shims::find("kernel32.dll", "SetThreadAffinityMask"));
+        const auto set_pool = reinterpret_cast<SetPool>(rt::shims::find("kernel32.dll", "SetThreadpoolAffinityMask"));
+        DWORD_PTR process_mask = 0, system_mask = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+        const DWORD_PTR missing = ~process_mask & (process_mask + 1);  // the lowest core outside the process mask, 0 if none
+        const DWORD_PTR lowest = process_mask & (~process_mask + 1);
+        if (!set_mask || !set_pool) {
+            std::fprintf(stderr, "FAIL SetThreadAffinityMask or SetThreadpoolAffinityMask is not served\n");
+            ++failures;
+        } else {
+            const HANDLE self = GetCurrentThread();
+            if (missing) {
+                SetLastError(ERROR_GEN_FAILURE);
+                const DWORD_PTR previous = set_mask(self, missing);
+                if (previous != process_mask) {
+                    std::fprintf(stderr, "FAIL a mask of cores the host lacks answered 0x%llx, want the process mask 0x%llx\n",
+                                 static_cast<unsigned long long>(previous), static_cast<unsigned long long>(process_mask));
+                    ++failures;
+                }
+            }
+            const DWORD_PTR first = set_mask(self, lowest);
+            const DWORD_PTR second = set_mask(self, process_mask);
+            if (first != process_mask || second != lowest) {
+                std::fprintf(stderr, "FAIL a valid mask answered 0x%llx then 0x%llx, want 0x%llx then 0x%llx\n",
+                             static_cast<unsigned long long>(first), static_cast<unsigned long long>(second),
+                             static_cast<unsigned long long>(process_mask), static_cast<unsigned long long>(lowest));
+                ++failures;
+            }
+            if (set_mask(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-7)), lowest) != 0) {
+                std::fprintf(stderr, "FAIL SetThreadAffinityMask on a bad handle did not fail\n");
+                ++failures;
+            }
+            if (!set_pool(nullptr, ~DWORD_PTR{0})) {
+                std::fprintf(stderr, "FAIL SetThreadpoolAffinityMask did not succeed\n");
+                ++failures;
+            }
+
+            // Every name a title can import it under reaches the shim (a missing alias falls through to the host).
+            for (const char* dll : {"kernelbase.dll", "api-ms-win-core-processthreads-l1-1-0.dll",
+                                    "api-ms-win-core-processthreads-l1-1-1.dll", "api-ms-win-core-processthreads-l1-1-2.dll",
+                                    "api-ms-win-core-processthreads-l1-1-3.dll"})
+                if (rt::shims::find(dll, "SetThreadAffinityMask") != reinterpret_cast<void*>(set_mask)) {
+                    std::fprintf(stderr, "FAIL SetThreadAffinityMask is not served under %s\n", dll);
+                    ++failures;
+                }
+            if (rt::shims::find("kernelbase.dll", "SetThreadpoolAffinityMask") != reinterpret_cast<void*>(set_pool)) {
+                std::fprintf(stderr, "FAIL SetThreadpoolAffinityMask is not served under kernelbase.dll\n");
+                ++failures;
+            }
+
+            // An empty mask names no CPU: it fails with ERROR_INVALID_PARAMETER, as on Windows.
+            SetLastError(ERROR_SUCCESS);
+            if (set_mask(self, 0) != 0 || GetLastError() != ERROR_INVALID_PARAMETER) {
+                std::fprintf(stderr, "FAIL SetThreadAffinityMask with an empty mask did not fail with ERROR_INVALID_PARAMETER\n");
+                ++failures;
+            }
+
+            if (missing) {
+                // The substituted answer is the thread's own mask, so a caller that restores it leaves the thread
+                // pinned (with one allowed CPU the two masks are the same and this passes either way).
+                set_mask(self, lowest);
+                const DWORD_PTR answered = set_mask(self, missing);
+                const DWORD_PTR still = set_mask(self, process_mask);  // answers the mask the thread has now
+                if (answered != lowest || still != lowest) {
+                    std::fprintf(stderr,
+                                 "FAIL a pinned thread asking for absent cores answered 0x%llx and was left on 0x%llx, want 0x%llx twice\n",
+                                 static_cast<unsigned long long>(answered), static_cast<unsigned long long>(still),
+                                 static_cast<unsigned long long>(lowest));
+                    ++failures;
+                }
+
+                // The note about the substitution goes to stderr; when that pipe is closed the write fails and leaves
+                // its error behind, but the call succeeded, so the last error is clear.
+                std::fflush(stderr);
+                int fds[2];
+                const int saved = _dup(2);
+                if (_pipe(fds, 4096, _O_BINARY) == 0 && saved >= 0) {
+                    _close(fds[0]);  // no reader
+                    _dup2(fds[1], 2);
+                    _close(fds[1]);
+                    setvbuf(stderr, nullptr, _IONBF, 0);
+                    SetLastError(ERROR_GEN_FAILURE);
+                    set_mask(self, missing);
+                    const DWORD error = GetLastError();
+                    std::fflush(stderr);
+                    _dup2(saved, 2);
+                    if (error != ERROR_SUCCESS) {
+                        std::fprintf(stderr, "FAIL a substituted answer left last error %lu with stderr closed, want 0\n", error);
+                        ++failures;
+                    }
+                }
+                if (saved >= 0) _close(saved);
+            }
+        }
+    }
+
+    // The retail title pins threads with SetThreadGroupAffinity. A GROUP_AFFINITY of cores or a group the PC lacks must
+    // succeed, leave the thread where it is and hand back the affinity it had; an empty mask still fails.
+    {
+        using SetGroup = BOOL(WINAPI*)(HANDLE, const GROUP_AFFINITY*, PGROUP_AFFINITY);
+        const auto set_group = reinterpret_cast<SetGroup>(rt::shims::find("kernel32.dll", "SetThreadGroupAffinity"));
+        if (!set_group) {
+            std::fprintf(stderr, "FAIL SetThreadGroupAffinity is not served\n");
+            ++failures;
+        } else {
+            for (const char* dll : {"kernelbase.dll", "api-ms-win-core-processtopology-l1-1-0.dll",
+                                    "api-ms-win-core-processtopology-l1-1-1.dll", "api-ms-win-core-processtopology-l1-1-2.dll"})
+                if (rt::shims::find(dll, "SetThreadGroupAffinity") != reinterpret_cast<void*>(set_group)) {
+                    std::fprintf(stderr, "FAIL SetThreadGroupAffinity is not served under %s\n", dll);
+                    ++failures;
+                }
+            const HANDLE self = GetCurrentThread();
+            GROUP_AFFINITY own = {};
+            GetThreadGroupAffinity(self, &own);
+            // A processor group the PC does not have.
+            GROUP_AFFINITY absent_group = {~KAFFINITY{0}, static_cast<WORD>(GetActiveProcessorGroupCount()), {}};
+            GROUP_AFFINITY before = {1, 7, {}};
+            SetLastError(ERROR_GEN_FAILURE);
+            const BOOL ok = set_group(self, &absent_group, &before);
+            GROUP_AFFINITY after = {};
+            GetThreadGroupAffinity(self, &after);
+            if (!ok || GetLastError() != ERROR_SUCCESS || before.Group != own.Group || before.Mask != own.Mask ||
+                after.Group != own.Group || after.Mask != own.Mask) {
+                std::fprintf(stderr, "FAIL an absent group answered ok=%d error=%lu previous %u/0x%llx, want TRUE, 0, %u/0x%llx\n",
+                             ok, GetLastError(), before.Group, static_cast<unsigned long long>(before.Mask), own.Group,
+                             static_cast<unsigned long long>(own.Mask));
+                ++failures;
+            }
+            // Cores of the thread's own group that the process lacks (when it has every core of the group there is none).
+            DWORD_PTR process_mask = 0, system_mask = 0;
+            GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+            const KAFFINITY missing = ~process_mask & (process_mask + 1);
+            if (missing) {
+                GROUP_AFFINITY absent_core = {missing, own.Group, {}};
+                GROUP_AFFINITY before_core = {};
+                if (!set_group(self, &absent_core, &before_core) || before_core.Mask != own.Mask) {
+                    std::fprintf(stderr, "FAIL absent cores answered previous 0x%llx, want 0x%llx\n",
+                                 static_cast<unsigned long long>(before_core.Mask), static_cast<unsigned long long>(own.Mask));
+                    ++failures;
+                }
+            }
+            // A mask the host accepts is applied; the answer is the affinity the thread had.
+            const KAFFINITY lowest = own.Mask & (~own.Mask + 1);
+            GROUP_AFFINITY one = {lowest, own.Group, {}}, prior = {};
+            GROUP_AFFINITY now = {};
+            if (!set_group(self, &one, &prior) || prior.Mask != own.Mask || !GetThreadGroupAffinity(self, &now) ||
+                now.Mask != lowest) {
+                std::fprintf(stderr, "FAIL a valid group mask was not applied with the old mask answered\n");
+                ++failures;
+            }
+            set_group(self, &own, nullptr);
+            // An empty mask names no CPU: it fails with ERROR_INVALID_PARAMETER, as on Windows.
+            GROUP_AFFINITY empty = {0, own.Group, {}};
+            SetLastError(ERROR_SUCCESS);
+            if (set_group(self, &empty, nullptr) || GetLastError() != ERROR_INVALID_PARAMETER) {
+                std::fprintf(stderr, "FAIL SetThreadGroupAffinity with an empty mask did not fail with ERROR_INVALID_PARAMETER\n");
+                ++failures;
+            }
+        }
+    }
+
+    // The game thread that ends a run must park, not ExitProcess, even when run_entry has already returned and
+    // cleared the run: main.cpp still prints "game exited with code N" and cleans up after it. On one CPU the
+    // host preempts the game thread right after SetEvent(g_done), and Sleep lets the game thread run again before
+    // the next run starts. A thread that exits the process here ends this test with code 77 before its last line.
+    {
+        auto returns_77 = +[](void*) -> DWORD { return 77; };
+        DWORD_PTR process_mask = 0, system_mask = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+        SetProcessAffinityMask(GetCurrentProcess(), process_mask & (~process_mask + 1));  // its lowest CPU
+        for (int i = 0; i < 50; ++i) {
+            const int code = rt::process::run_entry(reinterpret_cast<void*>(returns_77), 64 << 10);
+            if (code != 77) {
+                std::fprintf(stderr, "FAIL run %d of an entry point returning 77 returned %d\n", i, code);
+                ++failures;
+                break;
+            }
+            Sleep(1);
+        }
+        SetProcessAffinityMask(GetCurrentProcess(), process_mask);
+    }
 
     if (failures) return 1;
     std::printf("process_cmdline: GetCommandLineW parses back to __wargv, non-ASCII arguments intact (code page %u); "

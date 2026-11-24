@@ -2,7 +2,8 @@ r"""Measure RDNA2 (GFX10) f16/f64 results under MODE.FP_ROUND[3:2] nearest-even 
 
 Runs two native sweeps through tools/hw_oracle in wave32 and wave64:
 1. Targeted f16/f64 rounding cases (v_cvt_f16_f32, v_add_f16, v_sub_f16, v_mul_f16, v_fma_f16, v_pk_add_f16,
-   v_pk_fma_f16, v_fma_mixlo_f16, v_fma_mixhi_f16, v_add_f64 including exact-sum and finite-overflow saturation)
+   v_pk_fma_f16, v_fma_mixlo_f16, v_fma_mixhi_f16, v_ldexp_f16 overflow and denormal results, v_add_f64 including
+   exact-sum and finite-overflow saturation)
    under s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0 (RNE) vs 3 (RTZ).
 2. Exhaustive 65,536-input RNE vs RTZ comparison of all seven f16 transcendentals (v_rcp_f16, v_rsq_f16,
    v_sqrt_f16, v_sin_f16, v_cos_f16, v_exp_f16, v_log_f16), confirming that none of them depend on MODE.FP_ROUND.
@@ -11,18 +12,22 @@ Usage:
     python -I tools/mode_round_probe.py [--waves 32,64] [--json out.json]
     python -I tools/mode_round_probe.py --self-test        # pure-Python sanity checks, no GPU
 
-Exit 0 when every case matches (or --self-test passed), 1 on a mismatch, 2 on a harness error, 77 when
+Exit 0 when every case matches (or --self-test passed), 1 on a mismatch or --json write failure, 2 on a harness error or invalid CLI arguments, 77 when
 tools/hw_oracle is unavailable or the GPU is not GFX10. Standard library only; nothing here reads game files.
 """
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 RNE = "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0"
 RTZ = "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3"
@@ -55,6 +60,10 @@ CASES = (
      "v_fma_mixhi_f16 v3, v1, v2, v5", False, 0xC0001234, 0xBFFF1234),
     ("fma_mixlo_ovf", ("v_mov_b32 v1, 0x5f800000", "v_mov_b32 v2, 0x5f800000", "v_mov_b32 v5, 0"),
      "v_fma_mixlo_f16 v3, v1, v2, v5", False, 0x7C00, 0x7BFF),
+    ("ldexp_f16_ovf", ("v_mov_b32 v1, 0x7bff", "v_mov_b32 v2, 1"),
+     "v_ldexp_f16_e32 v3, v1, v2", False, 0x7C00, 0x7BFF),
+    ("ldexp_f16_sub", ("v_mov_b32 v1, 0xbc03", "v_mov_b32 v2, -15"),
+     "v_ldexp_f16_e32 v3, v1, v2", False, 0x8202, 0x8201),
     ("add_f64", ("v_mov_b32 v0, 0", "v_mov_b32 v1, 0x3ff00000", "v_mov_b32 v6, 0", "v_mov_b32 v7, 0xbc300000"),
      "v_add_f64 v[3:4], v[0:1], v[6:7]", True, (0x00000000, 0x3FF00000), (0xFFFFFFFF, 0x3FEFFFFF)),
     ("add_f64_ovf", ("v_mov_b32 v0, -1", "v_mov_b32 v1, 0x7fefffff"),
@@ -148,15 +157,119 @@ def self_test():
     print("self-test OK")
 
 
-def main():
+def parse_waves(raw):
+    """Parse --waves comma-separated wave sizes; return (waves, error_message)."""
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return None, "--waves must not be empty"
+    waves = []
+    for tok in tokens:
+        try:
+            w = int(tok)
+        except ValueError:
+            return None, f"invalid wave size in --waves: {tok!r}"
+        if w not in (32, 64):
+            return None, f"unsupported wave size in --waves: {w} (expected 32 or 64)"
+        waves.append(w)
+    return waves, None
+
+
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, data):
+    """Create missing parent directories and stage `data` as LF-terminated JSON via a sibling temp file,
+    so a write or replace failure keeps any previous report intact, or return an error string."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            return f"cannot create directory for --json {path}: {exc.strerror or exc}"
+    destination = os.path.realpath(path)
+    dest_parent = os.path.dirname(destination) or "."
+    if dest_parent != parent:
+        try:
+            os.makedirs(dest_parent, exist_ok=True)
+        except OSError as exc:
+            return f"cannot create directory for --json {path}: {exc.strerror or exc}"
+    try:
+        try:
+            mode = os.stat(destination).st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None and not stat.S_ISREG(mode):
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, indent=2)
+            return None
+        if mode is not None:
+            # Keep the direct writer's permission check without truncating the previous report.
+            os.close(os.open(destination, os.O_WRONLY))
+        fd = None
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=dest_parent, prefix=".mode_round_probe-", suffix=".tmp")
+            with open(fd, "w", encoding="utf-8", newline="\n") as f:
+                fd = None
+                json.dump(data, f, indent=2)
+            if os.name != "nt":
+                os.chmod(tmp, published_mode(destination))
+            replace_retry(tmp, destination)
+        except BaseException:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp is not None:
+                try:
+                    if os.path.lexists(tmp):
+                        os.chmod(tmp, 0o600)
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+            raise
+    except OSError as exc:
+        return f"cannot write --json {path}: {exc.strerror or exc}"
+    return None
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--waves", default="32,64", help="wave sizes to run (default: 32,64)")
     ap.add_argument("--json", dest="json_out", help="write full JSON report to this path")
     ap.add_argument("--self-test", action="store_true", help="check the case table without a GPU")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.self_test:
         self_test()
         return 0
+    waves, wave_err = parse_waves(args.waves)
+    if wave_err:
+        print(f"error: {wave_err}", file=sys.stderr)
+        return 2
+    if args.json_out is not None:
+        json_err = validate_json_path(args.json_out)
+        if json_err:
+            print(f"error: {json_err}", file=sys.stderr)
+            return 2
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle()
@@ -166,7 +279,6 @@ def main():
     if asm.family(oracle.arch) != "gfx10":
         print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
         return 77
-    waves = [int(w) for w in args.waves.split(",") if w.strip()]
     out = {"arch": oracle.arch, "waves": {}}
     mismatches = 0
     for wave in waves:
@@ -175,11 +287,18 @@ def main():
         out["waves"][str(wave)] = {"cases": c, "transcendentals": t}
         if c["ok"] != c["total"] or not t["all_ok"]:
             mismatches += 1
+        t_ok = sum(info["ok"] for info in t["ops"].values())
         print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
-              f"7/7 f16 transcendentals 0/65536 RNE/RTZ diffs")
-    if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(out, f, indent=2)
+              f"{t_ok}/{len(t['ops'])} f16 transcendentals 0/65536 RNE/RTZ diffs")
+        for op, info in t["ops"].items():
+            if not info["ok"]:
+                print(f"  {op}: {info['rne_rtz_diffs']}/{info['inputs']} RNE/RTZ diffs, "
+                      f"RTZ spot word {info['spot_got']} (want {info['spot_want']})")
+    if args.json_out is not None:
+        write_err = write_json_report(args.json_out, out)
+        if write_err:
+            print(f"error: {write_err}", file=sys.stderr)
+            return 1
     return 1 if mismatches else 0
 
 

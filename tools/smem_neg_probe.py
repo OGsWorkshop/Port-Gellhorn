@@ -12,6 +12,7 @@ whatever the hardware rule turns out to be. Rows the assembler rejects (a negati
 by hand as `.long` words. Standard library only; no game files.
 
 Exit codes: 0 every row matches the translator, 1 a mismatch, 2 harness error, 77 no hardware oracle.
+Usage: `python -I tools/smem_neg_probe.py --help` lists the options.
 """
 import argparse
 import os
@@ -98,10 +99,10 @@ def kernel_lines():
     return lines, order
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", choices=("translator", "hw"), default="translator")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     want = expected()
     if a.oracle == "translator":
         for name, vals in want.items():
@@ -110,20 +111,40 @@ def main():
     import asm
     import runner
     try:
-        oracle = runner.Oracle()
+        oracle = runner.open_oracle()
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
-    lines, order = kernel_lines()
-    n = len(order)
-    got = {}
-    for wave in (32, 64):
-        res = oracle.run([asm.Kernel(lines, wave=wave, threads=1, words=n, raw=True, vgprs=8, sgprs=64)])[0]
-        if isinstance(res, str):
-            print(f"wave{wave}: kernel rejected: {res}")
-            return 2
-        got[wave] = res
-    print(f"device: {oracle.device} ({oracle.arch})")
+    try:
+        lines, order = kernel_lines()
+        n = len(order)
+        got = {}
+        for wave in (32, 64):
+            results = oracle.run([asm.Kernel(lines, wave=wave, threads=1, words=n, raw=True, vgprs=8, sgprs=64)])
+            if not isinstance(results, (list, tuple)):
+                print(f"wave{wave}: expected list/tuple from oracle, got {type(results).__name__}")
+                return 2
+            if len(results) != 1:
+                print(f"wave{wave}: expected 1 oracle result, got {len(results)}")
+                return 2
+            res = results[0]
+            if isinstance(res, str):
+                print(f"wave{wave}: kernel rejected: {res}")
+                return 2
+            if not isinstance(res, (list, tuple)):
+                print(f"wave{wave}: expected word list from oracle, got {type(res).__name__}")
+                return 2
+            if len(res) != n:
+                print(f"wave{wave}: expected {n} words, got {len(res)}")
+                return 2
+            bad_types = [type(w).__name__ for w in res if isinstance(w, bool) or not isinstance(w, int)]
+            if bad_types:
+                print(f"wave{wave}: expected {n} int words, got {bad_types[0]} element")
+                return 2
+            got[wave] = list(res)
+        print(f"device: {oracle.device} ({oracle.arch})")
+    finally:
+        oracle.close()
     bad, i = 0, 0
     for name, _ls, regs, _soff, _xs in ROWS:
         w32 = got[32][i:i + len(regs)]

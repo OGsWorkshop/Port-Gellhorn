@@ -186,6 +186,196 @@ def test_b64_mask_imm_and_include_either():
     assert either[id(use64)] == {7}
 
 
+def test_writelane_sdwa_dpp_swaps_stores_and_div_scale():
+    use_s = ins("s_bcnt1_i32_b32", s(8), s(6))
+    use_v = ins("v_readfirstlane_b32", s(8), v(5))
+    mk = ins("v_cmp_eq_u32_e64", s(6), v(0), v(1))
+
+    # v_writelane_b32 writes one lane of v5, so v5 no longer holds a whole-VGPR mask ("v", 5),
+    # while the parked slot ("lane", 5, 0) reflects the written scalar operand.
+    wl_data = ins("v_writelane_b32", v(5), s(9), imm(0))
+    got_wl = L.analyse([[mk, ins("v_or_b32_e32", v(5), s(6), s(6)), wl_data, use_v]], [[]])[0][id(use_v)]
+    assert ("v", 5) not in got_wl
+    wl_mask = ins("v_writelane_b32", v(5), s(6), imm(0))
+    got_wl2 = L.analyse([[mk, ins("v_or_b32_e32", v(5), s(6), s(6)), wl_mask, use_v]], [[]])[0][id(use_v)]
+    assert ("v", 5) not in got_wl2 and ("lane", 5, 0) in got_wl2
+
+    # SDWA and DPP variants of VECTOR_BITWISE are not whole-dword per-lane mask computations:
+    # they must neither mark ("v", dst) nor enter mask_writes.
+    dpp_or = {"op": "v_or_b32_dpp", "args": [v(5), v(4), v(4)], "mods": ["row_shr:1", "row_mask:0x0"]}
+    sdwa_or = {"op": "v_or_b32_sdwa", "args": [v(5), s(6), s(6)],
+               "mods": ["dst_sel:BYTE_0", "dst_unused:UNUSED_PRESERVE", "src0_sel:BYTE_0", "src1_sel:BYTE_0"]}
+    dpp_mov = {"op": "v_mov_b32_dpp", "args": [v(5), v(4)], "mods": ["row_shr:1"]}
+    for op_ins in (dpp_or, sdwa_or, dpp_mov):
+        blk = [mk, ins("v_mov_b32_e32", v(4), s(6)), op_ins, use_v]
+        got, writes = L.analyse([blk], [[]])
+        assert ("v", 5) not in got[id(use_v)], op_ins["op"]
+        assert id(op_ins) not in writes, op_ins["op"]
+
+    # v_swap_b32 writes both operands, invalidating parked/VGPR masks in a[1] as well as a[0].
+    got_swap = L.analyse([[mk, ins("v_writelane_b32", v(5), s(6), imm(0)),
+                           ins("v_swap_b32_e32", v(4), v(5)), use_v]], [[]])[0][id(use_v)]
+    assert ("lane", 5, 0) not in got_swap and ("v", 5) not in got_swap
+
+    # Relative-destination writes invalidate all registers at or above the base register.
+    for rel_op in ("v_movreld_b32_e32", "v_movrelsd_b32_e32", "v_movrelsd_2_b32_e32"):
+        got_rel = L.analyse([[mk, ins("v_writelane_b32", v(6), s(6), imm(0)),
+                              ins("v_writelane_b32", v(3), s(6), imm(0)),
+                              ins(rel_op, v(4), v(7)), use_v]], [[]])[0][id(use_v)]
+        assert ("lane", 6, 0) not in got_rel and ("lane", 3, 0) in got_rel, rel_op
+    got_swaprel = L.analyse([[mk, ins("v_writelane_b32", v(6), s(6), imm(0)),
+                              ins("v_writelane_b32", v(2), s(6), imm(0)),
+                              ins("v_swaprel_b32_e32", v(5), v(3)), use_v]], [[]])[0][id(use_v)]
+    assert ("lane", 6, 0) not in got_swaprel and ("lane", 2, 0) in got_swaprel
+    for srel_op in ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32"):
+        got_srel = L.analyse([[ins("s_mov_b32", s(2), sp("exec_lo")),
+                               ins("s_mov_b32", s(6), sp("exec_lo")),
+                               ins(srel_op, s(4), s(8)), use_s]], [[]])[0][id(use_s)]
+        assert 6 not in got_srel and 2 in got_srel, srel_op
+
+    # Store instructions, LDS-targeted buffer loads, and non-returning atomics do not write a[0].
+    got_sstore = L.analyse([[mk, ins("s_store_dword", s(6), s(0, 2), imm(0)),
+                             ins("s_buffer_store_dword", s(6), s(0, 4), imm(0)), use_s]], [[]])[0][id(use_s)]
+    assert 6 in got_sstore
+    for non_dst in (
+        ins("global_store_dword", v(5), v(6), sp("off")),
+        ins("buffer_store_dword", v(5), v(6), s(0, 4), imm(0)),
+        ins("tbuffer_store_format_x", v(5), v(6), s(0, 4), imm(0)),
+        ins("flat_store_dword", v(5), v(6)),
+        ins("image_store", v(5), v(6), s(0, 8)),
+        ins("ds_write_b32", v(5), v(6)),
+        {"op": "buffer_load_dword", "args": [v(5), s(0, 4), imm(0)], "mods": ["offen", "lds"]},
+        ins("global_atomic_add", v(5), v(6), sp("off")),
+        ins("buffer_atomic_add", v(5), v(6), s(0, 4), imm(0)),
+        ins("image_atomic_add", v(5), v(6), s(0, 8)),
+        ins("ds_add_u32", v(5), v(6)),
+    ):
+        got_keep = L.analyse([[mk, ins("v_writelane_b32", v(5), s(6), imm(0)),
+                               non_dst, use_v]], [[]])[0][id(use_v)]
+        assert ("lane", 5, 0) in got_keep, non_dst["op"]
+    # Returning atomics (glc / _rtn) DO write a[0] and must still invalidate it.
+    for rtn_op in (
+        {"op": "global_atomic_add", "args": [v(5), v(6), v(7), sp("off")], "mods": ["glc"]},
+        {"op": "buffer_atomic_add", "args": [v(5), v(6), s(0, 4), imm(0)], "mods": ["glc"]},
+        ins("ds_add_rtn_u32", v(5), v(6), v(7)),
+    ):
+        got_kill = L.analyse([[mk, ins("v_writelane_b32", v(5), s(6), imm(0)),
+                               rtn_op, use_v]], [[]])[0][id(use_v)]
+        assert ("lane", 5, 0) not in got_kill, rtn_op["op"]
+
+    # v_div_scale_f32 / v_div_scale_f64 write a per-lane scale mask to a[1].
+    for ds_op in ("v_div_scale_f32", "v_div_scale_f64"):
+        got_ds = L.analyse([[ins(ds_op, v(0), s(6, 2), v(1), v(2), v(1)), use_s]], [[]])[0][id(use_s)]
+        assert got_ds == {6: L.MASK_LO, 7: L.MASK_HI}, ds_op
+
+
+
+def test_v_and_or_xnor_bfi_track_vector_masks():
+    use = ins("s_and_b32", s(12), s(7), s(8))
+    and_or = ins("v_and_or_b32", v(2), sp("vcc_lo"), sp("exec_lo"), imm(0))
+    xnor = ins("v_xnor_b32", v(3), sp("vcc_lo"), sp("exec_lo"))
+    bfi = ins("v_bfi_b32", v(4), sp("vcc_lo"), sp("exec_lo"), imm(-1))
+    mixed = ins("v_bfi_b32", v(5), sp("exec_lo"), sp("exec_hi"), imm(0))
+    blocks = [[
+        ins("v_cmp_eq_u32_e32", sp("vcc_lo"), v(0), v(1)),
+        and_or,
+        xnor,
+        bfi,
+        mixed,
+        ins("v_readfirstlane_b32", s(7), v(2)),
+        ins("v_readfirstlane_b32", s(8), v(3)),
+        ins("v_readfirstlane_b32", s(9), v(4)),
+        ins("v_readfirstlane_b32", s(10), v(5)),
+        use,
+    ]]
+    out, writes = L.analyse(blocks, [[]])
+    for w in (and_or, xnor, bfi, mixed):
+        assert id(w) in writes, w["op"]
+    masks = out[id(use)]
+    assert masks.get(("v", 2)) == L.MASK_LO
+    assert masks.get(("v", 3)) == L.MASK_LO
+    assert masks.get(("v", 4)) == L.MASK_LO
+    assert masks.get(("v", 5)) == L.MASK
+    assert masks.get(7) == L.MASK_LO
+    assert masks.get(8) == L.MASK_LO
+    assert masks.get(9) == L.MASK_LO
+    assert masks.get(10) == L.MASK
+    # Negative controls: any non-mask or non-0/-1 constant operand keeps dst as plain data.
+    for bad in (
+        ins("v_and_or_b32", v(6), sp("vcc_lo"), v(9), imm(0)),
+        ins("v_and_or_b32", v(6), sp("vcc_lo"), sp("exec_lo"), imm(5)),
+        ins("v_xnor_b32", v(6), sp("vcc_lo"), v(9)),
+        ins("v_bfi_b32", v(6), v(9), sp("exec_lo"), imm(0)),
+        ins("v_bfi_b32", v(6), sp("vcc_lo"), sp("exec_lo"), imm(3)),
+    ):
+        bad_use = ins("s_and_b32", s(12), s(7), sp("exec_lo"))
+        out, writes = L.analyse([[
+            ins("v_cmp_eq_u32_e32", sp("vcc_lo"), v(0), v(1)),
+            bad,
+            ins("v_readfirstlane_b32", s(7), v(6)),
+            bad_use,
+        ]], [[]])
+        assert id(bad) not in writes, bad["op"]
+        assert 7 not in out[id(bad_use)] and ("v", 6) not in out[id(bad_use)], bad["op"]
+
+def test_wave32_vcc_hi_isolation():
+    use = ins("s_nop", imm(0))
+    vcmp_lo = ins("v_cmp_eq_u32_e64", sp("vcc_lo"), v(0), imm(1))
+    vcmp_hi = ins("v_cmp_lt_f32_e64", sp("vcc_hi"), v(0), v(1))
+
+    # In wave32, writing plain data to vcc_hi does not clear vcc (vcc_lo), and vice versa.
+    m_data_hi = L.analyse(
+        [[vcmp_lo, vcmp_hi, ins("s_mov_b32", sp("vcc_hi"), imm(0x5)), use]],
+        [[]],
+        wave64=False,
+    )[0][id(use)]
+    assert m_data_hi == {"vcc": L.MASK}
+
+    m_data_lo = L.analyse(
+        [[vcmp_lo, vcmp_hi, ins("s_mov_b32", sp("vcc_lo"), imm(0x5)), use]],
+        [[]],
+        wave64=False,
+    )[0][id(use)]
+    assert m_data_lo == {"vcc_hi": L.MASK}
+
+    # v_add_co_u32 / v_mad_u64_u32 / s_and_saveexec_b32 / s_wqm_b32 writing vcc_hi in wave32 produce a vcc_hi mask
+    # without clobbering vcc, and s_mov_b32 vcc_hi, s_mask vs s_mov_b32 s_dst, vcc_hi propagate it.
+    for hi_prod in (
+        ins("v_add_co_u32", v(2), sp("vcc_hi"), v(0), v(1)),
+        ins("v_mad_u64_u32", {"k": "vgpr", "r": 2, "n": 2}, sp("vcc_hi"), v(0), v(1), {"k": "vgpr", "r": 4, "n": 2}),
+        ins("s_and_saveexec_b32", sp("vcc_hi"), sp("vcc")),
+        ins("s_wqm_b32", sp("vcc_hi"), sp("vcc_lo")),
+    ):
+        got = L.analyse([[vcmp_lo, hi_prod, ins("s_mov_b32", s(4), sp("vcc_hi")), use]], [[]], wave64=False)[0][id(use)]
+        assert got == {"vcc": L.MASK, "vcc_hi": L.MASK, 4: L.MASK}, hi_prod["op"]
+
+    # CFG join: mask on one branch, EITHER (0/-1) on the other preserves vcc_hi as MASK in wave32;
+    # mask vs plain data drops vcc_hi while keeping vcc.
+    out_join = L.analyse(
+        [[vcmp_lo], [vcmp_hi], [ins("s_mov_b32", sp("vcc_hi"), imm(-1))], [use]],
+        [[1, 2], [3], [3], []],
+        wave64=False,
+    )[0][id(use)]
+    assert out_join == {"vcc": L.MASK, "vcc_hi": L.MASK}
+
+    out_drop = L.analyse(
+        [[vcmp_lo], [vcmp_hi], [ins("s_mov_b32", sp("vcc_hi"), imm(0x5))], [use]],
+        [[1, 2], [3], [3], []],
+        wave64=False,
+    )[0][id(use)]
+    assert out_drop == {"vcc": L.MASK}
+
+    # In wave64, plain-data writes to vcc_hi still clear vcc as a single 64-bit mask.
+    out_w64 = L.analyse(
+        [[ins("v_cmp_lt_u32_e64", sp("vcc"), v(0), imm(32)),
+          ins("s_mov_b32", sp("vcc_hi"), imm(0x5)),
+          use]],
+        [[]],
+        wave64=True,
+    )[0][id(use)]
+    assert out_w64 == {}
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
@@ -194,4 +384,7 @@ if __name__ == "__main__":
     test_vmov_mask_copy_is_exec_gated()
     test_bfm64_and_half_kinds()
     test_b64_mask_imm_and_include_either()
+    test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
+    test_v_and_or_xnor_bfi_track_vector_masks()
+    test_wave32_vcc_hi_isolation()
     print("ok")

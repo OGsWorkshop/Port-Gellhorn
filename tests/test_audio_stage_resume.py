@@ -15,8 +15,10 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
 import awc_opus  # noqa: E402
 import make_game  # noqa: E402
+import winbatch  # noqa: E402
 
 
 class WriteFileTest(unittest.TestCase):
@@ -115,6 +117,8 @@ class AudioStageResumeTest(unittest.TestCase):
             name = os.path.splitext(os.path.basename(rel))[0]
             for mode in ("models", "textures"):
                 self.touch(self.work, "assets", name, mode, "manifest.json")
+                with open(os.path.join(self.work, "assets", name, mode, make_game.DECODER_RECORD), "w") as f:
+                    f.write(make_game.decoder_digest())
         self.touch(self.audio, "audio_manifest.json")
 
     def tearDown(self):
@@ -216,9 +220,7 @@ class DecodeXmaStdinTest(unittest.TestCase):
             with open(script, "w", encoding="utf-8") as f:
                 f.write(STDIN_FFMPEG)
             if os.name == "nt":
-                ffmpeg = os.path.join(d, "ffmpeg.cmd")
-                with open(ffmpeg, "w", encoding="utf-8") as f:
-                    f.write(f'@"{sys.executable}" "{script}" %*\n')
+                ffmpeg = winbatch.write_python_cmd(os.path.join(d, "ffmpeg.cmd"), sys.executable, script)
             else:
                 ffmpeg = os.path.join(d, "ffmpeg")
                 with open(ffmpeg, "w", encoding="utf-8") as f:

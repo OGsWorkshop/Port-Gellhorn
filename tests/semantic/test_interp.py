@@ -1,8 +1,11 @@
 """Self-tests for the mini SPIR-V interpreter, using hand-written modules and expectations taken from the SPIR-V
 and GLSL.std.450 specifications (not from the translator)."""
+import math
+import struct
 import unittest
 
 import spirv_mini_interp as si
+import spirv_wave_interp
 
 HEADER = """\
 OpCapability Shader
@@ -79,6 +82,55 @@ class InterpreterTests(unittest.TestCase):
                                   "%x = OpCompositeExtract %float %u 1\n"
                                   "%res = OpBitcast %uint %x\n"), 0x40000000)                   # 2.0f
 
+    def test_float_sign_operations_use_result_width(self):
+        # The low word in 1 + 2**-30 and the finite magnitude 2**130 both need binary64.
+        text = """\
+OpCapability Shader
+OpCapability Float64
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out %f32_control
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %out Location 0
+OpDecorate %f32_control Location 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%double = OpTypeFloat 64
+%u2 = OpTypeVector %uint 2
+%u4 = OpTypeVector %uint 4
+%precise64 = OpConstant %double 1.000000000931322574615478515625
+%large_negative64 = OpConstant %double -1361129467683753853853498429727072845824
+%zero32 = OpConstant %float 0
+%negative32 = OpConstant %float -1.25
+%ptr_out_words = OpTypePointer Output %u4
+%ptr_out_pair = OpTypePointer Output %u2
+%out = OpVariable %ptr_out_words Output
+%f32_control = OpVariable %ptr_out_pair Output
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%neg64 = OpFNegate %double %precise64
+%abs64 = OpExtInst %double %glsl FAbs %large_negative64
+%neg_words = OpBitcast %u2 %neg64
+%abs_words = OpBitcast %u2 %abs64
+%neg_lo = OpCompositeExtract %uint %neg_words 0
+%neg_hi = OpCompositeExtract %uint %neg_words 1
+%abs_lo = OpCompositeExtract %uint %abs_words 0
+%abs_hi = OpCompositeExtract %uint %abs_words 1
+%words = OpCompositeConstruct %u4 %neg_lo %neg_hi %abs_lo %abs_hi
+OpStore %out %words
+%neg32 = OpFNegate %float %zero32
+%abs32 = OpExtInst %float %glsl FAbs %negative32
+%neg32_bits = OpBitcast %uint %neg32
+%abs32_bits = OpBitcast %uint %abs32
+%control = OpCompositeConstruct %u2 %neg32_bits %abs32_bits
+OpStore %f32_control %control
+"""
+        outputs = si.run_fragment(text + FOOTER)
+        self.assertEqual(outputs["%f32_control"], (0x80000000, 0x3FA00000))
+        self.assertEqual(outputs["%out"], (0x00400000, 0xBFF00000, 0, 0x48100000))
+
     def test_fma_select_bitcast(self):
         self.assertEqual(run_word("%x = OpExtInst %float %glsl Fma %f2 %f3 %f1\n%res = OpBitcast %uint %x\n"),
                          0x40E00000)                                                              # 7.0f
@@ -119,6 +171,59 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%x = OpFNegate %float %f2p5\n%res = OpConvertFToS %int %x\n"), 0xFFFFFFFE)
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f2p5\n"), 2)
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f70000\n"), 70000)
+
+    def test_int32_to_float_uses_result_width(self):
+        # 2**24 + 1 is exact in binary64 but rounds to 2**24 in binary32.
+        text = """\
+OpCapability Shader
+OpCapability Float64
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out %f32_control
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %out Location 0
+OpDecorate %f32_control Location 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%sint = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%double = OpTypeFloat 64
+%bool = OpTypeBool
+%u2 = OpTypeVector %uint 2
+%u4 = OpTypeVector %uint 4
+%unsigned = OpConstant %uint 16777217
+%signed = OpConstant %sint -16777217
+%rounded_unsigned = OpConstant %float 16777216
+%rounded_signed = OpConstant %float -16777216
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%ptr_out_words = OpTypePointer Output %u4
+%ptr_out_uint = OpTypePointer Output %uint
+%out = OpVariable %ptr_out_words Output
+%f32_control = OpVariable %ptr_out_uint Output
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%du = OpConvertUToF %double %unsigned
+%ds = OpConvertSToF %double %signed
+%bu = OpBitcast %u2 %du
+%bs = OpBitcast %u2 %ds
+%ulo = OpCompositeExtract %uint %bu 0
+%uhi = OpCompositeExtract %uint %bu 1
+%slo = OpCompositeExtract %uint %bs 0
+%shi = OpCompositeExtract %uint %bs 1
+%words = OpCompositeConstruct %u4 %ulo %uhi %slo %shi
+OpStore %out %words
+%fu = OpConvertUToF %float %unsigned
+%fs = OpConvertSToF %float %signed
+%u_ok = OpFOrdEqual %bool %fu %rounded_unsigned
+%s_ok = OpFOrdEqual %bool %fs %rounded_signed
+%f_ok = OpLogicalAnd %bool %u_ok %s_ok
+%control = OpSelect %uint %f_ok %one %zero
+OpStore %f32_control %control
+"""
+        outputs = si.run_fragment(text + FOOTER)
+        self.assertEqual(outputs["%f32_control"], (1,))
+        self.assertEqual(outputs["%out"], (0x10000000, 0x41700000, 0x10000000, 0xC1700000))
 
     def test_floor_ceil_trunc_and_signed_zero(self):
         def word(name, const, neg=False):
@@ -171,6 +276,54 @@ class InterpreterTests(unittest.TestCase):
                                    "%res = OpBitcast %uint %x\nOpStore %out %res\n" + FOOTER)
                     with self.assertRaises(si.UnsupportedConstruct):
                         si.run_fragment(body)
+
+    WIDE = HEADER.replace("%c0 = OpConstant %uint 0",
+                          "%ulong = OpTypeInt 64 0\n"
+                          "%cl_1 = OpConstant %ulong 1\n"
+                          "%cl_2p31 = OpConstant %ulong 2147483648\n"
+                          "%cl_2p32 = OpConstant %ulong 4294967296\n"
+                          "%cl_2p32_5 = OpConstant %ulong 4294967301\n"
+                          "%cl_hi = OpConstant %ulong 18446744069414584320\n"       # 0xFFFFFFFF00000000 = -2**32
+                          "%cl_m1 = OpConstant %ulong 18446744073709551615\n"
+                          "%c0 = OpConstant %uint 0")
+
+    def test_bit_count_counts_every_bit_of_a_64bit_operand(self):
+        # OpBitCount counts the set bits of its operand, whatever the width of the (32-bit) result.
+        for src, want in (("%cl_hi", 32), ("%cl_m1", 64), ("%cl_2p32_5", 3), ("%cl_1", 1)):
+            with self.subTest(src=src):
+                out = si.run_fragment(self.WIDE + f"%res = OpBitCount %uint {src}\nOpStore %out %res\n" + FOOTER)
+                self.assertEqual(out["%out"], (want,))
+        self.assertEqual(run_word("%res = OpBitCount %uint %cF0\n"), 28)
+
+    def test_signed_min_max_clamp_abs_use_the_width_of_a_64bit_type(self):
+        # GLSL.std.450 SMin/SMax/SClamp/SAbs read their operands as signed at the width of their type. 2**31 is
+        # positive in a 64-bit integer and 0xFFFFFFFF00000000 is -2**32; a 32-bit reading takes them as
+        # -2**31 and 0.
+        for inst, want in (("SMin %cl_2p31 %cl_1", "%cl_1"), ("SMax %cl_2p31 %cl_1", "%cl_2p31"),
+                           ("SMin %cl_hi %cl_1", "%cl_hi"), ("SMax %cl_hi %cl_m1", "%cl_m1"),
+                           ("SClamp %cl_2p31 %cl_1 %cl_2p32", "%cl_2p31"), ("SClamp %cl_hi %cl_m1 %cl_1", "%cl_m1"),
+                           ("SAbs %cl_hi", "%cl_2p32"), ("SAbs %cl_2p32_5", "%cl_2p32_5"), ("SAbs %cl_m1", "%cl_1")):
+            with self.subTest(inst=inst):
+                out = si.run_fragment(self.WIDE + f"%r = OpExtInst %ulong %glsl {inst}\n"
+                                      f"%eq = OpIEqual %bool %r {want}\n%res = OpSelect %uint %eq %c1 %c0\n"
+                                      "OpStore %out %res\n" + FOOTER)
+                self.assertEqual(out["%out"], (1,))
+
+    def test_glsl_integer_operations_reject_mixed_component_widths(self):
+        for inst in ("SAbs %cl_1", "SMin %c0 %cl_1", "SMax %cl_1 %c0",
+                     "SClamp %c0 %c0 %cl_1", "FindILsb %cl_1", "FindSMsb %cl_1", "FindUMsb %cl_1"):
+            with self.subTest(inst=inst):
+                body = f"%res = OpExtInst %uint %glsl {inst}\n"
+                with self.assertRaisesRegex(si.UnsupportedConstruct, "64-bit.*32-bit"):
+                    si.run_fragment(self.WIDE + body + "OpStore %out %res\n" + FOOTER)
+
+    def test_find_bit_of_a_64bit_operand_is_rejected(self):
+        # GLSL.std.450 limits FindILsb, FindSMsb and FindUMsb to 32-bit components.
+        for name in ("FindILsb", "FindSMsb", "FindUMsb"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(si.UnsupportedConstruct, "64-bit"):
+                    si.run_fragment(self.WIDE + f"%r = OpExtInst %ulong %glsl {name} %cl_2p32\n"
+                                    "%res = OpUConvert %uint %r\nOpStore %out %res\n" + FOOTER)
 
     def test_round_even_clamp_max(self):
         # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
@@ -307,6 +460,23 @@ class InterpreterTests(unittest.TestCase):
                 self.assertEqual(si.run_fragment(body, memory=memory)["%out"][0], result)
                 self.assertEqual(memory[4096], after)
 
+    def test_atomic_store_writes_the_word(self):
+        """OpAtomicStore has no result: it writes its value, to memory or to a variable's element."""
+        text = HEADER.replace("OpMemoryModel Logical GLSL450",
+                              'OpCapability PhysicalStorageBufferAddresses\n'
+                              'OpExtension "SPV_KHR_physical_storage_buffer"\n'
+                              "OpMemoryModel PhysicalStorageBuffer64 GLSL450")
+        decls = ("%ulong = OpTypeInt 64 0\n"
+                 "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint\n%addr = OpConstant %ulong 4096\n")
+        text = text.replace("%main = OpFunction", decls + "%main = OpFunction")
+        body = (text + "%p = OpConvertUToPtr %_ptr_PSB_uint %addr\nOpAtomicStore %p %c1 %c0 %cF0\n"
+                "%v = OpVariable %_ptr_Function_arr Function %null_arr\n"
+                "%e = OpAccessChain %_ptr_Function_uint %v %c2\nOpAtomicStore %e %c1 %c0 %c8\n"
+                "%res = OpLoad %uint %e\nOpStore %out %res\n" + FOOTER)
+        memory = {4096: 7}
+        self.assertEqual(si.run_fragment(body, memory=memory)["%out"][0], 8)
+        self.assertEqual(memory[4096], 0xFFFFFFF0)
+
     def test_inputs_and_push_constants_can_be_seeded(self):
         text = HEADER.replace('OpEntryPoint Fragment %main "main" %out',
                               'OpEntryPoint Fragment %main "main" %out %in')
@@ -337,6 +507,26 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%b = OpSLessThan %bool %cFF %c0\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
         self.assertEqual(run_word("%b = OpLogicalAnd %bool %t %f\n%res = OpSelect %uint %b %c1 %c2\n"), 2)
         self.assertEqual(run_word("%b = OpLogicalOr %bool %f %t\n%res = OpSelect %uint %b %c1 %c2\n"), 1)
+
+    def test_a_nan_the_operation_creates_is_the_same_on_every_host(self):
+        floats = "%inf = OpBitcast %float %cInf\n%zero = OpBitcast %float %c0\n"
+        for op in ("OpFMul %float %zero %inf", "OpFMul %float %inf %zero", "OpFSub %float %inf %inf",
+                   "OpFAdd %float %inf %ninf", "OpExtInst %float %glsl Fma %zero %inf %f1"):
+            with self.subTest(op=op):
+                body = floats + "%ninf = OpFNegate %float %inf\n" + f"%x = {op}\n%res = OpBitcast %uint %x\n"
+                self.assertEqual(run_word(body), 0xFFC00000)
+        header = HEADER.replace("%main = OpFunction", "%cNaN = OpConstant %uint 2143289345\n%main = OpFunction")
+        for op in ("OpFAdd %float %nan %f1", "OpFMul %float %nan %f2", "OpExtInst %float %glsl Fma %nan %f2 %f1"):
+            with self.subTest(op=op, propagated=True):
+                text = header + f"%nan = OpBitcast %float %cNaN\n%x = {op}\n%res = OpBitcast %uint %x\n"
+                self.assertEqual(si.run_fragment(text + "OpStore %out %res\n" + FOOTER)["%out"][0], 0x7FC00001)
+
+    def test_created_nan_is_pinned_whatever_the_host_gives(self):
+        arm64_nan = math.copysign(math.nan, 1.0)
+        self.assertEqual(struct.pack("<d", si.ieee_nan(arm64_nan, 0.0, math.inf)),
+                         struct.pack("<Q", 0xFFF8000000000000))
+        self.assertEqual(struct.pack("<d", si.ieee_nan(arm64_nan, arm64_nan, 1.0)), struct.pack("<d", arm64_nan))
+        self.assertEqual(si.ieee_nan(2.5, 1.0, 1.5), 2.5)
 
     def test_ordered_integer_comparisons(self):
         # 2 vs 0xFFFFFFFF: unsigned 2 < 4294967295, signed 2 > -1
@@ -458,6 +648,42 @@ class InterpreterTests(unittest.TestCase):
             with self.subTest(cond=cond):
                 self.assertEqual(si.run_fragment(text)["%out"][0], want)
 
+    def test_phi_without_a_matching_predecessor_names_the_result_and_edge(self):
+        body = "OpBranch %next\n%next = OpLabel\n%answer = OpPhi %uint %c1 %other\n"
+        with self.assertRaisesRegex(si.UnsupportedConstruct, r"%answer.*%entry"):
+            si.run_fragment(HEADER + body + FOOTER)
+
+    def test_phi_before_the_first_label(self):
+        text = HEADER.replace("%entry = OpLabel\n", "") + "%answer = OpPhi %uint %c1 %other\nOpFunctionEnd\n"
+        with self.assertRaisesRegex(si.InvalidModule, r"%answer.*start of the function"):
+            si.run_fragment(text)
+
+    def test_duplicate_phi_result_is_rejected(self):
+        body = ("OpBranch %next\n%next = OpLabel\n%a = OpPhi %uint %c1 %entry\n"
+                "%a = OpPhi %uint %c2 %entry\n")
+        with self.assertRaisesRegex(si.UnsupportedConstruct, r"duplicate.*%a"):
+            si.run_fragment(HEADER + body + FOOTER)
+
+    def test_phis_of_a_block_take_their_values_together(self):
+        # A loop header that swaps %a and %b on every back edge: each OpPhi reads the other's value from before
+        # the block. Three iterations from (1, 2) leave (2, 1); assigning %a first would give %b the new %a, (2, 2).
+        text = (HEADER.replace('"main" %out', '"main" %out %out2')
+                .replace("%main = OpFunction", "%out2 = OpVariable %_ptr_Output_uint Output\n"
+                         "%c3 = OpConstant %uint 3\n%main = OpFunction") +
+                "OpBranch %head\n"
+                "%head = OpLabel\n"
+                "%a = OpPhi %uint %c1 %entry %b %cont\n"
+                "%b = OpPhi %uint %c2 %entry %a %cont\n"
+                "%i = OpPhi %uint %c0 %entry %inext %cont\n"
+                "%more = OpULessThan %bool %i %c3\n"
+                "OpLoopMerge %done %cont None\nOpBranchConditional %more %cont %done\n"
+                "%cont = OpLabel\n%inext = OpIAdd %uint %i %c1\nOpBranch %head\n"
+                "%done = OpLabel\nOpStore %out %a\nOpStore %out2 %b\n" + FOOTER)
+        out = si.run_fragment(text)
+        self.assertEqual((out["%out"], out["%out2"]), ((2,), (1,)))
+        lane0 = spirv_wave_interp.run_wave(text, wave=32)["outputs"][0]     # the other interpreter agrees
+        self.assertEqual((lane0["%out"], lane0["%out2"]), ((2,), (1,)))
+
     def test_function_array_access(self):
         self.assertEqual(run_word("%arr_v = OpVariable %_ptr_Function_arr Function %null_arr\n"
                                   "%p = OpAccessChain %_ptr_Function_uint %arr_v %c2\n"
@@ -542,6 +768,162 @@ class InterpreterTests(unittest.TestCase):
     def test_push_constant_reads_zero(self):
         text = HEADER + "%p = OpAccessChain %_ptr_PC_uint %pc %c0\n%res = OpLoad %uint %p\nOpStore %out %res\n" + FOOTER
         self.assertEqual(si.run_fragment(text)["%out"][0], 0)
+
+    def test_a_module_run_twice_gives_the_same_words_and_the_same_parse_error(self):
+        # run_workgroup runs one generator per invocation over one text: each must see the same module.
+        text = HEADER + "%res = OpIAdd %uint %c1 %c2\nOpStore %out %res\n" + FOOTER
+        self.assertEqual(si.run_fragment(text)["%out"][0], 3)
+        self.assertEqual(si.run_fragment(text)["%out"][0], 3)
+        broken = HEADER + "%res = OpIAdd %uint %c1 %c2\nthis is not an instruction\n" + FOOTER
+        for _ in range(2):
+            with self.assertRaises(si.UnsupportedConstruct) as ctx:
+                si.run_fragment(broken)
+            self.assertIn("this is not an instruction", str(ctx.exception))
+
+
+class AggregateValueTests(unittest.TestCase):
+    HEADER = """\
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %out Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%v2uint = OpTypeVector %uint 2
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%seven = OpConstant %uint 7
+%array = OpTypeArray %uint %one
+%nested = OpTypeArray %array %one
+%null_array = OpConstantNull %array
+%null_nested = OpConstantNull %nested
+%const_array = OpConstantComposite %array %zero
+%ptr_array = OpTypePointer Function %array
+%ptr_nested = OpTypePointer Function %nested
+%ptr_word = OpTypePointer Function %uint
+%ptr_output = OpTypePointer Output %v2uint
+%out = OpVariable %ptr_output Output
+%main = OpFunction %void None %fn
+%entry = OpLabel
+"""
+
+    def test_whole_array_store_does_not_alias_its_operand(self):
+        body = """\
+%src = OpVariable %ptr_array Function %null_array
+%dst = OpVariable %ptr_array Function %null_array
+%saved = OpLoad %array %src
+OpStore %dst %saved
+%element = OpAccessChain %ptr_word %dst %zero
+OpStore %element %seven
+%old = OpCompositeExtract %uint %saved 0
+%new = OpLoad %uint %element
+%result = OpCompositeConstruct %v2uint %old %new
+OpStore %out %result
+"""
+        self.assertEqual(si.run_fragment(self.HEADER + body + FOOTER)["%out"], (0, 7))
+
+    def test_nested_array_load_keeps_its_original_elements(self):
+        body = """\
+%src = OpVariable %ptr_nested Function %null_nested
+%saved = OpLoad %nested %src
+%element = OpAccessChain %ptr_word %src %zero %zero
+OpStore %element %seven
+%old = OpCompositeExtract %uint %saved 0 0
+%new = OpLoad %uint %element
+%result = OpCompositeConstruct %v2uint %old %new
+OpStore %out %result
+"""
+        self.assertEqual(si.run_fragment(self.HEADER + body + FOOTER)["%out"], (0, 7))
+
+    def test_shared_nested_initializer_creates_separate_storage(self):
+        body = """\
+%src = OpVariable %ptr_nested Function %null_nested
+%other = OpVariable %ptr_nested Function %null_nested
+%element = OpAccessChain %ptr_word %src %zero %zero
+OpStore %element %seven
+%independent = OpAccessChain %ptr_word %other %zero %zero
+%old = OpLoad %uint %independent
+%new = OpLoad %uint %element
+%result = OpCompositeConstruct %v2uint %old %new
+OpStore %out %result
+"""
+        self.assertEqual(si.run_fragment(self.HEADER + body + FOOTER)["%out"], (0, 7))
+
+    def test_array_constant_store_preserves_the_constant(self):
+        body = """\
+%dst = OpVariable %ptr_array Function
+OpStore %dst %const_array
+%element = OpAccessChain %ptr_word %dst %zero
+OpStore %element %seven
+%old = OpCompositeExtract %uint %const_array 0
+%new = OpLoad %uint %element
+%result = OpCompositeConstruct %v2uint %old %new
+OpStore %out %result
+"""
+        self.assertEqual(si.run_fragment(self.HEADER + body + FOOTER)["%out"], (0, 7))
+
+
+class MeshOutputTests(unittest.TestCase):
+    """A mesh shader's outputs (SPV_EXT_mesh_shader): arrays of vectors and of a Block struct holding a bool, and
+    OpSetMeshOutputsEXT, whose counts the result reports under its name."""
+    HEADER = """\
+OpCapability MeshShadingEXT
+OpExtension "SPV_EXT_mesh_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint MeshEXT %main "main" %idx %cull
+OpExecutionMode %main LocalSize 1 1 1
+OpExecutionMode %main OutputVertices 3
+OpExecutionMode %main OutputPrimitivesEXT 2
+OpExecutionMode %main OutputTrianglesEXT
+OpDecorate %idx BuiltIn PrimitiveTriangleIndicesEXT
+OpDecorate %blk Block
+OpMemberDecorate %blk 0 BuiltIn CullPrimitiveEXT
+OpMemberDecorate %blk 0 PerPrimitiveEXT
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%bool = OpTypeBool
+%v3uint = OpTypeVector %uint 3
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%c2 = OpConstant %uint 2
+%c3 = OpConstant %uint 3
+%true = OpConstantTrue %bool
+%arr_idx = OpTypeArray %v3uint %c2
+%blk = OpTypeStruct %bool
+%arr_cull = OpTypeArray %blk %c2
+%ptr_idx = OpTypePointer Output %arr_idx
+%ptr_cull = OpTypePointer Output %arr_cull
+%ptr_v3 = OpTypePointer Output %v3uint
+%ptr_bool = OpTypePointer Output %bool
+%idx = OpVariable %ptr_idx Output
+%cull = OpVariable %ptr_cull Output
+%tri = OpConstantComposite %v3uint %c0 %c1 %c2
+%main = OpFunction %void None %fn
+%entry = OpLabel
+"""
+    BODY = """\
+%p = OpAccessChain %ptr_v3 %idx %c1
+OpStore %p %tri
+%q = OpAccessChain %ptr_bool %cull %c1 %c0
+OpStore %q %true
+"""
+
+    def test_counts_and_arrayed_outputs(self):
+        out = si.run_fragment(self.HEADER + "OpSetMeshOutputsEXT %c3 %c2\n" + self.BODY + FOOTER)
+        self.assertEqual(out["OpSetMeshOutputsEXT"], (3, 2))
+        self.assertEqual(out["%idx"], (0, 0, 0, 0, 1, 2))      # element 1 written, element 0 still zero
+        self.assertEqual(out["%cull"], (0, 1))                  # the Block's bool member, per primitive
+
+    def test_no_counts_before_the_instruction_runs(self):
+        self.assertNotIn("OpSetMeshOutputsEXT", si.run_fragment(self.HEADER + self.BODY + FOOTER))
+
+    def test_a_second_call_is_rejected(self):
+        twice = "OpSetMeshOutputsEXT %c3 %c2\nOpSetMeshOutputsEXT %c3 %c2\n"
+        with self.assertRaisesRegex(si.InvalidModule, "second time"):
+            si.run_fragment(self.HEADER + twice + FOOTER)
 
 
 if __name__ == "__main__":

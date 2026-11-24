@@ -4,8 +4,8 @@ Consumes rpf9dump model manifests (models/manifest.json + .obj + <stem>_tex/*.dd
 optional TTPF texture manifests (manifest.json + *.dds), groups geometry into spatial
 or grid-laid-out XZ chunks, embeds decoded PNG textures into binary glTF 2.0 (.glb)
 chunks, and writes world.json atomically for viewer/serve.py + viewer/index.html.
-Chunks are built and verified in a staging directory first, so a build that fails or is
-interrupted leaves the previous world.json and the chunks it references as they were.
+Chunks are built and verified in a staging directory first. If the process stops during
+publication, the next run recovers the last committed world before reading its new inputs.
 
 With --placements, models are instanced at their map placements instead: each entity row written by
 ``world_index.py --entities-out`` is matched to an exported model by the joaat of its name (and, when the row
@@ -26,14 +26,27 @@ from __future__ import annotations
 import argparse
 import array
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import functools
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import stat
 import statistics
 import sys
 import tempfile
+
+try:
+    import fcntl
+except ImportError:                       # Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:                       # POSIX
+    msvcrt = None
 import threading
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -447,13 +460,13 @@ def _pack_model_job(job: tuple) -> tuple[int, dict | None]:
     }
 
 
-_PNG_CACHE: dict[tuple[str, int], bytes | None] = {}
+_PNG_CACHE: dict[tuple[str, str, int], bytes | None] = {}
 _PNG_CACHE_BUDGET = 256 * 1024 * 1024
 
 
-def _png_for(dds_path: str, max_tex_size: int) -> bytes | None:
-    """Decode a DDS to PNG once per worker, keeping at most about 256 MB of PNGs (oldest dropped first)."""
-    key = (os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
+def _png_for(staging_dir: str, dds_path: str, max_tex_size: int) -> bytes | None:
+    """Decode once per worker per build, keeping at most about 256 MB of PNGs (oldest dropped first)."""
+    key = (staging_dir, os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
     if key in _PNG_CACHE:
         return _PNG_CACHE[key]
     dds_mod = _get_dds_png()
@@ -491,7 +504,7 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
         keys = sorted({p["material"] for m in meshes for p in m["primitives"] if p["material"]})
         for key in keys:
             dds = mat_to_dds.get(key)
-            png = _png_for(dds, max_tex_size) if dds else None
+            png = _png_for(staging_dir, dds, max_tex_size) if dds else None
             if png is None:
                 skipped += 1
                 continue
@@ -587,7 +600,6 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
     chunks_dir = os.path.join(abs_out, "chunks")
     created_dirs = [d for d in (abs_out, chunks_dir) if not os.path.isdir(d)]
     os.makedirs(abs_out, exist_ok=True)
-    _remove_stale_staging(abs_out)
     staging_dir = tempfile.mkdtemp(prefix=CHUNK_STAGING_PREFIX, dir=abs_out)
     pack_dir = os.path.join(staging_dir, "packs")
     os.makedirs(pack_dir)
@@ -694,7 +706,7 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
         _publish_world(staging_dir, chunks_dir, [f"{c['id']}.glb" for c in chunks],
                        os.path.join(abs_out, "world.json"), world_doc, glb_mod)
     except BaseException:
-        if not _holds_unrestored_chunks(staging_dir):
+        if not _holds_recovery_data(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
         for d in reversed(created_dirs):
             try:
@@ -702,7 +714,7 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
             except OSError:
                 pass
         raise
-    shutil.rmtree(staging_dir, ignore_errors=True)
+    _discard_publication_staging(staging_dir)
     _prune_stale_chunks(chunks_dir, {f"{c['id']}.glb" for c in world_doc["chunks"]})
     return world_doc
 
@@ -1185,8 +1197,7 @@ def _write_json_atomic(path: str, data: dict, replace=None) -> None:
 
     As for the GLB export (#425): an existing file named ``<path>.tmp`` is never used or removed, overlapping
     writers each stage their own file (the last replacement wins), and the published file keeps the mode of the
-    one it replaces. ``replace`` defaults to ``os.replace``; ``_publish_world`` passes ``glb_writer._replace``,
-    which retries a Windows sharing violation (the viewer may hold world.json open during a rebuild).
+    one it replaces. ``replace`` defaults to ``os.replace``.
     """
     replace = replace or os.replace
     parent = os.path.dirname(os.path.abspath(path))
@@ -1244,34 +1255,153 @@ def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
 # world.json is committed.
 CHUNK_STAGING_PREFIX = ".chunks-staging-"
 _STAGING_BACKUP = "previous"
+_STAGING_JOURNAL = "publication.json"
+_STAGING_WORLD = "world.json"
+_WORLD_BUILD_LOCK = "leonida-world-build-"
+
+
+@contextmanager
+def _exclusive_output(out_dir: str):
+    """Hold one exclusive build lock for ``out_dir``.
+
+    Staging cleanup, publication and stale-chunk pruning all work on the shared output
+    directory, so two builds must not run there at once.  A killed process releases the
+    OS file lock automatically.
+    """
+    # Keep the lock outside the output: a failed build must still leave no output directory,
+    # and a successful one must contain only chunks/ and world.json.  Key it on the resolved
+    # path so every spelling of one folder (8.3 names, junctions, symlinks) shares a lock; for
+    # a folder that does not exist yet, realpath resolves the part that does and appends the rest.
+    key = hashlib.sha256(
+        os.path.normcase(os.path.realpath(out_dir)).encode("utf-8", "surrogatepass")
+    ).hexdigest()[:20]
+    lock_path = os.path.join(tempfile.gettempdir(), _WORLD_BUILD_LOCK + key)
+    with open(lock_path, "a+b") as fh:
+        fd = fh.fileno()
+        locked = False
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            elif msvcrt is not None:
+                if os.fstat(fd).st_size == 0:
+                    fh.write(b"\0")
+                    fh.flush()
+                fh.seek(0)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                locked = True
+            else:
+                raise RuntimeError("no file-lock implementation available")
+        except OSError as exc:
+            raise RuntimeError(f"another world_build is using {out_dir}") from exc
+        try:
+            yield
+        finally:
+            if locked:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                else:
+                    fh.seek(0)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+def _with_output_lock(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        out_dir = kwargs.get("out_dir")
+        if out_dir is None and len(args) > 1:
+            out_dir = args[1]
+        if out_dir is None:
+            raise TypeError("build_world requires an out_dir")
+        abs_out = os.path.abspath(out_dir)
+        with _exclusive_output(abs_out):
+            _remove_stale_staging(abs_out)
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 def _holds_unrestored_chunks(staging_dir: str) -> bool:
     backup_dir = os.path.join(staging_dir, _STAGING_BACKUP)
     try:
-        return os.path.isdir(backup_dir) and bool(os.listdir(backup_dir))
+        return bool(os.listdir(backup_dir))
+    except FileNotFoundError:
+        return False
     except OSError:
         return True  # cannot tell: keep it rather than risk deleting a recovery copy
 
 
-def _remove_stale_staging(out_dir: str) -> None:
-    """Remove staging directories left behind by builds that were killed.
+def _holds_recovery_data(staging_dir: str) -> bool:
+    return os.path.lexists(os.path.join(staging_dir, _STAGING_JOURNAL)) or _holds_unrestored_chunks(staging_dir)
 
-    A staging directory whose previous/ still holds chunks is a recovery copy from a publish
-    that could not be rolled back; it is kept until someone restores or deletes it.
-    """
+
+def _discard_publication_staging(staging_dir: str) -> None:
+    # Keep the journal until the backups are gone, including if the process dies during cleanup.
+    shutil.rmtree(os.path.join(staging_dir, _STAGING_BACKUP), ignore_errors=True)
+    if not _holds_unrestored_chunks(staging_dir):
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def _restore_publication(staging_dir: str, chunks_dir: str, replace) -> None:
+    """Undo chunk renames while the staged manifest has yet to be committed."""
+    pending_world = os.path.join(staging_dir, _STAGING_WORLD)
+    try:
+        os.lstat(pending_world)
+    except FileNotFoundError:
+        return  # the manifest rename is the commit point
+    journal = os.path.join(staging_dir, _STAGING_JOURNAL)
+    backup_dir = os.path.join(staging_dir, _STAGING_BACKUP)
+    try:
+        with open(journal, encoding="utf-8") as f:
+            doc = json.load(f)
+        added = doc.get("added") if isinstance(doc, dict) else None
+        if not isinstance(added, list):
+            raise ValueError("publication journal has no list of added chunks")
+        backups = os.listdir(backup_dir)
+        if not all(
+            isinstance(name, str) and name.endswith(".glb") and _CHUNK_FILE_RE.fullmatch(name)
+            for name in [*added, *backups]
+        ):
+            raise ValueError("invalid chunk names in publication journal or backups")
+        if not set(added).isdisjoint(backups):
+            raise ValueError("a chunk cannot be both new and backed up")
+        for name in added:
+            try:
+                os.unlink(os.path.join(chunks_dir, name))
+            except FileNotFoundError:
+                pass
+        for name in backups:
+            live = os.path.join(chunks_dir, name)
+            if os.name == "nt":
+                try:
+                    mode = os.lstat(live).st_mode
+                except FileNotFoundError:
+                    pass
+                else:
+                    if stat.S_ISREG(mode) and not mode & stat.S_IWRITE:
+                        # The uncommitted replacement inherited the original's mode.
+                        # Windows cannot overwrite it until it is writable.
+                        os.chmod(live, stat.S_IMODE(mode) | stat.S_IWRITE)
+            replace(os.path.join(backup_dir, name), live)
+        os.unlink(journal)
+    except (OSError, ValueError) as exc:
+        raise OSError(f"could not recover the previous world from {staging_dir}: {exc}") from exc
+
+
+def _remove_stale_staging(out_dir: str) -> None:
+    """Recover a stopped publication before any later build can touch the live chunks."""
     try:
         entries = os.listdir(out_dir)
-    except OSError:
+    except FileNotFoundError:
         return
     for name in entries:
         path = os.path.join(out_dir, name)
-        if (
-            name.startswith(CHUNK_STAGING_PREFIX)
-            and os.path.isdir(path)
-            and not os.path.islink(path)
-            and not _holds_unrestored_chunks(path)
-        ):
+        if not name.startswith(CHUNK_STAGING_PREFIX) or not os.path.isdir(path) or os.path.islink(path):
+            continue
+        if os.path.lexists(os.path.join(path, _STAGING_JOURNAL)):
+            _restore_publication(path, os.path.join(out_dir, "chunks"), _get_glb_writer()._replace)
+            _discard_publication_staging(path)
+        elif not _holds_unrestored_chunks(path):
+            # Older builds did not record whether they committed. Preserve their backups for manual recovery.
             shutil.rmtree(path, ignore_errors=True)
 
 
@@ -1294,50 +1424,33 @@ def _publish_world(
 ) -> None:
     """Move the verified staged chunks into chunks_dir, then commit world.json.
 
-    Every live chunk that gets replaced is first moved into <staging>/previous/. If a move or
-    the world.json write fails, the new chunks are taken out again and the previous ones put
-    back, so the old world.json keeps matching its chunks. A previous chunk that cannot be put
-    back stays in <staging>/previous/ and is named in the raised error.
+    Record which chunks had no predecessor before moving any files. The staged manifest
+    stays in place until the final rename, so recovery can distinguish an incomplete
+    publish from an interruption after the new world was committed.
     """
     backup_dir = os.path.join(staging_dir, _STAGING_BACKUP)
     os.makedirs(backup_dir, exist_ok=True)
     os.makedirs(chunks_dir, exist_ok=True)
-    backed_up: list[str] = []
-    placed: list[str] = []
+    pending_world = os.path.join(staging_dir, _STAGING_WORLD)
+    _write_json_atomic(pending_world, world_doc)
+    os.chmod(pending_world, published_mode(world_path))
+    added = {name for name in chunk_names if not os.path.lexists(os.path.join(chunks_dir, name))}
+    _write_json_atomic(os.path.join(staging_dir, _STAGING_JOURNAL), {"added": sorted(added)})
     try:
         for name in chunk_names:
             live = os.path.join(chunks_dir, name)
             staged = os.path.join(staging_dir, name)
             os.chmod(staged, published_mode(live))
-            if os.path.lexists(live):
+            if name not in added:
                 glb_mod._replace(live, os.path.join(backup_dir, name))
-                backed_up.append(name)
             glb_mod._replace(staged, live)
-            placed.append(name)
-        _write_json_atomic(world_path, world_doc, replace=glb_mod._replace)
-    except BaseException as exc:
-        unrestored = []
-        restore = set(backed_up)
-        for name in reversed(placed):
-            if name not in restore:
-                try:
-                    os.remove(os.path.join(chunks_dir, name))
-                except OSError:
-                    pass
-        for name in reversed(backed_up):
-            try:
-                glb_mod._replace(os.path.join(backup_dir, name), os.path.join(chunks_dir, name))
-            except OSError:
-                unrestored.append(name)
-        if unrestored:
-            raise OSError(
-                f"publishing chunks failed ({exc!r}) and {len(unrestored)} previous chunk(s) could not be "
-                f"put back; they are in {backup_dir} (kept by later builds until restored or deleted): "
-                f"{', '.join(sorted(unrestored))}"
-            ) from exc
+        glb_mod._replace(pending_world, world_path)
+    except BaseException:
+        _restore_publication(staging_dir, chunks_dir, glb_mod._replace)
         raise
 
 
+@_with_output_lock
 def build_world(
     assets_dir: str,
     out_dir: str,
@@ -1367,12 +1480,12 @@ def build_world(
     Individual unusable models are still skipped when other selected models can load.
 
     Chunks are written to a staging directory inside out_dir and verified before any live
-    chunk is replaced. If writing, verifying or publishing fails, or the build is interrupted,
-    the staging directory is removed and the previous world.json and chunks stay as they were.
-    Publishing renames one chunk at a time and then replaces world.json, so a reader during
-    those renames can see old and new chunks mixed, and a hard kill there leaves them mixed
-    under the old world.json. A staging directory whose previous/ still holds chunks is kept
-    by later builds as a recovery copy; other leftover staging is removed by the next build.
+    chunk is replaced. Publishing renames one chunk at a time and then replaces world.json,
+    so a reader during those renames can see old and new chunks mixed. A publication that
+    raises before the manifest rename is rolled back. After an abrupt process exit, the
+    next build rolls back an unfinished publication before reading its own inputs.
+    One build at a time may use an output directory: a second build refuses with a clear error
+    instead of removing the first build's staging.
     """
     if chunk_size <= 0 or not math.isfinite(chunk_size):
         raise ValueError(f"chunk_size must be positive, got {chunk_size!r}")
@@ -1528,7 +1641,6 @@ def build_world(
     chunks_dir = os.path.join(abs_out, "chunks")
     created_dirs = [d for d in (abs_out, chunks_dir) if not os.path.isdir(d)]
     os.makedirs(abs_out, exist_ok=True)
-    _remove_stale_staging(abs_out)
     staging_dir = tempfile.mkdtemp(prefix=CHUNK_STAGING_PREFIX, dir=abs_out)
     try:
         world_doc = _build_staged_world(
@@ -1538,7 +1650,7 @@ def build_world(
             placement_stats=placement_stats,
         )
     except BaseException:
-        if not _holds_unrestored_chunks(staging_dir):
+        if not _holds_recovery_data(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
         for d in reversed(created_dirs):
             try:
@@ -1546,7 +1658,7 @@ def build_world(
             except OSError:
                 pass
         raise
-    shutil.rmtree(staging_dir, ignore_errors=True)
+    _discard_publication_staging(staging_dir)
     _prune_stale_chunks(chunks_dir, {f"{c['id']}.glb" for c in world_doc["chunks"]})
     return world_doc
 

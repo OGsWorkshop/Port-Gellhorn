@@ -14,6 +14,7 @@ As a module:
 
 As a CLI:
     python3 -I tools/spirv_asm.py input.spvasm -o output.spv [--target-env vulkan1.2]
+Usage: `python -I tools/spirv_asm.py --help` lists the options.
 """
 import argparse
 import array
@@ -33,6 +34,7 @@ SPIRV_MAGIC = 0x07230203
 TARGET_ENV_VERSION = {
     "vulkan1.0": 0x00010000,
     "vulkan1.1": 0x00010300,
+    "vulkan1.1spv1.4": 0x00010400,
     "vulkan1.2": 0x00010500,
     "vulkan1.3": 0x00010600,
     "vulkan1.4": 0x00010600,
@@ -46,9 +48,16 @@ TARGET_ENV_VERSION = {
 }
 
 _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemorySemantics"))
+_ID_RE = re.compile(r"%[A-Za-z0-9_]+")
 _EXT_SETS = {
     "GLSL.std.450": GLSL_STD_450,
 }
+
+# OpTypeForwardPointer takes an ID reference. Its matching OpTypePointer defines the type.
+_TYPE_DEFINITIONS = frozenset(
+    name for name, (_, _, has_result, _) in INSTRUCTIONS.items()
+    if has_result and name.startswith("OpType")
+)
 
 # Precompute fixed-arity pure-Id instructions (e.g. OpIAdd, OpFMul, OpSelect, OpStore, OpBranch)
 # so the hot loop encodes ~80% of shader lines without per-operand dispatch overhead.
@@ -65,6 +74,40 @@ for _opname, (_opc, _hrt, _hres, _ospecs) in INSTRUCTIONS.items():
 
 class SpirvAsmError(ValueError):
     """Raised when SPIR-V assembly text cannot be encoded."""
+
+
+# Leave an unterminated literal together so the tokenizer reports its opening line.
+_QUOTED_OR_COMMENT = r'"[^"\\]*(?:\\[\s\S][^"\\]*)*(?:"|(?:\\)?\Z)|;[^\r\n]*'
+_ASSEMBLY_TOKEN = re.compile(_QUOTED_OR_COMMENT)
+_ASSEMBLY_PART = re.compile(_QUOTED_OR_COMMENT + r'|(\r\n?|\n)')
+
+
+def _line_break_count(text: str) -> int:
+    return text.count("\r") + text.count("\n") - text.count("\r\n")
+
+
+def _instruction_lines(text):
+    # Most modules have only single-line operands. Keep their bulk split on the fast path.
+    if not any("\r" in part[0] or "\n" in part[0] for part in _ASSEMBLY_TOKEN.finditer(text)):
+        return enumerate(text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1)
+    return _multiline_instructions(text)
+
+
+def _multiline_instructions(text):
+    """Yield instruction text and its physical starting line, keeping quoted line endings."""
+    start = 0
+    instruction_line = physical_line = 1
+    for part in _ASSEMBLY_PART.finditer(text):
+        if part[1] is None:
+            token = part[0]
+            physical_line += _line_break_count(token)
+            continue
+        yield instruction_line, text[start:part.start()]
+        physical_line += 1
+        instruction_line = physical_line
+        start = part.end()
+    if start < len(text):
+        yield instruction_line, text[start:]
 
 
 def _tokenize_line(line: str, lineno: int) -> list[str]:
@@ -100,7 +143,9 @@ def _tokenize_line(line: str, lineno: int) -> list[str]:
                     j += 1
             else:
                 raise SpirvAsmError(f"line {lineno}: unterminated string literal")
-            tokens.append("".join(out))
+            token = "".join(out)
+            tokens.append(token)
+            lineno += _line_break_count(token)
             i = j
             continue
         j = i + 1
@@ -109,6 +154,33 @@ def _tokenize_line(line: str, lineno: int) -> list[str]:
         tokens.append(line[i:j])
         i = j
     return tokens
+
+
+def _instruction_tokens(text: str):
+    """Yield one token list per instruction, with its physical starting line."""
+    tokens = []
+    start_line = previous_line = 1
+    for line, raw_line in _instruction_lines(text):
+        for token in _tokenize_line(raw_line, line):
+            if token == "=" and len(tokens) > 1 and tokens[-1].startswith("%"):
+                # The ID before '=' begins the next instruction, even across a newline.
+                result_id = tokens.pop()
+                yield start_line, tokens
+                start_line, tokens = previous_line, [result_id]
+            elif (tokens and tokens[-1] != "=" and token.startswith("Op")
+                  and len(token) > 2 and "A" <= token[2] <= "Z"
+                  and not (len(tokens) == 4 and tokens[2] == "OpSpecConstantOp")):
+                # OpSpecConstantOp also accepts an Op-prefixed mnemonic as its first operand.
+                yield start_line, tokens
+                tokens = []
+            if not tokens:
+                start_line = line
+            tokens.append(token)
+            previous_line = line
+            if token.startswith('"'):
+                line += _line_break_count(token)
+    if tokens:
+        yield start_line, tokens
 
 
 def _unquote_string(tok: str, lineno: int) -> str:
@@ -144,6 +216,36 @@ def _parse_int(tok: str, lineno: int) -> int:
         return int(tok, 0)
     except ValueError as exc:
         raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}") from exc
+
+
+def _int_literal(tok: str, width: int, signed: bool, lineno: int) -> int:
+    """The bits of integer literal `tok` for a `width`-bit integer type, refused where spirv-as refuses it.
+
+    As SPIRV-Tools reads it: an unsigned type takes 0..2^width-1 and no minus sign (not even -0); a signed type
+    takes -2^(width-1)..2^(width-1)-1, or a hex literal 0..2^width-1 read as the bit pattern (0xFFFF for a 16-bit
+    signed type is -1). Only a bare hex literal is a bit pattern: with a sign (+0xFFFF) it is a value and must fit the
+    signed range, as SPIRV-Tools reads it. A type narrower than 32 bits fills its word as the spec says: zero-extended when unsigned,
+    sign-extended when signed (0x8000 for a 16-bit signed type is 0xFFFF8000). Returns the value as an unsigned
+    number of max(width, 32) bits.
+    """
+    val = _parse_int(tok, lineno)
+    kind = "signed" if signed else "unsigned"
+    if not signed:
+        if tok.startswith("-"):
+            raise SpirvAsmError(f"line {lineno}: cannot put a negative number in an unsigned literal: {tok}")
+        if val >> width:
+            raise SpirvAsmError(f"line {lineno}: integer {tok} does not fit in a {width}-bit {kind} integer")
+    elif re.match(r"0[xX]", tok) and val >> width == 0:
+        if val >> (width - 1):
+            val -= 1 << width
+    elif not -(1 << (width - 1)) <= val < 1 << (width - 1):
+        raise SpirvAsmError(f"line {lineno}: integer {tok} does not fit in a {width}-bit {kind} integer")
+    return val & ((1 << max(width, 32)) - 1)
+
+
+def _u32_literal(tok: str, lineno: int) -> int:
+    """A LiteralInteger operand, or a numeric enum/mask value: one unsigned 32-bit word."""
+    return _int_literal(tok, 32, False, lineno)
 
 
 _HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
@@ -211,13 +313,10 @@ def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
         raise SpirvAsmError(f"line {lineno}: OpConstant references unknown scalar type")
     kind, width = type_info[0], type_info[1]
     if kind == "int":
-        val = _parse_int(tok, lineno)
-        if width <= 32:
-            return [val & 0xFFFFFFFF]
-        if width == 64:
-            u64 = val & 0xFFFFFFFFFFFFFFFF
-            return [u64 & 0xFFFFFFFF, (u64 >> 32) & 0xFFFFFFFF]
-        raise SpirvAsmError(f"line {lineno}: unsupported integer constant width {width}")
+        if width > 32 and width != 64:
+            raise SpirvAsmError(f"line {lineno}: unsupported integer constant width {width}")
+        val = _int_literal(tok, width, bool(type_info[2]), lineno)
+        return [val] if width <= 32 else [val & 0xFFFFFFFF, val >> 32]
     if kind == "float":
         bits = _parse_float_bits(tok, width, lineno)
         if width <= 32:
@@ -234,8 +333,21 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
     if version is None:
         raise SpirvAsmError(f"unsupported target environment: {target_env!r}")
 
+    # A successful line-by-line parse consists of complete instructions. Try this first
+    # for generated shaders, where the more expensive token grouping is rarely needed.
+    track_switch_types = "OpSwitch" in text
+    lines = ((lineno, _tokenize_line(raw, lineno)) for lineno, raw in _instruction_lines(text))
+    try:
+        return _assemble(lines, version, track_switch_types)
+    except SpirvAsmError:
+        pass
+    return _assemble(_instruction_tokens(text), version, track_switch_types)
+
+
+def _assemble(instructions, version: int, track_switch_types: bool) -> bytes:
     sym_to_id: dict[str, int] = {}
     next_id = 1
+    defined_types: set[str] = set()
     type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width)
     id_to_type: dict[int, int] = {}        # result_id -> result_type_id
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
@@ -246,6 +358,8 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             raise SpirvAsmError(f"line {lineno}: expected %id, got {tok!r}")
         vid = sym_to_id.get(tok)
         if vid is None:
+            if not _ID_RE.fullmatch(tok):
+                raise SpirvAsmError(f"line {lineno}: invalid ID {tok!r}")
             vid = next_id
             next_id += 1
             sym_to_id[tok] = vid
@@ -255,12 +369,12 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
     def encode_operand(kind: str, toks: list[str], idx: int, lineno: int,
                        res_type_id: int | None, cur_ext_table: dict[str, int] | None,
-                       switch_width: int, out: list[int]) -> int:
+                       switch_type: tuple | None, out: list[int]) -> int:
         if kind in _ID_KINDS:
             out.append(get_id(toks[idx], lineno))
             return idx + 1
         if kind == "LiteralInteger":
-            out.append(_parse_int(toks[idx], lineno) & 0xFFFFFFFF)
+            out.append(_u32_literal(toks[idx], lineno))
             return idx + 1
         if kind == "LiteralFloat":
             out.append(_parse_float_bits(toks[idx], 32, lineno))
@@ -276,16 +390,21 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if cur_ext_table is not None and tok in cur_ext_table:
                 out.append(cur_ext_table[tok])
             else:
-                out.append(_parse_int(tok, lineno) & 0xFFFFFFFF)
+                out.append(_u32_literal(tok, lineno))
             return idx + 1
         if kind == "PairLiteralIntegerIdRef":
-            val = _parse_int(toks[idx], lineno)
-            if switch_width == 64:
-                u64 = val & 0xFFFFFFFFFFFFFFFF
-                out.append(u64 & 0xFFFFFFFF)
-                out.append((u64 >> 32) & 0xFFFFFFFF)
+            tok = toks[idx]
+            if switch_type is not None:
+                width, signed = switch_type
             else:
+                # Selector of unknown type: one word, read as signed only when the literal is negative.
+                width, signed = 32, tok.startswith("-")
+            val = _int_literal(tok, width, signed, lineno)
+            if width == 64:
                 out.append(val & 0xFFFFFFFF)
+                out.append(val >> 32)
+            else:
+                out.append(val)
             if idx + 1 >= len(toks):
                 raise SpirvAsmError(f"line {lineno}: missing label in {kind}")
             out.append(get_id(toks[idx + 1], lineno))
@@ -300,7 +419,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if idx + 1 >= len(toks):
                 raise SpirvAsmError(f"line {lineno}: missing literal in {kind}")
             out.append(get_id(toks[idx], lineno))
-            out.append(_parse_int(toks[idx + 1], lineno) & 0xFFFFFFFF)
+            out.append(_u32_literal(toks[idx + 1], lineno))
             return idx + 2
         if kind == "LiteralSpecConstantOpInteger":
             opname = toks[idx]
@@ -313,14 +432,14 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             for sk, sq in sub[3]:
                 if sq == "*":
                     while idx < len(toks):
-                        idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                        idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
                 elif sq == "?":
                     if idx < len(toks):
-                        idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                        idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
                 else:
                     if idx >= len(toks):
                         raise SpirvAsmError(f"line {lineno}: missing operand {sk} for {opname}")
-                    idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                    idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             return idx
 
         venum = VALUE_ENUMS.get(kind)
@@ -330,7 +449,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if entry is None:
                 # Allow raw numeric value fallback (e.g. hex enum value)
                 if tok[:1].isdigit() or tok.startswith(("0x", "0X")):
-                    out.append(_parse_int(tok, lineno) & 0xFFFFFFFF)
+                    out.append(_u32_literal(tok, lineno))
                     return idx + 1
                 raise SpirvAsmError(f"line {lineno}: unknown {kind} value {tok!r}")
             val, params = entry
@@ -339,7 +458,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             for pk in params:
                 if idx >= len(toks):
                     raise SpirvAsmError(f"line {lineno}: missing parameter {pk} for {kind}.{tok}")
-                idx = encode_operand(pk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                idx = encode_operand(pk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             return idx
 
         benum = BIT_ENUMS.get(kind)
@@ -351,7 +470,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 entry = benum.get(part)
                 if entry is None:
                     if part[:1].isdigit() or part.startswith(("0x", "0X")):
-                        mask |= _parse_int(part, lineno) & 0xFFFFFFFF
+                        mask |= _u32_literal(part, lineno)
                         continue
                     raise SpirvAsmError(f"line {lineno}: unknown {kind} flag {part!r} in {tok!r}")
                 bval, params = entry
@@ -366,13 +485,12 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 for pk in params:
                     if idx >= len(toks):
                         raise SpirvAsmError(f"line {lineno}: missing parameter {pk} for {kind} {tok!r}")
-                    idx = encode_operand(pk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                    idx = encode_operand(pk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             return idx
 
         raise SpirvAsmError(f"line {lineno}: unsupported operand kind {kind!r}")
 
-    for lineno, raw_line in enumerate(text.splitlines(), 1):
-        toks = _tokenize_line(raw_line, lineno)
+    for lineno, toks in instructions:
         if not toks:
             continue
         res_tok = None
@@ -383,6 +501,11 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         else:
             opname = toks[0]
             arg_idx = 1
+
+        if res_tok is not None and opname in _TYPE_DEFINITIONS:
+            if res_tok in defined_types:
+                raise SpirvAsmError(f"line {lineno}: type ID {res_tok} is already defined")
+            defined_types.add(res_tok)
 
         fast = _PURE_ID_INSNS.get(opname)
         if fast is not None:
@@ -404,7 +527,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if has_res:
                 rid = get_id(res_tok, lineno)
                 out.append(rid)
-                if rt_id is not None:
+                if track_switch_types and rt_id is not None:
                     id_to_type[rid] = rt_id
             for k in range(arg_idx, len(toks)):
                 out.append(get_id(toks[k], lineno))
@@ -436,7 +559,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 raise SpirvAsmError(f"line {lineno}: {opname} requires '%id =' result")
             res_id = get_id(res_tok, lineno)
             out.append(res_id)
-            if res_type_id is not None:
+            if track_switch_types and res_type_id is not None:
                 id_to_type[res_id] = res_type_id
         elif res_tok is not None:
             raise SpirvAsmError(f"line {lineno}: {opname} does not produce a result id")
@@ -452,26 +575,33 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 ext_imports[res_id] = _EXT_SETS[ext_name]
 
         cur_ext_table = None
-        switch_width = 32
+        switch_type = None                 # (width, signed) of the OpSwitch selector's integer type
         if opname == "OpExtInst" and arg_idx < len(toks):
             cur_ext_table = ext_imports.get(get_id(toks[arg_idx], lineno))
         elif opname == "OpSwitch" and arg_idx < len(toks):
             sel_id = get_id(toks[arg_idx], lineno)
-            sel_ti = type_info.get(id_to_type.get(sel_id))
-            if sel_ti and sel_ti[0] == "int":
-                switch_width = sel_ti[1]
+            if sel_id not in id_to_type:
+                # The single top-down pass has not seen a typed definition of the selector. The case literals' width
+                # comes from that type, so guessing 32 bits would emit a 64-bit selector's literals as one word each.
+                # spirv-as refuses this too, and spirv-val refuses a module whose selector block comes after the switch.
+                raise SpirvAsmError(
+                    f"line {lineno}: OpSwitch selector {toks[arg_idx]} has no known type: it must be defined before "
+                    "the OpSwitch (blocks are laid out in dominance order)")
+            sel_ti = type_info.get(id_to_type[sel_id])
+            if sel_ti and sel_ti[0] == "int" and (sel_ti[1] <= 32 or sel_ti[1] == 64):
+                switch_type = (sel_ti[1], bool(sel_ti[2]))
 
         for kind, quant in op_specs:
             if quant == "*":
                 while arg_idx < len(toks):
-                    arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                    arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             elif quant == "?":
                 if arg_idx < len(toks):
-                    arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                    arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             else:
                 if arg_idx >= len(toks):
                     raise SpirvAsmError(f"line {lineno}: {opname} missing operand ({kind})")
-                arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_type, out)
 
         if arg_idx != len(toks):
             raise SpirvAsmError(f"line {lineno}: {opname} unexpected trailing tokens {toks[arg_idx:]!r}")
@@ -496,13 +626,13 @@ def main(argv=None) -> int:
                     help="target SPIR-V / Vulkan environment (default: vulkan1.2)")
     args = ap.parse_args(argv)
     try:
-        with open(args.src, encoding="utf-8") as f:
+        with open(args.src, encoding="utf-8", newline="") as f:
             text = f.read()
         data = assemble(text, target_env=args.target_env)
         with open(args.out, "wb") as f:
             f.write(data)
-    except (OSError, SpirvAsmError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+    except (OSError, ValueError, SpirvAsmError) as exc:    # ValueError: a source file that is not UTF-8
+        print(f"ERROR: {args.src}: {exc}" if isinstance(exc, UnicodeDecodeError) else f"ERROR: {exc}", file=sys.stderr)
         return 1
     return 0
 

@@ -3,6 +3,7 @@
 
 These blocks use the same 0x60-byte slot-word header as `63 30 00 00` mesh blocks,
 but with different vertex formats. This tool finds and measures their strides.
+Usage: `python -I tools/analyze_4240_full.py --help` lists the options.
 """
 
 import argparse
@@ -13,6 +14,10 @@ import re
 import struct
 import sys
 import zlib
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 # Constants from meshlet_page.py
 BLOCK_MAGIC = 0x3063       # 63 30 00 00
@@ -154,50 +159,6 @@ def parse_4240_block(data, at, stream_end):
     
     return record, at + HEADER_SIZE
 
-def walk_stream(data):
-    """Walk a decompressed stream and find all 4240 blocks."""
-    blocks = []
-    pos = 0
-    while pos < len(data):
-        pos = (pos + 15) & ~15
-        if pos >= len(data):
-            break
-        while pos + 4 <= len(data) and _u32(data, pos) == 0:
-            pos += 4
-        if pos >= len(data):
-            break
-        pos &= ~15
-        if pos + 4 > len(data):
-            break
-        word = _u32(data, pos)
-        
-        if word == OTHER_BLOCK_MAGIC:
-            try:
-                record, pos = parse_4240_block(data, pos, len(data))
-                record["kind"] = "4240_block"
-                blocks.append(record)
-            except ValueError as e:
-                blocks.append({"kind": "error", "offset": pos, "error": str(e)})
-                pos += 4
-        elif word == BLOCK_MAGIC:
-            pos += HEADER_SIZE
-        elif word & 0x80000000:
-            head = _u32(data, pos)
-            meshlets = head & 0x7FFFFFFF
-            triangles = _u32(data, pos + 4)
-            refs = _u32(data, pos + 8)
-            rec_at = pos + 12
-            tri_at = rec_at + 16 * meshlets
-            ref_at = tri_at + 4 * triangles
-            end = ref_at + 2 * refs
-            if end <= len(data):
-                pos = end
-            else:
-                pos += 4
-        else:
-            pos += 4
-    return blocks
-
 def process_archive(archive_path, limit=None):
     """Process an RPF9 archive and return stats on 4240 blocks."""
     stats = {
@@ -297,22 +258,11 @@ def positive_int(text):
     return value
 
 
-def same_output_path(first, second):
-    """True when the two names are one file: the same path, or a link, junction or other spelling of it."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze 42 40 00 00 vertex blocks in RPF9 archives")
     parser.add_argument("inputs", nargs="+", help="RPF9 archive paths")
     parser.add_argument("--json", help="Write results to JSON file")
     parser.add_argument("--limit", type=positive_int, help="Limit streams per archive")
-    parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
     # Checked before the scan: the report is written after every archive has been read, so a --json naming one of
     # them replaced the archive with the report, and a folder only failed once the whole scan was done.
@@ -321,20 +271,21 @@ def main() -> int:
             print(f"ERROR: --json {args.json} is a folder, not a file", file=sys.stderr)
             return 2
         for path in args.inputs:
-            if same_output_path(args.json, path):
+            if same_report_path(args.json, path):
                 print(f"ERROR: --json {args.json} would overwrite the input archive {path}", file=sys.stderr)
                 return 2
 
     all_stats, status = [], 0
     for path in args.inputs:
         if not os.path.exists(path):
-            print(f"ERROR: {path} does not exist", file=sys.stderr)
-            status = 1
+            # A missing input is a usage error (2); a folder that exists but is not an archive is a read error (1).
+            print(f"ERROR: {path}: does not exist", file=sys.stderr)
+            status = max(status, 2)
             continue
         if not os.path.isfile(path):
             # A folder passed for an archive used to reach open() and end the whole run with PermissionError.
             print(f"ERROR: {path} is not a file", file=sys.stderr)
-            status = 1
+            status = max(status, 1)
             continue
         print(f"Processing {path}...")
         try:
@@ -343,6 +294,10 @@ def main() -> int:
             # A truncated archive or a bad data offset otherwise looks like an empty successful scan.
             print(f"ERROR: {e}", file=sys.stderr)
             status = 1
+            continue
+        except OSError as e:
+            print(f"ERROR: cannot read {path}: {e.strerror or e}", file=sys.stderr)
+            status = max(status, 1)
             continue
         all_stats.append(stats)
         

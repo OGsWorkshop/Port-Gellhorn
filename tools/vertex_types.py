@@ -46,6 +46,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from meshlet_page import PageError, parse_group  # noqa: E402  (same group validation as the 63 30 pages)
+from report_paths import path_key  # noqa: E402
 
 MAGIC = 0x4042
 HEADER = 0x80
@@ -207,6 +208,78 @@ def normal_0x21(w):
     return _oct((w & 255) / 127.5 - 1, ((w >> 8) & 255) / 127.5 - 1)
 
 
+def tangent_0x21(w):
+    """(unit tangent, bitangent sign) from one tag-0x21 u32, decoded as the mesh shaders decode it.
+
+    Bit 31 set: bits 20-29 are an angle, v * 2pi / 1023 - pi, that turns a basis built from the normal alone
+    (b1 = (s*x*x*a - 1, s*x*y*a, s*x), b2 = (x*y*a, y*y*a - s, y), s = sign(z) with z = 0 as +1, a = 1 / (s + z));
+    tangent = b1 * cos(angle) - b2 * sin(angle).
+    Bit 31 clear: octahedral tangent, x = bits 16-22, y = bits 23-29, each unorm7 remapped by v / 63.5 - 1.
+    Bit 30 is the bitangent sign: 1 when cross(normal, tangent) runs along +v of the texture coordinates
+    (docs/restofworld.md), returned as +1 or -1. The shaders themselves turn a set bit 30 into the factor -1.0
+    (`v_cndmask_b32 ..., 1.0, -1.0`); the sign here is the measured side, not that factor.
+    Returns (None, sign) when a vector cannot be built."""
+    sign = 1 if (w >> 30) & 1 else -1
+    if not w >> 31:
+        return _oct(((w >> 16) & 127) / 63.5 - 1, ((w >> 23) & 127) / 63.5 - 1), sign
+    n = normal_0x21(w)
+    if n is None:
+        return None, sign
+    x, y, z = n
+    s = 1.0 if z >= 0 else -1.0
+    a = 1.0 / (s + z)
+    ang = ((w >> 20) & 1023) * (2 * math.pi / 1023) - math.pi
+    c, sn = math.cos(ang), math.sin(ang)
+    b1 = (s * x * x * a - 1, s * x * y * a, s * x)
+    b2 = (x * y * a, y * y * a - s, y)
+    return _norm(*(b1[i] * c - b2[i] * sn for i in range(3))), sign
+
+
+def tangent_checks(words, uvs, mpos, tris):
+    """Counts for the tag-0x21 tangent against the texture-coordinate gradients of each triangle.
+
+    words: the 0x21 u32 per vertex; uvs: (u, v) per vertex; mpos: model-space positions; tris: triangles.
+    For each vertex of a triangle with a usable UV mapping, dP/du is projected into the vertex's tangent plane.
+    Keys per form (10 = bit 31 set, 8 = clear): checked, along_u (cos(tangent, dP/du) > 0.8), rotated_along_u
+    (the same tangent turned by a seeded random angle about the normal, the chance level), and of the along_u
+    vertices, sign_agree (bit 30 matches the side of dP/dv that cross(normal, tangent) is on)."""
+    out = {}
+    rng = random.Random(0)
+    for a, b, c in tris:
+        e1 = [mpos[b][i] - mpos[a][i] for i in range(3)]
+        e2 = [mpos[c][i] - mpos[a][i] for i in range(3)]
+        du1, dv1 = uvs[b][0] - uvs[a][0], uvs[b][1] - uvs[a][1]
+        du2, dv2 = uvs[c][0] - uvs[a][0], uvs[c][1] - uvs[a][1]
+        det = du1 * dv2 - du2 * dv1
+        if abs(det) < 1e-12:
+            continue
+        dpdu = _norm(*((e1[i] * dv2 - e2[i] * dv1) / det for i in range(3)))
+        dpdv = _norm(*((e2[i] * du1 - e1[i] * du2) / det for i in range(3)))
+        if dpdu is None or dpdv is None:
+            continue
+        for v in (a, b, c):
+            w = words[v]
+            n = normal_0x21(w)
+            t, sign = tangent_0x21(w)
+            if n is None or t is None:
+                continue
+            d = sum(dpdu[i] * n[i] for i in range(3))
+            pu = _norm(*(dpdu[i] - d * n[i] for i in range(3)))
+            if pu is None:
+                continue
+            form = "10" if w >> 31 else "8"
+            add(out, f"tangent{form}_checked")
+            cu = sum(t[i] * pu[i] for i in range(3))
+            bt = (n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0])
+            th = rng.uniform(0, 2 * math.pi)
+            rt = [t[i] * math.cos(th) + bt[i] * math.sin(th) for i in range(3)]
+            add(out, f"tangent{form}_rotated_along_u", int(sum(rt[i] * pu[i] for i in range(3)) > 0.8))
+            if cu > 0.8:
+                add(out, f"tangent{form}_along_u")
+                add(out, f"tangent{form}_sign_agree", int((sum(bt[i] * dpdv[i] for i in range(3)) > 0) == (sign > 0)))
+    return out
+
+
 def _s8(b):
     return max((b - 256 if b > 127 else b) / 127.0, -1.0)
 
@@ -280,8 +353,119 @@ def mad_log(ratios):
     return dev[len(dev) // 2]
 
 
+def tangent_0x27(w):
+    """(unit vector, sign) from one tag-0x27 u32, read as the mesh shaders read it: a 2_10_10_10 UNORM element
+    (tbuffer_load_format_xyzw BUF_FMT_2_10_10_10_UNORM) with each component mapped by v * 2 - 1, so
+    xyz = bits 0-9, 10-19, 20-29 over 1023 and w = bits 30-31 over 3. docs/restofworld.md measures xyz as a
+    tangent along u of a second texture-coordinate stream and w as its bitangent sign."""
+    x, y, z = (((w >> s) & 1023) / 1023 * 2 - 1 for s in (0, 10, 20))
+    return _norm(x, y, z), (w >> 30) / 3 * 2 - 1
+
+
+def tangent27_checks(data, at, slots, n, mpos, tris, face_normals):
+    """Counts for each tag-0x27 slot, keyed "<slot>:<check>".
+
+    Over all vertices: vertices, unit (|xyz| within 3% of 1), w0 / w3 (the 2-bit field at 0 or 3).
+    Over the sampled triangles' vertices: perp_face_n / perp_face (|cos(xyz, face normal)| < 0.2); and per
+    0x28 stream s (texture coordinates, read as int16 pairs): uv<s>_n / uv<s>_along_u (cos(xyz, dP/du) > 0.8,
+    dP/du projected into the triangle's plane), and of those, uv<s>_w_plus_minus_v (w > 0 exactly when
+    cross(face normal, xyz) points along -dP/dv; the face normal follows the triangle's winding)."""
+    out = {}
+    uvsets = [(i, struct.unpack_from(f"<{2 * n}h", data, at + off)) for i, (tag, off) in sorted(slots.items())
+              if tag == 0x28 and i]
+    for si, (tag, off) in sorted(slots.items()):
+        if tag != 0x27 or not si:
+            continue
+        words = struct.unpack_from(f"<{n}I", data, at + off)
+        dec = [tangent_0x27(w) for w in words]
+        add(out, f"{si}:vertices", n)
+        add(out, f"{si}:unit", sum(1 for w in words if abs(math.sqrt(sum(
+            (((w >> s) & 1023) / 1023 * 2 - 1) ** 2 for s in (0, 10, 20))) - 1) < 0.03))
+        add(out, f"{si}:w0", sum(1 for w in words if w >> 30 == 0))
+        add(out, f"{si}:w3", sum(1 for w in words if w >> 30 == 3))
+        for (a, b, c), fn in zip(tris, face_normals):
+            if fn is None:
+                continue
+            for v in (a, b, c):
+                t = dec[v][0]
+                if t is not None:
+                    add(out, f"{si}:perp_face_n")
+                    add(out, f"{si}:perp_face", int(abs(t[0] * fn[0] + t[1] * fn[1] + t[2] * fn[2]) < 0.2))
+            e1 = [mpos[b][k] - mpos[a][k] for k in range(3)]
+            e2 = [mpos[c][k] - mpos[a][k] for k in range(3)]
+            for ui, uv in uvsets:
+                du1, dv1 = uv[2 * b] - uv[2 * a], uv[2 * b + 1] - uv[2 * a + 1]
+                du2, dv2 = uv[2 * c] - uv[2 * a], uv[2 * c + 1] - uv[2 * a + 1]
+                det = du1 * dv2 - du2 * dv1
+                if not det:
+                    continue
+                gu = [(e1[k] * dv2 - e2[k] * dv1) / det for k in range(3)]
+                gv = [(e2[k] * du1 - e1[k] * du2) / det for k in range(3)]
+                d = sum(gu[k] * fn[k] for k in range(3))
+                pu = _norm(*(gu[k] - d * fn[k] for k in range(3)))
+                if pu is None:
+                    continue
+                for v in (a, b, c):
+                    t, sign = dec[v]
+                    if t is None:
+                        continue
+                    add(out, f"{si}:uv{ui}_n")
+                    if t[0] * pu[0] + t[1] * pu[1] + t[2] * pu[2] > 0.8:
+                        add(out, f"{si}:uv{ui}_along_u")
+                        bt = (fn[1] * t[2] - fn[2] * t[1], fn[2] * t[0] - fn[0] * t[2], fn[0] * t[1] - fn[1] * t[0])
+                        minus_v = bt[0] * gv[0] + bt[1] * gv[1] + bt[2] * gv[2] < 0
+                        add(out, f"{si}:uv{ui}_w_plus_minus_v", int(minus_v == (sign > 0)))
+    return out
+
+
 def add(d, k, v=1):
     d[k] = d.get(k, 0) + v
+
+
+SKIN_PAIRS = ((6, 8), (7, 9))  # (weight slot, tag 0x26; joint-index slot, tag 0x25), four influences per pair
+
+
+def skin_checks(data, at, slots, n):
+    """Counts that test the skin reading of a block: slots 6/7 (tag 0x26) are four unorm8 weights each and
+    slots 8/9 (tag 0x25) the four matching joint indices. Empty when slot 8 is not tag 0x25.
+
+    Keys: blocks, vertices, pairs_<k> (blocks with k weight/index slot pairs), unpaired (a 0x25 slot without
+    its 0x26 slot), weight_sum_255 / weight_sum_247_255 (per vertex, over all weight slots), weights_descending,
+    nonzero_indices_distinct (no joint repeats among the non-zero weights), zero_weight_zero_index (every
+    zero weight has index 0), index_max_<b> (blocks by highest index used by a non-zero weight, in bands of
+    16), and the control colour_sum_255 (slot 1, tag 0x26, the same byte sum on the colour stream)."""
+    out = {}
+    if slots.get(8, (None,))[0] != 0x25:
+        return out
+    pairs = []
+    for ws, js in SKIN_PAIRS:
+        if slots.get(js, (None,))[0] != 0x25:
+            continue
+        if slots.get(ws, (None,))[0] != 0x26:
+            add(out, "unpaired")
+            return out
+        pairs.append((at + slots[ws][1], at + slots[js][1]))
+    add(out, "blocks")
+    add(out, "vertices", n)
+    add(out, f"pairs_{len(pairs)}")
+    top = 0
+    for v in range(n):
+        w = [b for wo, _ in pairs for b in data[wo + 4 * v:wo + 4 * v + 4]]
+        j = [b for _, jo in pairs for b in data[jo + 4 * v:jo + 4 * v + 4]]
+        s = sum(w)
+        add(out, "weight_sum_255", int(s == 255))
+        add(out, "weight_sum_247_255", int(247 <= s <= 255))
+        add(out, "weights_descending", int(all(w[k] >= w[k + 1] for k in range(len(w) - 1))))
+        live = [j[k] for k in range(len(w)) if w[k]]
+        add(out, "nonzero_indices_distinct", int(len(set(live)) == len(live)))
+        add(out, "zero_weight_zero_index", int(all(j[k] == 0 for k in range(len(w)) if not w[k])))
+        top = max([top] + live)
+    add(out, f"index_max_{top // 16 * 16}-{top // 16 * 16 + 15}")
+    if slots.get(1, (None,))[0] == 0x26:
+        c = at + slots[1][1]
+        add(out, "colour_vertices", n)
+        add(out, "colour_sum_255", sum(1 for v in range(n) if sum(data[c + 4 * v:c + 4 * v + 4]) == 255))
+    return out
 
 
 def measure_block(data, at, T, rng, found=None):
@@ -300,6 +484,9 @@ def measure_block(data, at, T, rng, found=None):
     add(T, "blocks")
     add(T, "vertices", n)
     add(T, "edges", len(edges))
+    sk = T.setdefault("skin", {})
+    for key, val in skin_checks(data, at, slots, n).items():
+        add(sk, key, val)
     pos, bias, scale = positions(data, at, slots, n)
     if all(math.isfinite(c) for c in bias + scale) and min(scale) >= 0:
         add(T, "pos_header_finite")
@@ -315,6 +502,9 @@ def measure_block(data, at, T, rng, found=None):
     k = struct.unpack_from("<I", data, at + 0x6C)[0]
     mpos = [(p[1], p[2], p[0]) if k == 1 else (p[2], p[1], p[0]) if k == 0 else p for p in pos]
     face_normals = [face_normal(mpos[a], mpos[b], mpos[c]) for a, b, c in stris]
+    t27 = T.setdefault("tag27", {})
+    for key, val in tangent27_checks(data, at, slots, n, mpos, stris, face_normals).items():
+        add(t27, key, val)
     if edges:
         e = sum(math.dist(pos[p], pos[q]) for p, q in edges) / len(edges)
         r = sum(math.dist(pos[p], pos[q]) for p, q in pairs) / max(len(pairs), 1)
@@ -396,6 +586,16 @@ def measure_block(data, at, T, rng, found=None):
                         good += abs(nv[0] * fn[0] + nv[1] * fn[1] + nv[2] * fn[2]) > 0.8
                 if tot:
                     tt.setdefault(f"facenormal_{name}", []).append(good / tot)
+    # tag 0x21 tangent: against the first 0x28 (texture coordinate) stream of the block, if it has one
+    s21 = [(i, off) for i, (tag, off) in sorted(slots.items()) if tag == 0x21 and i]
+    s28 = [off for i, (tag, off) in sorted(slots.items()) if tag == 0x28 and i]
+    if s21 and s28:
+        words = struct.unpack_from(f"<{n}I", data, at + s21[0][1])
+        raw = struct.unpack_from(f"<{2 * n}h", data, at + s28[0])
+        uvs = [(raw[2 * v], raw[2 * v + 1]) for v in range(n)]
+        tt = T["tags"][f"slot{s21[0][0]}:21"]
+        for key, val in tangent_checks(words, uvs, mpos, stris).items():
+            add(tt, key, val)
     return n
 
 
@@ -488,9 +688,15 @@ def same_output_path(first, second):
         return False
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a scan must not report an
+    # incomplete directory as complete. main() turns the OSError into one error line and exit 2.
+    raise exc
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("inputs", nargs="+", help=".rpf archives or folders of them")
+    ap.add_argument("inputs", nargs="+", help=".rpf archives or folders; overlapping paths are counted once")
     ap.add_argument("--limit", type=int, default=0, help="stop after this many 42 40 00 00 streams per archive")
     ap.add_argument("--json", help="write the totals here")
     ap.add_argument("--seed", type=int, default=1)
@@ -498,31 +704,38 @@ def main(argv=None):
     if args.limit < 0:
         print("error: --limit must be >= 0", file=sys.stderr)
         return 2
-    archives = []
+    archives = {}  # Resolved path -> first spelling, in discovery order.
     for p in args.inputs:
         if not os.path.exists(p):
             print(f"error: {p} does not exist", file=sys.stderr)
             return 2
         if os.path.isdir(p):
-            for root, directories, files in os.walk(p):
-                directories.sort()
-                archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
+            try:
+                for root, directories, files in os.walk(p, onerror=_walk_error):
+                    directories.sort()
+                    for name in sorted(files):
+                        if name.lower().endswith(".rpf"):
+                            path = os.path.join(root, name)
+                            archives.setdefault(path_key(path), path)
+            except OSError as exc:
+                print(f"error: {exc.filename or p}: {exc.strerror or exc}", file=sys.stderr)
+                return 2
         else:
-            archives.append(p)
+            archives.setdefault(path_key(p), p)
     # The report is written after the whole scan, so check its path first: an archive given as --json used to be
     # replaced by the report (exit 0), and a directory ended the run in a traceback.
     if args.json:
         if os.path.isdir(args.json):
             print(f"error: --json {args.json} is a directory", file=sys.stderr)
             return 2
-        for path in archives:
+        for path in archives.values():
             if same_output_path(args.json, path):
                 print(f"error: --json would overwrite the input {path}", file=sys.stderr)
                 return 2
     rng = random.Random(args.seed)
     T = {"streams": 0}
     errors = {}
-    for path in archives:
+    for path in archives.values():
         try:
             for _, _, data in iter_blocks(path, args.limit):
                 T["streams"] += 1

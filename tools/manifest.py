@@ -17,6 +17,10 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 CHUNK = 8 * 1024 * 1024
 DEFAULT = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
 
@@ -80,16 +84,6 @@ def sha256(path: str, *, expected_size: int | None = None) -> str:
     return _hash_file(path, expected_size=expected_size)[1]
 
 
-def same_output_path(first: str, second: str) -> bool:
-    """True when writing ``second`` would truncate ``first`` (same path, case variant or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def walk(game_dir: str, *, exclude=None):
     def scan_failed(error: OSError) -> None:
         raise error
@@ -136,7 +130,7 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
                                     "choose a manifest path that is not one of the hashed files") from None
     files = sorted(walk(game_dir, exclude=out))
     for _rel, path in files:
-        if same_output_path(out, path):
+        if same_report_path(out, path):
             raise ManifestError(f"--out would overwrite the input {path}; "
                                 "choose a manifest path that is not one of the hashed files")
     sizes = {path: os.path.getsize(path) for _, path in files}
@@ -211,6 +205,9 @@ def load_manifest(manifest: str) -> dict:
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
     want = load_manifest(manifest)
     have = dict(walk(game_dir, exclude=manifest))
+    if not want and have:
+        # A create that was cut short, or a mistyped --manifest, would otherwise print OK without checking a file.
+        raise ManifestError(f"{manifest} lists no files, but {game_dir} holds {len(have)}; create it again")
     problems = {}
     pending = []
     for rel, info in want.items():

@@ -31,8 +31,10 @@ struct Ref {
 
 static_assert(std::is_move_constructible_v<leonida::Draw>);
 static_assert(std::is_move_assignable_v<leonida::Draw>);
-static_assert(sizeof(leonida::Draw::render_targets) == sizeof(leonida::TargetView) * 8);
-static_assert(sizeof(leonida::Draw::vertex_buffers) == sizeof(leonida::VertexBufferView) * 32);
+static_assert(sizeof(leonida::DrawViews::render_targets) == sizeof(leonida::TargetView) * 8);
+static_assert(sizeof(leonida::DrawViews::vertex_buffers) == sizeof(leonida::VertexBufferView) * 32);
+// The views stay out of the variant: a recorded command is sized by its largest member, Draw included.
+static_assert(sizeof(leonida::Draw) < sizeof(leonida::DrawViews));
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--trace-d3d12") == 0) rt::d3d12_trace::set_enabled(true);
@@ -288,6 +290,13 @@ int main(int argc, char** argv) {
         EXPECT(invalid_bundle_call([&](auto* b) {
             b->ClearUnorderedAccessViewFloat({}, uav_view, rt_resource, uav_float, 0, nullptr); }));
         EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
+        // Measured on the PC runtime (default adapter and WARP, d3d12_bundle_forbidden_test): these fail a bundle's Close.
+        const D3D12_VIEWPORT bundle_viewport{0, 0, 4, 4, 0, 1};
+        const D3D12_RECT bundle_scissor{0, 0, 4, 4};
+        EXPECT(invalid_bundle_call([&](auto* b) { b->RSSetViewports(1, &bundle_viewport); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->RSSetScissorRects(1, &bundle_scissor); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->ClearState(nullptr); }));
         // D3D-26: DiscardResource and the atomic copies are not allowed in a bundle; WriteBufferImmediate is
         // ("Recording command lists and bundles", the bundle restrictions and the API restrictions table).
         EXPECT(invalid_bundle_call([&](auto* b) { b->DiscardResource(rt_resource, nullptr); }));
@@ -329,11 +338,43 @@ int main(int argc, char** argv) {
         EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 1) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
-        // A depth outside [0, 1] makes Close report the invalid call, as D3D12 does.
+        // A depth outside [0, 1] is recorded as given and the list closes, as on WARP (3ce953ae8;
+        // d3d12_close_parity_test "ClearDepthStencilView depth 1.5", d3d12_clear_test reads the texels back).
         EXPECT(SUCCEEDED(allocator->Reset()));
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 2.0f, 0, 0, nullptr);
-        EXPECT(list->Close() == E_INVALIDARG);
+        EXPECT(list->Close() == S_OK);
+
+        // State-setting calls on a closed direct list or bundle are ignored and do not mutate recorded state.
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->OMSetStencilRef(5);
+        EXPECT(list->Close() == S_OK);
+        EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 5 && back == 5);
+        const FLOAT post_close_factor[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+        list->OMSetStencilRef(99);
+        list->OMSetBlendFactor(post_close_factor);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->IASetIndexBuffer(nullptr);
+        list->SetPipelineState(nullptr);
+        list->ClearState(nullptr);
+        list->ExecuteBundle(bundle.p);
+        EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 5 && back == 5);
+        EXPECT(list->Close() == E_FAIL);
+
+        // Post-close state calls on a closed bundle do not append calls or invalidate the bundle.
+        bundle->OMSetStencilRef(99);
+        bundle->OMSetBlendFactor(post_close_factor);
+        bundle->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+        bundle->IASetIndexBuffer(nullptr);
+        bundle->SetPipelineState(nullptr);
+        bundle->ClearState(nullptr);
+        bundle->ExecuteBundle(untouched_bundle.p);
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->ExecuteBundle(bundle.p);
+        EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 7 && back == 9);
+        EXPECT(list->Close() == S_OK);
     }
 
     EXPECT(d.run([&](VkCommandBuffer cb) {

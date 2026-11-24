@@ -1,7 +1,7 @@
 r"""Differential fuzzer for the translator, two instruction families on the GPU (FUZZ-2, FUZZ-5), standard
 library only.
 
-    python -I tools/valu_fuzz.py --family f16  --programs 200 --seed 1 [--wave 64|32|both] [--emulate]
+    python -I tools/valu_fuzz.py --family f16  --programs 200 --seed 1 [--wave 64|32|both] [--emulate] [--asm-jobs N]
     python -I tools/valu_fuzz.py --family mem  ...
     python -I tools/valu_fuzz.py --family f16 --show 1:7:32      # print program 7 of seed 1 (wave32) and its model
     python -I tools/valu_fuzz.py --family f16 --model-only ...   # generate and model only (no GPU)
@@ -19,7 +19,9 @@ Families:
 Oracles (--oracle translator|hw|translator,hw): translator (default) assembles for gfx1013, translates and runs
 vk_compute_test. hw runs the same programs natively on the AMD GPU through tools/hw_oracle/ (wave32 and native wave64,
 64 threads) and compares them with the model, so it tests the model, not the translator; it exits 77 when the tools
-are missing. The forms are the ones with the same meaning on GFX10 and GFX11; what differs is listed in
+are missing. On the hardware both families also run on GFX11.7 and GFX12; mem's gfx12 kernels are respelled by
+gfx12_lines (null soffset, the split wait counters, global_inv). The forms are the ones
+with the same meaning on GFX10 and GFX11; what differs is listed in
 docs/shader_validation.md ("16-bit and memory ops on the GPU"). --negative-control checks that wrong models are caught.
 
 Each program is one 64-thread group (wave64, or two wave32s). Every thread stores 16 result VGPRs (v20..v35); the
@@ -36,17 +38,22 @@ llvmpipe at 8 lanes); wave64 programs translated with --emulate use no subgroup 
 
 Needs llvm-mc 21 or newer for --family f16 (docs/testing.md): llvm-mc 18 rejects op_sel on the 16-bit integer VOP3
 forms, so no f16 program assembles and the run stops with exit code 2. --family mem assembles with 18.
+Usage: `python -I tools/valu_fuzz.py --help` lists the options.
 """
 import argparse
 import json
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
 import shutil
 import tempfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
+from itertools import islice
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +62,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
 from hw_oracle import asm  # noqa: E402
+from check import gpu_test_timeout, timed_out  # noqa: E402
 from compute_fixture import compute_header, find_test_program, unpinned_subgroup  # noqa: E402
 
 THREADS = 64
@@ -581,9 +589,39 @@ def word3(mode, fam):
     """V# word 3 for a 32_FLOAT buffer with identity DST_SEL and OOB_SELECT = mode. GFX10 and GFX11 keep DST_SEL
     [11:0] and OOB_SELECT [29:28] where they were; FORMAT is 7 bits [18:12] on GFX10 (22 = 32_FLOAT) and 6 bits
     [17:12] on GFX11 (22 = 32_FLOAT too), and GFX10 has RESOURCE_LEVEL in bit 24, which GFX11 dropped (Mesa
-    gfx10-rsrc.json and gfx11-rsrc.json). TYPE [31:30] must be 0 on GFX11."""
+    gfx10-rsrc.json and gfx11-rsrc.json). TYPE [31:30] must be 0 on GFX11. GFX12 keeps GFX11's fields and FORMAT
+    table (gfx12-rsrc.json: 32_FLOAT = 22) and adds STRIDE_SCALE [19:18] and the compression bits [27:24], all left
+    0 here; word 1 (BASE_ADDRESS_HI [15:0], STRIDE [29:16]) is the same on all three."""
     w = 0xFAC | (22 << 12) | (mode << 28)
-    return w | (1 << 24) if fam == "gfx10" else w
+    if fam == "gfx10":
+        return w | (1 << 24)
+    if fam in ("gfx11", "gfx12"):
+        return w
+    raise ValueError(f"no V# word 3 layout for {fam}")
+
+
+# GFX12 spellings of the mem kernels' waits, cache invalidation and soffset (AMD clang, rocm-sdk-core 10.0.0, gfx1200):
+# s_waitcnt_vscnt is gone (s_wait_storecnt); the legacy s_waitcnt vmcnt/lgkmcnt forms still assemble, but to the old
+# encoding, so the split counters are named (loads: loadcnt, scalar memory: kmcnt); buffer_gl0_inv/gl1_inv are gone
+# (global_inv); and a MUBUF soffset must be an SGPR or null, not the literal 0 ("operands are not valid").
+GFX12_SPELLING = {"s_waitcnt_vscnt null, 0x0": ["s_wait_storecnt 0x0"],
+                  "s_waitcnt vmcnt(0)": ["s_wait_loadcnt 0x0"],
+                  "s_waitcnt lgkmcnt(0)": ["s_wait_kmcnt 0x0"],
+                  "buffer_gl0_inv": ["global_inv scope:SCOPE_DEV"],
+                  "buffer_gl1_inv": []}
+
+
+def gfx12_lines(lines):
+    """The mem kernel body in GFX12 spelling: GFX12_SPELLING, and soffset 0 written as null."""
+    out = []
+    for ln in lines:
+        if ln in GFX12_SPELLING:
+            out += GFX12_SPELLING[ln]
+        elif ln.startswith("buffer_"):
+            out.append(re.sub(r"(s\[\d+:\d+\]), 0\b", r"\1, null", ln))
+        else:
+            out.append(ln)
+    return out
 
 
 def buffer_dword_ok(mode, n_rec, stride, idx, off, offs, k):
@@ -741,7 +779,8 @@ class MemFamily(Family):
         return self.body("gfx10", False)
 
     def hw_body(self, fam):
-        return self.body(fam, True)
+        lines = self.body(fam, True)
+        return gfx12_lines(lines) if fam == "gfx12" else lines
 
     def hw_tail(self, fam):
         # the scratch area is in the output buffer already; the results are stored by hw_lines
@@ -811,6 +850,23 @@ def programs(family, seed, count, waves, skip=()):
     return [cls(seed, i, w, skip) for i in range(count) for w in waves]
 
 
+def hw_family_skip_reason(family, arch):
+    """Why --family FAMILY cannot run natively on this GPU, or None. Checked by assembling what the generator emits
+    (AMD clang, LLVM 23 / rocm-sdk-core 10.0.0): the f16 kernels assemble clean for gfx1150, gfx1170 and gfx1201
+    (300 programs per wave size each, 0 rejected), so f16 runs on GFX11.7 and GFX12 like on any GFX11; the mem
+    kernels assemble clean for gfx1150 and gfx1170, and for gfx12xx in GFX12 spelling (gfx12_lines: the split wait
+    counters, global_inv, and a null soffset, without which every buffer_load/store_b* form is rejected with
+    "operands are not valid for this GPU or mode"). A family whose V# layout word3() does not know is refused."""
+    from hw_oracle import asm
+    if family != "mem":
+        return None
+    try:
+        word3(0, asm.family(arch))
+    except ValueError as e:
+        return f"{arch}: {e}"
+    return None
+
+
 def compare(p, data):
     """Differences between the model and the dumped words. p.uncertain_words is set to how many result words had a
     half the model does not judge (so a summary can show how many comparisons were skipped)."""
@@ -838,7 +894,7 @@ def pc_tail_env():
     return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def translate(progs, work, emulate, pc_tail=False):
+def translate(progs, work, emulate, pc_tail=False, *, asm_jobs=1):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     for d in (disasm, fssm, spirv):
         if d.exists():
@@ -846,7 +902,8 @@ def translate(progs, work, emulate, pc_tail=False):
     for d in (disasm, fssm):
         d.mkdir(parents=True)
     mc = mc_command.mc_command()
-    for p in progs:
+
+    def assemble(p):
         text = p.asm()
         asm_path = work / (p.name + ".asm")
         asm_path.write_text(text, encoding="utf-8", newline="\n")
@@ -859,6 +916,22 @@ def translate(progs, work, emulate, pc_tail=False):
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
         (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8", newline="\n")
         (fssm / (p.name + ".fssm")).write_bytes(compute_header(asm_path))
+
+    if asm_jobs == 1:
+        for p in progs:
+            assemble(p)
+    else:
+        with ThreadPoolExecutor(max_workers=asm_jobs) as pool:
+            # Refill a small window in input order to bound the queue and report the first failure by program order.
+            remaining = iter(progs)
+            window = min(2 * asm_jobs, sys.maxsize)
+            pending = deque(pool.submit(assemble, p) for p in islice(remaining, window))
+            for p in remaining:
+                pending.popleft().result()
+                pending.append(pool.submit(assemble, p))
+            for job in pending:
+                job.result()
+
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
         cmd.append("--wave64-emulate")
@@ -886,7 +959,11 @@ def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
         env["VKC_SUBGROUP_SIZE"] = "32"
     if index_entry.get("subgroup_size") and not emulate:
         env["VKC_SUBGROUP_SIZE"] = str(index_entry["subgroup_size"])
-    r = subprocess.run(args, capture_output=True, text=True, env=env)
+    limit = gpu_test_timeout()
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=limit)
+    except subprocess.TimeoutExpired:
+        return 1, timed_out(exe, limit)
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
@@ -974,11 +1051,22 @@ def negative_control(oracle, a, waves):
 def run_translator(progs, a):
     """The translator path: assemble for gfx1013, translate, run with vk_compute_test. Returns an exit code."""
     a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
-    work = Path(a.work).resolve() if a.work else Path(tempfile.mkdtemp(prefix=f"{a.family}_fuzz_"))
-    work.mkdir(parents=True, exist_ok=True)
-    pc_tail = bool(getattr(a, "pc_tail_ubo", False))
     try:
-        index, log = translate(progs, work, a.emulate, pc_tail=True) if pc_tail else translate(progs, work, a.emulate)
+        parent = Path(a.work).resolve() if a.work else None
+        if parent is not None:
+            parent.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=f"{a.family}_fuzz_", dir=parent))
+    except OSError as e:
+        print(f"ERROR: cannot create work directory: {e}", file=sys.stderr)
+        return 2
+    print(f"work dir {work}")
+    pc_tail = bool(getattr(a, "pc_tail_ubo", False))
+    translate_options = {"pc_tail": True} if pc_tail else {}
+    asm_jobs = getattr(a, "asm_jobs", 1)
+    if asm_jobs != 1:
+        translate_options["asm_jobs"] = asm_jobs
+    try:
+        index, log = translate(progs, work, a.emulate, **translate_options)
     except RuntimeError as e:
         print(e)
         return 2
@@ -1002,7 +1090,9 @@ def run_translator(progs, a):
             continue
         # A wave32 program needs 32-lane subgroups. Where vk_compute_test couldn't pin them, its words come from
         # another wave size and are no evidence either way. --wave64-emulate output uses no subgroup operations.
-        lanes = unpinned_subgroup(msg) if p.wave == 32 else None
+        # Only a run that succeeded is skipped for that: a failed one is a harness error even when it printed the
+        # warning first, or a crash after it would be counted as a skip and the run could still pass.
+        lanes = unpinned_subgroup(msg) if rc == 0 and p.wave == 32 else None
         if lanes:
             skipped += 1
             print(f"SKIP {p.name}: the device can't run it at {lanes} lanes "
@@ -1037,13 +1127,15 @@ def main():
     ap.add_argument("--family", choices=sorted(FAMILIES), required=True)
     ap.add_argument("--programs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--asm-jobs", type=int, default=1, metavar="N",
+                    help="assemble translator fixtures with N concurrent llvm-mc processes (default: 1)")
     ap.add_argument("--wave", choices=("64", "32", "both"), default="both")
     ap.add_argument("--emulate", action="store_true", help="translate with --wave64-emulate, run at subgroup 32")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="translate with --pc-tail-ubo and run vk_compute_test with LEONIDA_PC_TAIL_UBO=1 "
                          "(128-byte push constants; also set by LEONIDA_PC_TAIL_UBO=1)")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
-    ap.add_argument("--work", default=None, help="keep the generated .asm and SPIR-V here")
+    ap.add_argument("--work", default=None, help="keep each run's generated .asm and SPIR-V in a new subfolder here")
     ap.add_argument("--model-only", action="store_true")
     ap.add_argument("--show", default=None, metavar="SEED:INDEX[:WAVE]")
     ap.add_argument("--max-report", type=int, default=8)
@@ -1068,6 +1160,8 @@ def main():
     W3_LAYOUT = "gfx10" if a.gfx10_word3 else None
     if a.programs < 1 or a.max_report < 1:
         ap.error("--programs and --max-report must be at least 1")
+    if a.asm_jobs < 1:
+        ap.error("--asm-jobs must be at least 1")
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
@@ -1086,6 +1180,17 @@ def main():
         except runner.Unavailable as e:
             print(f"hardware oracle unavailable: {e}")
             return 77
+        from hw_oracle import asm
+        why = hw_family_skip_reason(a.family, oracle.arch)
+        if why:
+            oracle.close()
+            print(f"hardware oracle unavailable: {why}")
+            return 77
+        if W3_LAYOUT == "gfx10" and asm.family(oracle.arch) == "gfx12":
+            # GFX10's RESOURCE_LEVEL bit 24 is WRITE_COMPRESS_ENABLE in gfx12-rsrc.json: not an informational change there
+            oracle.close()
+            print(f"error: --gfx10-word3 sets V# word 3 bit 24, which is WRITE_COMPRESS_ENABLE on {oracle.arch}")
+            return 2
         print(f"hardware oracle: {oracle.device}")
     if a.show is not None:
         parts = a.show.split(":")

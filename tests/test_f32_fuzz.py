@@ -92,6 +92,30 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(status, "skip")
         self.assertIn("denormal", detail)
 
+    def test_fmamk_madmk_operand_order_and_translator(self):
+        # S0 * K + S2 = 2.0 * 3.0 + 4.0 = 10.0 (whereas S0 * S2 + K would be 11.0).
+        vals = [0] * len(ff.SEED_REGS)
+        vals[0], vals[1] = ff.bits(2.0), ff.bits(4.0)
+        srcs = [(0, {}), ("k", ff.bits(3.0)), (1, {})]
+        for op in ("v_fmamk_f32", "v_madmk_f32"):
+            with self.subTest(op=op):
+                got_model = ff.model(op, vals, srcs, [])
+                self.assertEqual(got_model, [ff.bits(10.0), 0])
+                self.assertEqual(ff.line(op, vals, srcs, False, []),
+                                 f"{op} v8, v0, 0x{ff.bits(3.0):x}, v1")
+                status, words = ff.run_translated(ff.listing(op, vals, srcs, False, [])[0])
+                self.assertEqual((status, words[:2]), ("ok", got_model))
+
+
+class CliTests(unittest.TestCase):
+    TOOL = os.path.join(ROOT, "tools", "f32_fuzz.py")
+
+    def test_no_arguments_prints_usage(self):
+        r = subprocess.run([sys.executable, "-I", self.TOOL], capture_output=True, text=True, timeout=5)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("usage:", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
 
 class HardwareOracle(unittest.TestCase):
     """--oracle hw: kernel text, verdicts, GFX11 skips and the exit-77 contract (no GPU needed), plus a run on the
@@ -109,9 +133,15 @@ class HardwareOracle(unittest.TestCase):
         self.assertEqual(ff.hw_lines(c, "gfx1030")[-2], "global_store_dwordx2 v20, v[8:9], s[2:3]")
         self.assertEqual(len(ff.hw_lines(c, "gfx1150", guard=False)), len(lines) - 1)
 
+    def test_packed_u8_hardware_verdict_compares_raw_bytes(self) -> None:
+        case = self.case("v_cvt_pk_u8_f32", [0x43000000, 0, 0x7FC00000],
+                         [(0, {}), (1, {}), (2, {})], e64=True)
+        self.assertEqual(ff.hw_verdict(case, [0x7FC00080, 0]), ("match", [0x7FC00080, 0]))
+        self.assertEqual(ff.hw_verdict(case, [0x7FC00081, 0]), ("mismatch", [0x7FC00080, 0]))
+
     def test_removed_opcodes_are_skipped_not_substituted(self):
         from hw_oracle import asm
-        for op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_mad_legacy_f32"):
+        for op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_madmk_f32", "v_mad_legacy_f32"):
             self.assertIn(op, asm.valu_skip_reason(op, "gfx1150"))
             self.assertIn(op, asm.valu_skip_reason(op, "gfx1030"))
             self.assertIsNone(asm.valu_skip_reason(op, "gfx1013"))
@@ -198,6 +228,11 @@ class HardwareOracle(unittest.TestCase):
             oracle = runner.open_oracle()
         except runner.Unavailable as e:
             self.skipTest(f"hardware oracle unavailable: {e}")
+        from hw_oracle import asm
+        why = asm.rdna23_skip_reason(oracle.arch)
+        if why:
+            oracle.close()
+            self.skipTest(why)
         try:
             ff.hw_probe_modes(oracle)
             cases = ff.gen_cases(300, 21, tuple(ff.ALL_OPS)) + ff.gen_probes(2, 21, tuple(ff.ALL_OPS))

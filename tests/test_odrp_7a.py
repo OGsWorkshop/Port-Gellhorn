@@ -601,6 +601,43 @@ class ArchiveAndCliTest(unittest.TestCase):
         self.assertEqual(table[0], odrp_7a.COLUMNS)
         self.assertEqual(len(table), 6)
 
+    def test_reports_can_be_replaced_inside_the_carve_folder(self):
+        folder = os.path.join(self.root, "carved")
+        os.mkdir(folder)
+        source = os.path.join(folder, "00000001.bin")
+        with open(source, "wb") as f:
+            f.write(self.meta_single)
+        for name in ("report.json", "report.csv"):
+            with self.subTest(name=name):
+                out = os.path.join(folder, name)
+                with open(out, "wb") as f:
+                    f.write(b"old report")
+                result = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet"],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with open(out, "rb") as f:
+                    self.assertNotEqual(f.read(), b"old report")
+        with open(source, "rb") as f:
+            self.assertEqual(f.read(), self.meta_single)
+
+    def test_report_alias_to_a_binary_payload_is_rejected(self):
+        folder = os.path.join(self.root, "carved")
+        os.mkdir(folder)
+        source = os.path.join(folder, "00000001.bin")
+        alias = os.path.join(folder, "report.json")
+        with open(source, "wb") as f:
+            f.write(self.meta_single)
+        try:
+            os.link(source, alias)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(str(e))
+        result = subprocess.run([sys.executable, "-I", TOOL, folder, alias, "--quiet"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("would overwrite", result.stderr)
+        with open(source, "rb") as f:
+            self.assertEqual(f.read(), self.meta_single)
+
     def test_cli_validation_and_error_handling(self):
         # Bad numeric flags exit 2 without creating output.
         for flag, value, message in (
@@ -711,6 +748,36 @@ class ArchiveAndCliTest(unittest.TestCase):
             for m in created:
                 if not m.closed:
                     m.close()
+
+    def test_failed_output_write_preserves_existing_json_and_csv_reports(self):
+        real_named_temp = tempfile.NamedTemporaryFile
+
+        def failing(*args, **kwargs):
+            handle = real_named_temp(*args, **kwargs)
+
+            def fail_write(data):
+                handle.file.write(data[:4])
+                raise OSError(28, "No space left on device")
+
+            handle.write = fail_write
+            return handle
+
+        for name, old_text in (("kept.json", '{"previous": true}\n'), ("kept.csv", "offset,kind\n0x0,old\n")):
+            out = os.path.join(self.root, name)
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(old_text)
+            for label, patch in (
+                ("write", unittest.mock.patch.object(odrp_7a.tempfile, "NamedTemporaryFile", side_effect=failing)),
+                ("replace", unittest.mock.patch.object(odrp_7a.os, "replace",
+                                                       side_effect=PermissionError(13, "Permission denied"))),
+            ):
+                with self.subTest(name=name, label=label), patch:
+                    with self.assertRaises(SystemExit) as cm:
+                        odrp_7a.main([self.rpf, out, "--quiet"])
+                    self.assertNotEqual(cm.exception.code, 0)
+                    with open(out, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), old_text)
+                    self.assertFalse([n for n in os.listdir(self.root) if n.startswith(".odrp_7a-")])
 
 
 if __name__ == "__main__":

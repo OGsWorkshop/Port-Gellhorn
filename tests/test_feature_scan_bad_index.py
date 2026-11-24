@@ -33,10 +33,24 @@ class BadFeatureScanIndexTest(unittest.TestCase):
         argv = [sys.executable, "-I", str(TOOL), str(shaders)]
         if out:
             argv += ["--out", str(out)]
-        return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=60)
+        return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, errors="replace", timeout=60)
 
     def assert_clean(self, result):
         self.assertNotIn("Traceback", result.stderr, result.stderr)
+
+    def test_report_write_failure_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            shaders = make_work(td, [])
+            blocker = Path(td) / "blocker"
+            blocker.write_bytes(b"keep")
+            for out in (Path(td), blocker / "report.json"):
+                with self.subTest(out=out):
+                    result = self.run_scan(shaders, out)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(f"ERROR: cannot write {out}", result.stderr)
+                    self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                    self.assert_clean(result)
+            self.assertEqual(blocker.read_bytes(), b"keep")
 
     def test_non_object_spirv_indexes_are_empty_counts(self):
         for value in (None, 42, True, "x"):

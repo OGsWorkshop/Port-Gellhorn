@@ -2,10 +2,13 @@
 // SetPrivateData, SetPrivateDataInterface and SetName (runtime/shims/d3d12_com_object.h, D3D-24). The same script
 // runs on the device and on a fence, a committed buffer, a command allocator and a descriptor heap of each device,
 // and records every HRESULT, every size the call writes back, the bytes it reads and the reference count of an
-// interface the object holds. The two records must be the same, step by step. No shaders or game data. Skips (77)
-// without a Vulkan GPU; without a host D3D12 device only the layer's own record is printed. Set
-// LEONIDA_D3D49_VERBOSE=1 to print every step.
+// interface the object holds. The two records must be the same, step by step, and the same as Microsoft's answers
+// recorded in d3d12_private_data_answers.h, which is what Wine and Proton check (their host D3D12 is vkd3d). No
+// shaders or game data. Skips (77) without a Vulkan GPU. Set LEONIDA_D3D49_VERBOSE=1 to print every step, and
+// LEONIDA_D3D49_DUMP=1 to print the host's record in the answers file's format (Windows only).
 #include "vk_test_device.h"
+#include "host_wine.h"
+#include "d3d12_private_data_answers.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -51,7 +54,7 @@ public:
 
 // WKPDID_D3DDebugObjectName / ...NameW (d3dcommon.h), spelled out so nothing needs dxguid.lib.
 constexpr GUID kName{0x429b8c22, 0x9188, 0x4b0c, {0x87, 0x42, 0xac, 0xb0, 0xbf, 0x85, 0xc2, 0x00}};
-constexpr GUID kNameW{0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x99, 0xd2, 0x86, 0x6a, 0x3e, 0x5f, 0x7e}};
+constexpr GUID kNameW{0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
 
 // A key of its own for each step, so no step sees another's entry.
 GUID key(unsigned step) { return GUID{0x5eed0000u + step, 0x1d3d, 0x4c12, {0x9a, 0x41, 0x77, 0x10, 0x2b, 0x6c, 0x00, 0x01}}; }
@@ -314,32 +317,49 @@ int main() {
                                              reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
                                        : nullptr;
         Ref<ID3D12Device> host;
-        if (!create_host || FAILED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
-            std::printf("private data: no host D3D12 device to compare with; %zu steps recorded, not compared\n",
-                        ours.values.size());
-        } else {
-            Record theirs;
+        Record theirs;
+        if (create_host && !hostwine::host_is_wine() &&
+            SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
             EXPECT(record(host.p, theirs));
-            EXPECT(theirs.names == ours.names);
+        if (GetEnvironmentVariableA("LEONIDA_D3D49_DUMP", nullptr, 0) > 0) {
+            if (!host.p) {
+                std::fprintf(stderr, "LEONIDA_D3D49_DUMP prints Microsoft's runtime's record: run it on Windows\n");
+                return 1;
+            }
+            for (std::size_t i = 0; i < theirs.values.size(); ++i)
+                std::printf("    {\"%s\", 0x%llxull},\n", theirs.names[i].c_str(),
+                            static_cast<unsigned long long>(theirs.values[i]));
+            return 0;
+        }
+        Record recorded;
+        for (const PrivateDataAnswer& a : kPrivateDataAnswers) recorded.add(a.name, a.value);
+        const auto compare = [&](const char* against, const Record& ref) {
+            if (ref.names != ours.names) {
+                std::fprintf(stderr, "private data: the steps differ from %s's\n", against);
+                return 1;
+            }
             int mismatches = 0, faulted = 0;
             for (std::size_t i = 0; i < ours.values.size(); ++i) {
-                if (theirs.values[i] == kFaulted) {  // SetName(nullptr): the host faults; the layer clears the name
-                    std::printf("private data %s: the host faults, not compared (ours 0x%llx)\n",
-                                ours.names[i].c_str(), static_cast<unsigned long long>(ours.values[i]));
+                if (ref.values[i] == kFaulted) {  // SetName(nullptr): the host faults; the layer clears the name
+                    if (verbose)
+                        std::printf("private data %s: the host faults, not compared (ours 0x%llx)\n",
+                                    ours.names[i].c_str(), static_cast<unsigned long long>(ours.values[i]));
                     ++faulted;
                     continue;
                 }
-                const bool same = ours.values[i] == theirs.values[i];
+                const bool same = ours.values[i] == ref.values[i];
                 if (verbose || !same)
-                    std::printf("private data %s: ours 0x%llx host 0x%llx%s\n", ours.names[i].c_str(),
-                                static_cast<unsigned long long>(ours.values[i]),
-                                static_cast<unsigned long long>(theirs.values[i]), same ? "" : "  MISMATCH");
+                    std::printf("private data %s: ours 0x%llx, %s 0x%llx%s\n", ours.names[i].c_str(),
+                                static_cast<unsigned long long>(ours.values[i]), against,
+                                static_cast<unsigned long long>(ref.values[i]), same ? "" : "  MISMATCH");
                 mismatches += !same;
             }
-            std::printf("private data: %zu steps compared with the host (%d more the host faults on), %d mismatches\n",
-                        ours.values.size() - faulted, faulted, mismatches);
-            EXPECT(mismatches == 0);
-        }
+            std::printf("private data: %zu steps compared with %s (%d more the host faults on), %d mismatches\n",
+                        ours.values.size() - faulted, against, faulted, mismatches);
+            return mismatches;
+        };
+        if (host.p) EXPECT(compare("the host", theirs) == 0);
+        EXPECT(compare("Microsoft's recorded answers", recorded) == 0);
     }
     std::printf("d3d12_private_data_test: OK\n");
     return 0;

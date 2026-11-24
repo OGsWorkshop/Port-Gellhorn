@@ -16,16 +16,29 @@ What is modelled, per instruction:
     constants), integer inline constants -16..64, float inline constants (0.5, 1.0, 2.0, 4.0, their negatives and
     1/(2*pi)) as their f32 bits, and 32-bit literals. An e32 VOP2 has a VGPR in src1 and a literal only in src0; a
     VOP3 form has at most one literal and at most two scalar values (SGPRs and the literal: the GFX10 constant bus).
+    The 64-bit shifts take one scalar value: with an SGPR pair as S1, S0 is a VGPR or an inline constant.
   * v_mad_u32_u16 / v_mad_i32_i16 with op_sel on the two 16-bit sources (the high halves). A literal there has 16
     bits (zero-extended: its high half is 0); a float inline constant is its f32 bits (high half 0x3f00 for 0.5).
   * v_bfe_u32 / v_bfe_i32: offset and width are their low 5 bits, and the field stops at bit 31
     (width = min(width, 32 - offset), as for s_bfe in tools/salu_diff.py).
   * v_perm_b32: the selector bytes 0..7 pick a byte of {src0, src1}, 8..11 replicate a sign bit, 12 is 0x00,
     13 and up 0xff.
-Every rule was checked against an RDNA2 GPU (AMD Radeon iGPU, gfx1036, Windows driver 26.10.1) with --oracle hw.
+  * clamp (CLAMP_OPS) on the add/sub without carry-out, in the e64 / VOP3 form: v_add_nc_u32, v_sub_nc_u32 and
+    v_subrev_nc_u32 saturate to [0, 0xffffffff], v_add_nc_i32 and v_sub_nc_i32 to [0x80000000, 0x7fffffff]; without
+    clamp they wrap.
+  * the 64-bit shifts (OPS64): v_lshlrev_b64, v_lshrrev_b64, v_ashrrev_i64 shift S1 by S0 & 63 into a VGPR pair. S0
+    is any 32-bit source; S1 is a VGPR pair (aligned or not), an SGPR pair, or an integer inline constant
+    sign-extended to 64 bits. Their constant-bus limit is one on GFX10: llvm-mc and COMGR reject
+    `v_lshrrev_b64 v[2:3], 0x12345678, s[4:5]` and `..., s4, s[6:7]` ("violates constant bus restrictions").
+Every rule above the clamp and 64-bit shift bullets was checked against an RDNA2 GPU (AMD Radeon iGPU, gfx1036, Windows
+driver 26.10.1) with --oracle hw. The clamp and 64-bit shift rules are the docs/design.md rows ("Integer clamp",
+"Vector integer additions") measured on gfx1035 with tools/int_hw_probe.py (SHADER-137); --oracle hw generates them,
+but this tool has not run them on a GPU yet.
 
-Not generated: VOP3 neg/abs/clamp/omod on integer ops, DPP and SDWA forms (tools/sdwa_diff.py), 16-bit and packed
-ops, carries and anything that depends on other lanes (tools/wint_diff.py), 64-bit ops.
+Not generated: VOP3 neg/abs/omod on integer ops, clamp on the other integer ops, DPP and SDWA forms
+(tools/sdwa_diff.py), 16-bit and packed ops, carries and anything that depends on other lanes (tools/wint_diff.py),
+64-bit ops other than the three shifts. A 32-bit literal or a float inline constant as the 64-bit source of a shift is
+not generated either: how either is widened to 64 bits for an integer operand is not measured.
 
 Known divergences (KNOWN_DIVERGENCES): by default the generator leaves out the forms where the translator is known to
 differ from the hardware, so that a run shows new problems only; --known puts them back (a hardware-only run always
@@ -69,11 +82,14 @@ if SEM_DIR not in sys.path:
     sys.path.insert(0, SEM_DIR)
 
 M32 = 0xFFFFFFFF
+M64 = (1 << 64) - 1
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 VREGS = tuple(range(0, 8)) + tuple(range(12, 20))   # data VGPRs; v8..v11 are the observation
 SREGS = tuple(range(4, 20))                          # data SGPRs
 MASKS = ("s20", "s21", "vcc_lo")
+VPAIRS = tuple(v for v in VREGS if v + 1 in VREGS)   # v[n:n+1] with both halves data VGPRs; GFX10 takes odd n too
+SPAIRS = tuple(range(SREGS[0], SREGS[-1], 2))        # s[n:n+1], n even
 N_SEED = len(VREGS) + len(SREGS)
 N_OBS = 4
 INLINE_F = {"0.5": 0x3F000000, "-0.5": 0xBF000000, "1.0": 0x3F800000, "-1.0": 0xBF800000, "2.0": 0x40000000,
@@ -94,6 +110,11 @@ class RefError(Exception):
 def s32(x):
     x &= M32
     return x - (1 << 32) if x >> 31 else x
+
+
+def s64(x):
+    x &= M64
+    return x - (1 << 64) if x >> 63 else x
 
 
 def sx(x, bits):
@@ -171,6 +192,8 @@ OPS = {
     "v_mul_hi_i32_i24": ("vop2", 2, lambda a, b: ((sx(a, 24) * sx(b, 24)) >> 32) & M32),
     "v_mul_u32_u24": ("vop2", 2, lambda a, b: ((a & 0xFFFFFF) * (b & 0xFFFFFF)) & M32),
     "v_mul_hi_u32_u24": ("vop2", 2, lambda a, b: ((a & 0xFFFFFF) * (b & 0xFFFFFF)) >> 32),
+    "v_add_nc_i32": ("vop3", 2, lambda a, b: (a + b) & M32),
+    "v_sub_nc_i32": ("vop3", 2, lambda a, b: (a - b) & M32),
     "v_add3_u32": ("vop3", 3, lambda a, b, c: (a + b + c) & M32),
     "v_lshl_add_u32": ("vop3", 3, lambda a, b, c: ((a << (b & 31)) + c) & M32),
     "v_add_lshl_u32": ("vop3", 3, lambda a, b, c: (((a + b) & M32) << (c & 31)) & M32),
@@ -204,7 +227,23 @@ OPS = {
     "v_cvt_pk_i16_i32": ("vop3", 2, lambda a, b: (sat(s32(a), -32768, 32767) & 0xFFFF)
                          | ((sat(s32(b), -32768, 32767) & 0xFFFF) << 16)),
 }
+# The 64-bit shifts: D (a VGPR pair) = S1 (64 bits) shifted by S0 & 63. Their encoding is "vop3_64".
+OPS64 = {
+    "v_lshlrev_b64": lambda a, b: (b << (a & 63)) & M64,
+    "v_lshrrev_b64": lambda a, b: b >> (a & 63),
+    "v_ashrrev_i64": lambda a, b: (s64(b) >> (a & 63)) & M64,
+}
+OPS.update({name: ("vop3_64", 2, fn) for name, fn in OPS64.items()})
 OP_SEL_OPS = ("v_mad_u32_u16", "v_mad_i32_i16")
+# The VOP3 clamp bit on the add/sub without carry-out saturates instead of wrapping (docs/design.md "Integer clamp").
+I32_MIN, I32_MAX = -(1 << 31), (1 << 31) - 1
+CLAMP_OPS = {
+    "v_add_nc_u32": lambda a, b: min(a + b, M32),
+    "v_sub_nc_u32": lambda a, b: max(a - b, 0),
+    "v_subrev_nc_u32": lambda a, b: max(b - a, 0),
+    "v_add_nc_i32": lambda a, b: sat(s32(a) + s32(b), I32_MIN, I32_MAX) & M32,
+    "v_sub_nc_i32": lambda a, b: sat(s32(a) - s32(b), I32_MIN, I32_MAX) & M32,
+}
 CMPS = {
     "eq_u32": lambda a, b: a == b, "ne_u32": lambda a, b: a != b, "lt_u32": lambda a, b: a < b,
     "le_u32": lambda a, b: a <= b, "gt_u32": lambda a, b: a > b, "ge_u32": lambda a, b: a >= b,
@@ -281,6 +320,21 @@ class Gen:
                 out.append(c)
         return out
 
+    def src64(self):
+        """The 64-bit source of a shift: a VGPR pair, an SGPR pair or an integer inline constant."""
+        r = self.r
+        k = r.random()
+        if k < 0.45:
+            n = r.choice(VPAIRS)
+            return f"v[{n}:{n + 1}]"
+        if k < 0.8:
+            n = r.choice(SPAIRS)
+            return f"s[{n}:{n + 1}]"
+        return str(r.randint(-16, 64))
+
+    def clamp(self, name):
+        return " clamp" if name in CLAMP_OPS and self.r.random() < 0.5 else ""
+
     def op(self, ops):
         r = self.r
         name = r.choice(ops)
@@ -301,8 +355,18 @@ class Gen:
         if enc == "vop2":
             if r.random() < 0.5:
                 return [f"{name}_e32 v{d}, {', '.join(self.srcs(2, False, True))}"]
-            return [f"{name}_e64 v{d}, {', '.join(self.srcs(2, True))}"]
+            return [f"{name}_e64 v{d}, {', '.join(self.srcs(2, True))}{self.clamp(name)}"]
+        if enc == "vop3_64":
+            src = self.src64()
+            sh = self.srcs(1, True)[0]
+            # the 64-bit shifts read at most one scalar value (their GFX10 constant-bus limit is one): with an SGPR
+            # pair as S1, the shift count is a VGPR or an inline constant
+            if src.startswith("s[") and scalar(sh):
+                sh = self.vreg() if r.random() < 0.5 else str(r.randint(-16, 64))
+            n = r.choice(VPAIRS)
+            return [f"{name} v[{n}:{n + 1}], {sh}, {src}"]
         line = f"{name} v{d}, {', '.join(self.srcs(n, True, lit16=2 if name in OP_SEL_OPS else 0))}"
+        line += self.clamp(name)
         if name in OP_SEL_OPS and r.random() < 0.5:
             line += f" op_sel:[{r.randint(0, 1)},{r.randint(0, 1)},0,0]"
         return [line]
@@ -317,6 +381,13 @@ def observe(regs):
     return [f"v_mov_b32_e32 v{8 + i}, v{r}" for i, r in enumerate(regs)]
 
 
+def dests(line):
+    """The VGPRs an instruction line writes: v<n>, or both halves of v[n:n+1]."""
+    tok = line.split()[1].rstrip(",")
+    m = re.fullmatch(r"v\[(\d+):(\d+)\]", tok)
+    return list(range(int(m.group(1)), int(m.group(2)) + 1)) if m else [int(tok[1:])]
+
+
 def generate(rng, n_ops, ops):
     gen = Gen(rng)
     body = []
@@ -326,9 +397,9 @@ def generate(rng, n_ops, ops):
     for line in reversed(body):
         if line.startswith("v_cmp"):
             continue
-        dst = int(line.split()[1].rstrip(",")[1:])
-        if dst not in written:
-            written.append(dst)
+        for dst in dests(line):
+            if dst not in written:
+                written.append(dst)
     regs = written[:4]
     regs += [rng.choice(VREGS) for _ in range(4 - len(regs))]
     return seeds(rng) + body + observe(regs)
@@ -337,6 +408,11 @@ def generate(rng, n_ops, ops):
 # ---- the reference interpreter --------------------------------------------------------------------------------
 
 _OP_SEL = re.compile(r"\s+op_sel:\[([01,]+)\]\s*$")
+
+
+def scalar(tok):
+    """Whether a source token is read over the constant bus: an SGPR (or pair), VCC or a literal."""
+    return tok.startswith(("s", "vcc", "0x"))
 
 
 def value(tok, st):
@@ -351,17 +427,37 @@ def value(tok, st):
     return int(tok, 0) & M32
 
 
+def value64(tok, st):
+    """A 64-bit source: a register pair, or an integer inline constant sign-extended to 64 bits."""
+    m = re.fullmatch(r"([vs])\[(\d+):(\d+)\]", tok)
+    if m:
+        lo = int(m.group(2))
+        if int(m.group(3)) != lo + 1:
+            raise RefError(f"{tok} is not a register pair")
+        return value(f"{m.group(1)}{lo}", st) | value(f"{m.group(1)}{lo + 1}", st) << 32
+    if tok in INLINE_F or not -16 <= int(tok, 0) <= 64:
+        raise RefError(f"{tok}: only pairs and integer inline constants are modelled as a 64-bit source")
+    return int(tok, 0) & M64
+
+
 def reference(lines):
     """Run the program; returns the four exported words."""
     st = {"v": {}, "s": {}}
     for line in lines:
         op, _, rest = line.partition(" ")
         sel = None
+        clamp = rest.endswith(" clamp")
+        if clamp:
+            rest = rest[:-len(" clamp")]
         m = _OP_SEL.search(rest)
         if m:
             sel = [int(x) for x in m.group(1).split(",")]
             rest = rest[:m.start()]
         args = [a.strip() for a in rest.split(",")]
+        base = op[:-4] if op.endswith(("_e32", "_e64")) else op
+        # before the early returns below: an s_mov_b32, v_cmp or v_cndmask with clamp must not run either
+        if clamp and (base not in CLAMP_OPS or op.endswith("_e32")):
+            raise RefError(f"{op}: clamp is not modelled")
         if op == "s_mov_b32":
             st["s"][args[0]] = value(args[1], st)
             continue
@@ -372,13 +468,20 @@ def reference(lines):
         if op == "v_cndmask_b32_e64":
             st["v"][int(args[0][1:])] = value(args[2] if value(args[3], st) & 1 else args[1], st)
             continue
-        base = op[:-4] if op.endswith(("_e32", "_e64")) else op
         if base not in OPS:
             raise RefError(f"{op} is not modelled")
+        if base in OPS64:
+            if sum(scalar(a) for a in args[1:]) > 1:
+                raise RefError(f"{line}: a 64-bit shift reads one scalar value (GFX10 constant bus)")
+            n = dests(line)
+            r = OPS64[base](value(args[1], st), value64(args[2], st))
+            st["v"][n[0]], st["v"][n[1]] = r & M32, r >> 32
+            continue
         vals = [value(a, st) for a in args[1:]]
         if sel:
             vals = [v >> 16 if i < 2 and sel[i] else v for i, v in enumerate(vals)]
-        st["v"][int(args[0][1:])] = OPS[base][2](*vals) & M32
+        fn = CLAMP_OPS[base] if clamp else OPS[base][2]
+        st["v"][int(args[0][1:])] = fn(*vals) & M32
     return [st["v"].get(8 + i, 0) for i in range(4)]
 
 
@@ -413,11 +516,15 @@ def translated(lines, name="ps_vint"):
     return [w & M32 for w in out["%out_mrt0"]]
 
 
-def hw_kernel(lines):
-    """A raw kernel for tools/hw_oracle: the program on one lane, then v8..v11 stored at the output pointer."""
+def hw_kernel(lines, wave=32):
+    """A raw kernel for tools/hw_oracle: the program on one lane, then v8..v11 stored at the output pointer. wave 64
+    runs it in a wave64 wave with the lane masks as 64-bit pairs."""
     from hw_oracle import asm
+    if wave == 64:
+        import vk_fuzz_run
+        lines = [vk_fuzz_run.wave64_text(ln) for ln in lines]
     return asm.Kernel(list(lines) + ["v_mov_b32 v0, 0", "global_store_b128 v0, v[8:11], s[2:3]", "s_endpgm"],
-                      wave=32, threads=1, words=4, raw=True)
+                      wave=wave, threads=1, words=4, raw=True)
 
 
 # ---- comparison, shrinking, the run --------------------------------------------------------------------------
@@ -477,17 +584,26 @@ def shrink(lines, check_fn=check):
             i -= n
     used = set()
     for line in body + obs:
-        used |= set(re.findall(r"\b[vs]\d+\b", line.partition(" ")[2]))
+        text = line.partition(" ")[2]
+        used |= set(re.findall(r"\b[vs]\d+\b", text))
+        for kind, lo, hi in re.findall(r"\b([vs])\[(\d+):(\d+)\]", text):
+            used |= {f"{kind}{n}" for n in range(int(lo), int(hi) + 1)}
     seed = [line for line in seed if line.split()[1].rstrip(",") in used]
     return seed + body + obs
 
 
-def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None):
-    counts = {"pass": 0, "mismatch": 0, "skip": {}}
+def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None, wave=32, build=None, work=None,
+              vk_constants=False):
+    counts = {"pass": 0, "mismatch": 0, "skip": {}, "vk": {}, "vk_failures": []}
     failures = []
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
-    hw = oracle.run([hw_kernel(p) for p in progs]) if "hw" in backends else [None] * programs
+    hw = oracle.run([hw_kernel(p, wave) for p in progs]) if "hw" in backends else [None] * programs
+    if "vk" in backends:
+        import vk_fuzz_run
+        counts["vk"], counts["vk_failures"] = vk_fuzz_run.judge(progs, hw, vk_fuzz_run.exact_verdict, wave=wave,
+                                                                  build=build, work_parent=work, opaque=not vk_constants)
+    backends = tuple(b for b in backends if b != "vk")
     for i, lines in enumerate(progs):
         try:
             problem = check(lines, backends, hw[i])
@@ -538,12 +654,22 @@ def main(argv=None):
                     help="comma-separated comparison targets: translator (default), hw (natively on an AMD GPU; see "
                          "tools/hw_oracle/). 'hw' alone compares the hardware with the reference only")
     ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
+    ap.add_argument("--wave", type=int, choices=(32, 64), default=32,
+                    help="the wave size of the hardware kernels and of the vk programs (64 needs native 64-wide "
+                         "subgroups; lane 0 is judged)")
+    ap.add_argument("--build", default=os.path.join(os.path.dirname(HERE), "runtime", "build"),
+                    help="with vk: the folder with vk_compute_test")
+    ap.add_argument("--vk-constants", action="store_true",
+                    help="with vk: keep the seeds as literal v_mov_b32 constants (the driver may fold them)")
+    ap.add_argument("--work", default=None, help="with vk: a folder for the temporary files (VK_FUZZ_KEEP=1 keeps them)")
     a = ap.parse_args(argv)
     if a.programs < 1 or a.max_ops < 1:
         ap.error("--programs and --max-ops must be at least 1")
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
-    if not backends or any(t not in ("translator", "hw") for t in backends):
-        ap.error("--oracle takes translator, hw or translator,hw")
+    if not backends or any(t not in ("translator", "hw", "vk") for t in backends):
+        ap.error("--oracle takes translator, hw, vk (with hw) or a comma-separated mix")
+    if "vk" in backends and "hw" not in backends:
+        ap.error("--oracle vk judges the translated programs against the hardware's words: use --oracle hw,vk")
     global KNOWN, LITERALS
     KNOWN = a.known or backends == ("hw",)
     LITERALS = not a.no_literals
@@ -553,8 +679,9 @@ def main(argv=None):
                 print(f"{'cmp':20} VOPC e64 into s20/s21/vcc_lo + v_cndmask_b32_e64: {', '.join(sorted(CMPS))}")
                 continue
             enc, n, _ = OPS[name]
-            kind = "VOP3 only" if enc == "vop3" else f"{enc.upper()} e32/e64"
-            print(f"{name:20} {kind}, {n} sources{', op_sel' if name in OP_SEL_OPS else ''}")
+            kind = {"vop3": "VOP3 only", "vop3_64": "VOP3 only, 64-bit pair"}.get(enc, f"{enc.upper()} e32/e64")
+            extra = ", op_sel" if name in OP_SEL_OPS else ", clamp" if name in CLAMP_OPS else ""
+            print(f"{name:20} {kind}, {n} sources{extra}")
         return 0
     if a.self_test:
         return 0 if self_test() else 1
@@ -578,15 +705,26 @@ def main(argv=None):
             return 77
         print(f"hardware oracle: {oracle.device}")
     try:
-        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle)
+        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle, a.wave, a.build, a.work,
+                                     a.vk_constants)
+        vk_bad = counts.pop("vk_failures")
         skips = sum(counts["skip"].values())
         print(f"{a.programs} programs (seed {a.seed}, {'+'.join(backends)}{', known' if KNOWN else ''}): "
               f"{counts['pass']} pass, {counts['mismatch']} mismatch, {skips} skipped")
         for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
             print(f"  skip x{n}: {reason}")
 
+        want_vk = "vk" in backends
+        if want_vk:
+            print(f"translated on the Vulkan GPU (wave{a.wave}) against the hardware: "
+                  + ", ".join(f"{k} {n}" for k, n in sorted(counts["vk"].items(), key=lambda kv: kv[0].startswith("skip"))))
+            for i, detail, lines in vk_bad[: None if a.all_failures else 3]:
+                print(f"VK MISMATCH program {i}: {detail}")
+                print("\n".join("\t" + line for line in lines))
+        backends = tuple(b for b in backends if b != "vk")
+
         def check_fn(lines):
-            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l)])[0]) if oracle else None)
+            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l, a.wave)])[0]) if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")
@@ -597,7 +735,17 @@ def main(argv=None):
     finally:
         if oracle:
             oracle.close()
-    return 1 if failures else 0
+    if failures or vk_bad:
+        return 1
+    if not counts["pass"]:   # nothing was compared: every program was skipped
+        print("no program ran: every one was skipped")
+        return 2
+    if want_vk:
+        import vk_fuzz_run
+        if vk_fuzz_run.all_skipped(counts["vk"]):
+            print("no Vulkan program ran: every one was skipped")
+            return 2
+    return 0
 
 
 if __name__ == "__main__":

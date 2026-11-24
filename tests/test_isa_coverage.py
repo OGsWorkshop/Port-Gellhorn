@@ -9,6 +9,8 @@ otherwise.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -48,6 +50,10 @@ FIXTURE_XML = (
     + _ins("IMAGE_LOAD", "ENC_MIMG", "MIMG_NSA1")
     + _ins("S_ENDPGM", "ENC_SOPP")
     + _ins("EXP", "ENC_EXP")
+    + _ins("S_AND_SAVEEXEC_B64", "ENC_SOP1")
+    + _ins("S_XOR_SAVEEXEC_B64", "ENC_SOP1")
+    + _ins("V_SHR_HI", "ENC_VOP1")
+    + _ins("V_SHR_LO", "ENC_VOP1")
     + "</Instructions></ISA></Spec>")
 
 FIXTURE_SRC = '''
@@ -60,6 +66,8 @@ def base_op(op):
 
 
 class Gen:
+    LOGIC = {"and": 1, "or": 2}
+
     def _insn(self, ins):
         op = base_op(ins["op"])
         if op in ("s_denorm_mode",):
@@ -75,6 +83,12 @@ class Gen:
                 raise Unsupported(op + " form")
         elif op == "exp":
             pass
+        elif op.endswith("_saveexec_b64") and op[2:].split("_saveexec")[0] in self.LOGIC:
+            pass
+        elif op.endswith("_hi") and flag:
+            pass
+        elif op.endswith("_lo"):
+            raise Unsupported(op)
         else:
             raise Unsupported(op)
 
@@ -113,6 +127,27 @@ class LlvmProbeTests(unittest.TestCase):
                     self.assertEqual(ic.probe_llvm_mc("llvm-mc", [name]), {name: expected})
 
 
+class LlvmStallTests(unittest.TestCase):
+    def test_stalled_llvm_mc_is_one_error_not_a_traceback(self) -> None:
+        stalled = subprocess.TimeoutExpired(["llvm-mc"], 30)
+        with patch.object(ic.subprocess, "run", side_effect=stalled) as run:
+            probe = ic.probe_llvm_mc("llvm-mc", ["s_endpgm", "v_add_f32"])
+        self.assertEqual(list(probe), ["error"])
+        self.assertIn("did not answer", probe["error"])
+        self.assertEqual(run.call_count, 1)      # the remaining names are not each given the full timeout again
+
+    def test_main_reports_the_stall_next_to_each_name(self) -> None:
+        xml, src = _fixture(FIXTURE_XML, ".xml"), _fixture(FIXTURE_SRC, ".py")
+        self.addCleanup(os.unlink, xml)
+        self.addCleanup(os.unlink, src)
+        stalled = subprocess.TimeoutExpired(["llvm-mc"], 30)
+        out = io.StringIO()
+        with patch.object(ic.subprocess, "run", side_effect=stalled), contextlib.redirect_stdout(out):
+            code = ic.main(["--isa", xml, "--translator", src, "--llvm-mc", "llvm-mc"])
+        self.assertEqual(code, 0)
+        self.assertIn("did not answer", out.getvalue())
+
+
 class FixtureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -147,7 +182,16 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(c["v_fancy_f32"], "unknown")
         # op.startswith("global_") sits in a helper that is not the dispatch, so it must not count.
         self.assertEqual(c["global_load_dword"], "unknown")
-        self.assertEqual(self.rep["totals"], {"handled-exact": 6, "handled-family": 1, "refused": 1, "unknown": 3})
+        self.assertEqual(self.rep["totals"], {"handled-exact": 6, "handled-family": 2, "refused": 1, "unknown": 6})
+
+    def test_suffix_families(self):
+        c = self.rep["class"]
+        self.assertEqual(c["s_and_saveexec_b64"], "handled-family")
+        self.assertEqual(c["s_xor_saveexec_b64"], "unknown")
+        self.assertEqual(c["v_shr_hi"], "unknown")
+        self.assertEqual(c["v_shr_lo"], "unknown")
+        self.assertEqual(self.rep["suffixes"], {"_saveexec_b64": 1})
+        self.assertIn("Suffix families the dispatch tests with op.endswith", ic.markdown(self.rep))
 
     def test_partial_refusal_is_flagged_but_handled(self):
         self.assertEqual(self.rep["class"]["image_load"], "handled-exact")
@@ -227,7 +271,7 @@ class FixtureTests(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(ic.main(["--isa", self.xml, "--translator", self.src, "--json"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["instructions"], 11)
+        self.assertEqual(json.loads(out.getvalue())["instructions"], 15)
 
 
 class TranslatorScanTests(unittest.TestCase):
@@ -257,8 +301,6 @@ class RealIsaTests(unittest.TestCase):
     # Names the translator matches that AMD's RDNA2 XML does not list. Each one was looked at (docs/isa_coverage.md);
     # a name that is not here and not in the XML is a typo or a wrong-generation name and fails the test.
     KNOWN_NOT_IN_XML = {
-        "s_and_b32_mask": "no producer anywhere, not an LLVM mnemonic: dead name",
-        "s_or_b32_mask": "no producer anywhere, not an LLVM mnemonic: dead name",
         "s_delay_alu": "RDNA3 instruction, kept in NOOPS so RDNA3 text does not trip the translator",
         "s_get_waveid_in_workgroup": "gfx1013 per llvm-mc, missing from the XML",
         "v_mac_f32": "gfx1013 per llvm-mc, missing from the XML",
@@ -269,10 +311,10 @@ class RealIsaTests(unittest.TestCase):
         "v_mac_legacy_f32": "gfx1013 per llvm-mc (VOP2 v_mac_legacy_f32_e32), missing from the XML",
         "v_add_u16": "internal: v_add_nc_u16 is re-dispatched under this GFX9 spelling",
         "v_sub_u16": "internal: v_sub_nc_u16 is re-dispatched under this GFX9 spelling",
-        "v_subrev_u16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
-        "v_and_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
-        "v_or_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
-        "v_xor_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
+        "v_add_i16": "internal: v_add_nc_i16 is re-dispatched under this name",
+        "v_sub_i16": "internal: v_sub_nc_i16 is re-dispatched under this name",
+        "s_atc_probe": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
+        "s_atc_probe_buffer": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
     }
 
     @classmethod
@@ -290,6 +332,12 @@ class RealIsaTests(unittest.TestCase):
 
     def test_every_prefix_matches_something(self):
         self.assertEqual(self.rep["prefixes_without_rdna2_match"], [])
+
+    def test_saveexec_family_is_handled(self):
+        stems = ("and", "andn1", "andn2", "nand", "nor", "or", "orn1", "orn2", "xnor", "xor")
+        for w in ("b32", "b64"):
+            for k in stems:
+                self.assertEqual(self.rep["class"][f"s_{k}_saveexec_{w}"], "handled-family", (k, w))
 
 
 if __name__ == "__main__":

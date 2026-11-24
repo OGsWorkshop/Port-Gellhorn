@@ -159,7 +159,7 @@ class RigDictionaryTest(unittest.TestCase):
     def test_cli_writes_counts_only(self):
         out = os.path.join(self.tmp.name, "out.json")
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", self.rigs],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
@@ -182,7 +182,7 @@ class ReportPathTests(unittest.TestCase):
         write_rpf(self.rpf, streams)
 
     def run_tool(self, *args):
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, errors="replace")
 
     def test_out_must_not_overwrite_the_archive(self):
         with open(self.rpf, "rb") as f:
@@ -202,6 +202,19 @@ class ReportPathTests(unittest.TestCase):
         self.assertIn("would overwrite the --rigs input", r.stderr)
         with open(self.rigs, encoding="utf-8") as f:
             self.assertEqual(f.read(), before)
+
+    def test_incompatible_rig_report_is_a_path_specific_error(self):
+        out = os.path.join(self.tmp.name, "output.json")
+        for report in ([], {"summary": {}}, {"rbf0": {"rigsets": [{"entries": [{}]}]}}):
+            with self.subTest(report=report):
+                with open(self.rigs, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(report, f)
+                result = self.run_tool(self.rpf, out, "--rigs", self.rigs)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(self.rigs, result.stderr)
+                self.assertIn("invalid rig report", result.stderr)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertFalse(os.path.exists(out))
 
     def test_out_must_be_a_file(self):
         folder = os.path.join(self.tmp.name, "out")
@@ -228,6 +241,27 @@ class ReportPathTests(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
+
+    def test_rigs_json_with_utf8_bom_is_accepted(self):
+        rigs_path = os.path.join(self.tmp.name, "rigs_bom.json")
+        out = os.path.join(self.tmp.name, "out_bom.json")
+        with open(rigs_path, "w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump({"rbf0": {"rigsets": []}}, f)
+        r = self.run_tool(self.rpf, out, "--rigs", rigs_path)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertIn("rbf0_join", data["summary"])
+
+    def test_malformed_rigs_json_with_utf8_bom_is_reported(self):
+        rigs_path = os.path.join(self.tmp.name, "rigs_bad_bom.json")
+        out = os.path.join(self.tmp.name, "out_bad_bom.json")
+        with open(rigs_path, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("{not valid json")
+        r = self.run_tool(self.rpf, out, "--rigs", rigs_path)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("invalid rig report", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
 
 if __name__ == "__main__":

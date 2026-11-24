@@ -153,6 +153,11 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(row["kind"], "xml")
         self.assertFalse(row["fragment"])
         self.assertEqual(row["root_element"], "SSetupData")
+        with_enc = b'\xef\xbb\xbf<?xml version="1.0" encoding="UTF-8"?>\n<CMapData><name>x</name></CMapData>'
+        row_enc = bvh_index.classify(with_enc, len(with_enc))
+        self.assertEqual(row_enc["kind"], "xml")
+        self.assertFalse(row_enc["fragment"])
+        self.assertEqual(row_enc["root_element"], "CMapData")
 
     def test_xml_fragment(self):
         text = b"/americas/map/x_bvh.rpf</filename><Item/>" + b" " * 40
@@ -194,6 +199,59 @@ class ScanTest(unittest.TestCase):
                 self.assertEqual(rows[0]["node_bytes"], 64)
                 self.assertNotIn("fill", rows[0])
 
+    def test_directory_with_an_unreadable_archive_keeps_the_others_but_exits_nonzero(self):
+        good = os.path.join(self.dir, "good.rpf")
+        with open(good, "wb") as f:
+            f.write(make_rpf([bvh_payload(3)]))
+        bad = bytearray(make_rpf([bvh_payload(2)]))
+        struct.pack_into("<I", bad, 4, len(bad) + 1000)       # the data area starts past the end of the file
+        with open(os.path.join(self.dir, "bad.rpf"), "wb") as f:
+            f.write(bad)
+        out = os.path.join(self.dir, "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = bvh_index.main([self.dir, "--out", out])
+        self.assertEqual(code, 1)
+        self.assertIn("bad.rpf: skipped", err.getvalue())
+        self.assertIn("incomplete", err.getvalue())
+        with open(out) as f:
+            self.assertEqual(json.load(f)["summary"]["streams"], 1)    # the readable archive is still reported
+
+    def test_directory_with_an_unlistable_subfolder_exits_nonzero_and_names_it(self):
+        with open(os.path.join(self.dir, "good.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(3)]))
+        locked = os.path.join(self.dir, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(locked, "hidden.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        real = os.scandir
+
+        def scandir(path="."):   # chmod does not deny root, so the listing failure is made here
+            if os.path.abspath(os.fspath(path)) == os.path.abspath(locked):
+                raise PermissionError(13, "Permission denied", os.fspath(path))
+            return real(path)
+
+        out = os.path.join(self.dir, "index.json")
+        err = io.StringIO()
+        with mock.patch.object(os, "scandir", scandir), contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = bvh_index.main([self.dir, "--out", out])
+        self.assertEqual(code, 1)
+        self.assertIn("locked: skipped", err.getvalue())
+        self.assertIn("incomplete", err.getvalue())
+        with open(out) as f:
+            self.assertEqual(json.load(f)["summary"]["streams"], 1)    # the readable archive is still reported
+
+    def test_hidden_folders_and_files_are_not_scanned(self):
+        os.makedirs(os.path.join(self.dir, ".cache"))
+        for rel in (os.path.join(".cache", "a.rpf"), ".b.rpf"):
+            with open(os.path.join(self.dir, rel), "wb") as f:
+                f.write(make_rpf([bvh_payload(2)]))
+        with open(os.path.join(self.dir, "c.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(3)]))
+        rows, _ = bvh_index.scan_dir(self.dir)
+        self.assertEqual([os.path.basename(r["source"]) for r in rows], ["c.rpf"])
+
     def test_index_outputs(self):
         path = os.path.join(self.dir, "pack.rpf")
         with open(path, "wb") as f:
@@ -224,6 +282,35 @@ class ScanTest(unittest.TestCase):
                 bvh_index.main([self.dir, "--out", out, "--csv", alias])
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("--out and --csv must use different paths", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
+    def test_report_under_a_file_is_refused_before_the_scan(self):
+        # Before: the scan ran to its end and os.makedirs then died in a NotADirectoryError traceback.
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(2))
+        blocker = os.path.join(self.dir, "blocker")
+        with open(blocker, "wb") as f:
+            f.write(b"not a folder")
+        out = os.path.join(blocker, "sub", "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(bvh_index, "scan_dir", side_effect=AssertionError("scanned anyway")):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", out])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--out cannot be written to", err.getvalue())
+        self.assertIn("cannot create its folder", err.getvalue())
+
+    def test_write_error_after_the_scan_is_a_message_and_exit_2(self):
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(2))
+        out = os.path.join(self.dir, "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(bvh_index, "_publish", side_effect=OSError(28, "No space left on device")):
+            self.assertEqual(bvh_index.main([self.dir, "--out", out]), 2)
+        self.assertIn("cannot write the report", err.getvalue())
+        self.assertIn("No space left on device", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
     def test_directory_with_glob_metacharacters_in_its_name(self):
@@ -267,6 +354,21 @@ class ScanTest(unittest.TestCase):
         (archived,), _ = bvh_index.scan_rpf(archive)
         self.assertEqual(archived["kind"], "bvh4-chunk")
         self.assertNotIn("fill", archived)
+
+    def test_folder_name_with_glob_characters_is_a_path(self):
+        # glob read "[v1]" as a character class, so a folder named like this indexed nothing and exited 0.
+        folder = os.path.join(self.dir, "carve [v1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        rows, summary = bvh_index.scan_dir(folder)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
+        archives = os.path.join(self.dir, "pack [1]")
+        os.makedirs(archives)
+        with open(os.path.join(archives, "a.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        rows, summary = bvh_index.scan_dir(archives)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
 
     def test_empty_and_short_archives_have_no_streams(self):
         for name, data in (("empty.rpf", b""), ("short.rpf", b"9FPR")):
@@ -407,6 +509,87 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("is a folder, not a report file", err.getvalue())
 
+    def _run_with_locked_folder(self, locked, out):
+        # Forcing os.scandir to raise for one folder gives the PermissionError os.walk hits for real, also on
+        # Windows where chmod cannot lock a folder.
+        real_scandir = os.scandir
+        target = os.path.normcase(os.path.abspath(locked))
+
+        def scandir(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(os.fspath(path))) == target:
+                raise PermissionError(13, "Access is denied", os.fspath(path))
+            return real_scandir(path, *args, **kwargs)
+
+        err = io.StringIO()
+        with mock.patch.object(bvh_index.os, "scandir", scandir):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    code = bvh_index.main([self.dir, "--out", out])
+                except SystemExit as e:
+                    code = e.code
+        return code, err.getvalue()
+
+    def test_overwrite_check_refuses_a_report_inside_an_unlistable_sub_folder(self):
+        # os.walk skips a folder it cannot list unless onerror stops it, so the report check used to pass over
+        # it and a report file inside it could be an input that gets overwritten.
+        locked = os.path.join(self.dir, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        out = os.path.join(locked, "report.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("previous report")
+        code, err = self._run_with_locked_folder(locked, out)
+        self.assertEqual(code, 2, err)
+        self.assertIn("--out cannot be checked against the inputs", err)
+        self.assertIn(locked, err)
+        self.assertNotIn("Traceback", err)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "previous report")
+
+    def test_unlistable_sub_folder_gives_the_same_result_whether_or_not_the_report_exists(self):
+        # A report outside the unlistable folder is not refused: both runs go to the scan, which names the
+        # folder and reports the run as incomplete (exit 1). The second run used to be refused only because
+        # the first one had written the report.
+        locked = os.path.join(self.dir, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        out = os.path.join(self.dir, "report.json")
+        for run in (1, 2):
+            code, err = self._run_with_locked_folder(locked, out)
+            self.assertEqual(code, 1, f"run {run}: {err}")
+            self.assertIn("the report is incomplete", err)
+            self.assertNotIn("cannot be checked against the inputs", err)
+            self.assertTrue(os.path.isfile(out), f"run {run}")
+
+
+class MissingTargetTest(unittest.TestCase):
+    """A target that cannot be opened is one line naming the path once; the OSError text repeated it and repr'd it."""
+
+    def _stderr(self, argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main(argv), 2)
+        return err.getvalue()
+
+    def test_cli_names_a_missing_target_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "no-such.rpf")
+            text = self._stderr([missing])
+        self.assertIn(f"{missing}: No such file or directory", text)
+        self.assertNotIn("[Errno", text)
+        self.assertEqual(text.count(missing), 1)
+
+    def test_cli_keeps_the_reason_of_a_refused_archive(self):
+        """A ValueError from the scan still reads as its own sentence, not as an empty line."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "one.rpf")
+            with open(path, "wb") as f:
+                f.write(make_rpf([bvh_payload(2)]))
+            text = self._stderr([path, "--start", str(1 << 20)])
+        self.assertIn("start offset is outside the archive", text)
+
 
 class _Unprintable:
     """A cell whose str() fails part-way through the CSV, standing in for a write that dies mid-report."""
@@ -479,6 +662,25 @@ class PublishTest(unittest.TestCase):
             self.assertEqual(json.load(f)["streams"][0]["offset"], 16)
         self.assertEqual(self.read(self.csv).splitlines()[1].split(",")[:2], ["a.rpf", "16"])
         self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
+
+    def test_failed_replace_of_read_only_report_removes_writable_temp(self):
+        os.chmod(self.out, 0o444)
+        self.addCleanup(lambda: os.path.exists(self.out) and os.chmod(self.out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".bvh_index-") and mode == 0o600:
+                made_writable.append(path)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(bvh_index.os, "replace", side_effect=OSError("replace denied")), \
+                mock.patch.object(bvh_index.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                bvh_index.write_outputs([], [{"streams": 0}], self.out, None)
+        self.assertEqual(len(made_writable), 1)
+        self.assertEqual(self.read(self.out), self.OLD_JSON)
+        self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".bvh_index-")], [])
 
     @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
     def test_replaced_report_keeps_its_permission_bits(self):

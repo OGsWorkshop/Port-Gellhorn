@@ -36,6 +36,8 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from anim_index import aux_table  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -159,9 +161,6 @@ def classify(data, offset, stored):
     return record
 
 
-def _gap(gap):
-    return (len(gap), 0) if gap.count(0) == len(gap) else (0, len(gap))
-
 
 def scan_rpf(path, start=None, limit=None, progress=None):
     """Walk an RPF9 data area. Returns (records, summary). No tables of contents are read or decrypted."""
@@ -192,7 +191,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                z, u = _gap(m[last:s])
+                z, u = gap_split(m, last, s)
                 zero += z
                 unread += u
                 record = classify(head, s, blen)
@@ -217,14 +216,14 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            z, u = _gap(m[last:s])
+            z, u = gap_split(m, last, s)
             zero += z
             unread += u
             rows.append(classify(out, s, used))
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
-        z, u = _gap(m[last:end])
+        z, u = gap_split(m, last, end)
         zero += z
         unread += u
         if size:
@@ -345,16 +344,6 @@ def offset(text):
     return value
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
@@ -369,17 +358,17 @@ def main(argv=None):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     if os.path.splitext(a.out)[1].lower() not in (".json", ".csv"):
         ap.error("output must end in .json or .csv")
-    if same_output_path(a.source, a.out):
+    if same_report_path(a.source, a.out):
         ap.error("output must not overwrite the source")
     if os.path.isdir(a.source):
         manifest = os.path.join(a.source, "index.json")
-        if os.path.isfile(manifest) and same_output_path(manifest, a.out):
+        if same_report_path(manifest, a.out):
             ap.error(f"output would overwrite the carve manifest: {a.out}")
         if os.path.isfile(a.out):
             for name in os.listdir(a.source):
                 inp = os.path.join(a.source, name)
                 if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
-                    if same_output_path(inp, a.out):
+                    if same_report_path(inp, a.out):
                         ap.error(f"output would overwrite an input file: {a.out}")
     folder = os.path.dirname(os.path.abspath(a.out))
     if not os.path.isdir(folder):

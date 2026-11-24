@@ -6,7 +6,9 @@ import io
 import json
 import os
 from contextlib import redirect_stderr, redirect_stdout
+from fractions import Fraction
 from pathlib import Path
+import random
 import re
 import subprocess
 import sys
@@ -48,6 +50,44 @@ class Rules(unittest.TestCase):
         self.assertEqual(pr.models16("snorm", 8, 0x81)["f32_rte"], 0xBC00)
         self.assertEqual(pr.models32("unorm", 16, 0xFFFF)["f32_rte"], 0x3F800000)
         self.assertEqual(pr.models32("unorm", 8, 0x80)["f32_rte"], 0x3F008081)          # 128 / 255
+
+    def test_round_frac_matches_the_fraction_form(self):
+        """round_frac works in integers; the Fraction form it replaced is the reference here, for f16 and f32 and
+        both modes: 16-bit format quotients, the first and last significands of a binade exact, at a tie and just
+        under one (a tie at the last one carries into the next binade), the same for denormals, powers of two down
+        past the smallest denormal, random fractions in [-1, 1], and all of them negated."""
+        def reference(x, prec, emin, rtz=False):
+            if x == 0:
+                return Fraction(0)
+            sign, a = (-1 if x < 0 else 1), abs(x)
+            e = a.numerator.bit_length() - a.denominator.bit_length()
+            if Fraction(2) ** e > a:
+                e -= 1
+            if Fraction(2) ** (e + 1) <= a:
+                e += 1
+            ulp = Fraction(2) ** (max(e, emin) - prec + 1)
+            q = a / ulp
+            return sign * (q.numerator // q.denominator if rtz else round(q)) * ulp
+
+        rng = random.Random(161)
+        for prec, emin in ((11, -14), (24, -126)):
+            cases = {Fraction(v, 65535) for v in range(0, 65536, 97)}
+            cases |= {Fraction(v, 32767) for v in range(0, 32768, 89)}
+            for e in (-1, -2, -7, emin):                     # the binade [2^e, 2^(e+1)), ulp 2^(e - prec + 1)
+                ulp = Fraction(2) ** (e - prec + 1)
+                for m in (2 ** (prec - 1), 2 ** (prec - 1) + 1, 2 ** prec - 2, 2 ** prec - 1):   # first and last
+                    cases |= {m * ulp, (m + Fraction(1, 2)) * ulp, (m + Fraction(1, 3)) * ulp}   # exact, tie, below
+            ulp = Fraction(2) ** (emin - prec + 1)          # denormals: 0 < x < 2^emin, the same ulp
+            for m in (0, 1, 2, 3, 2 ** (prec - 1) - 1):
+                cases |= {m * ulp, (m + Fraction(1, 2)) * ulp, (m + Fraction(1, 4)) * ulp}
+            cases |= {Fraction(1, 2 ** j) for j in range(prec - emin + 3)}   # down to under the smallest denormal
+            cases |= {Fraction(rng.randrange(-(1 << 40), 1 << 40), rng.randrange(1 << 40, 1 << 41))
+                      for _ in range(400)}
+            cases |= {-c for c in cases}
+            for x in sorted(cases):
+                for rtz in (False, True):
+                    self.assertEqual(pr.round_frac(x, prec, emin, rtz), reference(x, prec, emin, rtz),
+                                     (x, prec, emin, rtz))
 
 
 class Kernels(unittest.TestCase):
@@ -95,8 +135,9 @@ class FakeOracle:
     arch = "gfx1031"
     device = "fake gfx1031"
 
-    def __init__(self, rule="rte", clobber_hi=False, wave64_off=None):
+    def __init__(self, rule="rte", clobber_hi=False, wave64_off=None, drop=0, none_at=None):
         self.rule, self.clobber_hi, self.wave64_off = rule, clobber_hi, wave64_off
+        self.drop, self.none_at = drop, none_at   # answer `drop` fewer kernels; no result for kernel `none_at`
 
     def run(self, kernels, words=4):
         code_of = {c: (f, k, n) for f, (c, k, n) in pr.FORMATS.items()}
@@ -121,7 +162,9 @@ class FakeOracle:
                 hi = 0 if self.clobber_hi else pr.HI_SEED
                 res.append(hi | bits)
             out.append(staged + res)
-        return out
+        if self.none_at is not None:
+            out[self.none_at] = None
+        return out[:len(out) - self.drop] if self.drop else out
 
     def close(self):
         pass
@@ -164,6 +207,19 @@ class Compare(unittest.TestCase):
     def test_a_wave_difference_exits_1(self):
         rc, out = run_main(FakeOracle(wave64_off=9))
         self.assertEqual(rc, 1, out)
+
+    def test_a_short_result_list_is_a_harness_error(self):
+        # BUILD-733: fewer results than kernels used to be zipped away, leaving values unchecked and exit 0.
+        for drop in (1, 10_000):   # one kernel missing, then every result (an empty list)
+            with self.subTest(drop=drop):
+                rc, out = run_main(FakeOracle(drop=drop))
+                self.assertEqual(rc, 2)
+                self.assertRegex(out, r"harness error: \w+ wave32: the oracle returned \d+ results for \d+ kernels")
+
+    def test_a_missing_result_is_a_harness_error(self):
+        rc, out = run_main(FakeOracle(none_at=0))
+        self.assertEqual(rc, 2)
+        self.assertIn("base 0: no result", out)
 
     def test_a_clobbered_high_half_is_a_harness_error(self):
         rc, out = run_main(FakeOracle(clobber_hi=True))

@@ -29,7 +29,7 @@ Exit status is 0 even when nothing is found; the summary says how many streams w
 """
 import argparse
 import csv
-import glob
+import fnmatch
 import json
 import mmap
 import os
@@ -44,6 +44,11 @@ from contextlib import suppress
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 TAG = 0x81020006
@@ -64,7 +69,14 @@ FILL_BYTES = (0x00, 0x81, 0x94, 0x29)
 def below_normal():
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         k = ctypes.windll.kernel32
+        # GetCurrentProcess returns a pointer-sized pseudo-handle.
+        k.GetCurrentProcess.argtypes = ()
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.SetPriorityClass.restype = wintypes.BOOL
         k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)
 
 
@@ -121,7 +133,7 @@ def classify(head, size, tail=None):
     decompressor. `size` is the inflated size.
     """
     row = {"kind": "raw", "signature": "", "version": ""}
-    body = head[3:40] if head[:3] == b"\xef\xbb\xbf" else head[:40]
+    body = head[3:] if head[:3] == b"\xef\xbb\xbf" else head
     if body.startswith(b"<?xml"):
         row.update(kind="xml", signature="xml", fragment=False)
         rest = body
@@ -268,11 +280,9 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                     pos = s + 1
                     continue
                 head, kept, total, used = got
-                gap = m[last:s]
-                if gap.count(0) == len(gap):
-                    zero += len(gap)
-                else:
-                    unread += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 row = classify(head, total, kept[-HEAD:] if len(kept) >= HEAD else kept)
                 row.update(source=path, offset=s, stored=used, size=total)
                 if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= len(kept):
@@ -281,11 +291,9 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                     row["fill"]["total"] = len(body)
                 rows.append(row)
                 last = pos = s + used
-            tailgap = m[last:end]
-            if tailgap.count(0) == len(tailgap):
-                zero += len(tailgap)
-            else:
-                unread += len(tailgap)
+            gap_zero, gap_unread = gap_split(m, last, end)
+            zero += gap_zero
+            unread += gap_unread
         finally:
             m.close()
     return rows, [summarize(rows, path, span, zero, unread, time.time() - t0)]
@@ -308,11 +316,29 @@ def summarize(rows, source, span, zero, unread, elapsed):
             "elapsed_s": round(elapsed, 2)}
 
 
-def scan_dir(path, max_inflate=1 << 28):
-    # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
-    # class by glob and match nothing. The "**"/"*.rpf"/"*.bin" suffixes stay as glob patterns.
-    root = glob.escape(os.fspath(path))
-    rpfs = sorted(glob.glob(os.path.join(root, "**", "*.rpf"), recursive=True))
+def find_payloads(root, patterns, skipped=None):
+    """The files under root matching each glob pattern, as a sorted list per pattern. Hidden names are left out and
+    links are followed, as glob.glob("**", recursive=True) did. Unlike glob, a folder that cannot be listed is not
+    dropped silently: it is named on stderr and added to skipped, so the run reports itself incomplete."""
+    found = {p: [] for p in patterns}
+
+    def unlistable(error):
+        print(f"{error.filename or root}: skipped ({error.strerror or error})", file=sys.stderr)
+        if skipped is not None:
+            skipped.append(error.filename or root)
+
+    for folder, dirs, names in os.walk(root, onerror=unlistable, followlinks=True):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in names:
+            if not name.startswith("."):
+                for p in patterns:
+                    if fnmatch.fnmatch(name, p):
+                        found[p].append(os.path.join(folder, name))
+    return [sorted(found[p]) for p in patterns]
+
+
+def scan_dir(path, max_inflate=1 << 28, skipped=None):
+    rpfs, bins = find_payloads(os.fspath(path), ("*.rpf", "*.bin"), skipped)
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
@@ -320,11 +346,13 @@ def scan_dir(path, max_inflate=1 << 28):
                 r, s = scan_rpf(p, max_inflate=max_inflate)
             except (OSError, ValueError) as e:   # one unreadable archive should not lose the others
                 print(f"{p}: skipped ({e})", file=sys.stderr)
+                if skipped is not None:
+                    skipped.append(p)     # the caller still reports the run as incomplete
                 continue
             rows += r
             summaries.extend(s)
         return rows, summaries
-    for p in sorted(glob.glob(os.path.join(root, "**", "*.bin"), recursive=True)):
+    for p in bins:
         size = os.path.getsize(p)
         with open(p, "rb") as f:
             head = f.read(HEAD)
@@ -373,8 +401,26 @@ def _publish(dest, write, newline):
     except BaseException:
         if temp is not None:
             with suppress(OSError):
+                # The staging file may have inherited a read-only destination's mode; make it deletable
+                # first, or Windows strands it beside the report when the replace fails.
+                os.chmod(temp, 0o600)
                 os.unlink(temp)
         raise
+
+
+def report_path_problem(path):
+    """Why a report can't be written at `path`, or None: its folder can't be created (a file in the way, a
+    missing drive) or can't be written to. Checked before the scan, so a mistyped destination doesn't cost a run."""
+    parent = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as e:
+        return f"cannot create its folder: {e}"
+    if not os.access(parent, os.W_OK):
+        return f"its folder is not writable: {parent}"
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        return "the existing report is read-only"
+    return None
 
 
 def write_outputs(rows, summaries, out, csv_path):
@@ -461,6 +507,15 @@ def same_output_path(first, second):
         return False
 
 
+def _inside(path, folder):
+    """True when `path` is `folder` or lies below it, compared as the report check compares paths."""
+    path, folder = _path_key(path), _path_key(folder)
+    try:
+        return os.path.commonpath([path, folder]) == folder
+    except ValueError:   # different drives on Windows
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="RPF9 archive or a directory of .rpf/.bin payloads")
@@ -482,13 +537,23 @@ def main(argv=None):
             ap.error(f"{flag} is a folder, not a report file: {path}")
     if os.path.isdir(a.target):
         manifest = os.path.join(a.target, "index.json")
+
+        def unlistable(error):
+            # os.walk skips a folder it cannot list unless onerror stops it. A report path inside that folder could
+            # then be an input this check never saw, so refuse it. Any other unlistable folder is left to the scan,
+            # which names it and reports the run as incomplete (exit 1).
+            folder = error.filename or a.target
+            if _inside(path, folder):
+                ap.error(f"{flag} cannot be checked against the inputs: cannot list {folder}: "
+                         f"{error.strerror or error}")
+
         for flag, path in (("--out", a.out), ("--csv", a.csv)):
             if not path:
                 continue
             if os.path.isfile(manifest) and same_output_path(path, manifest):
                 ap.error(f"{flag} would overwrite the carve manifest: {path}")
             if os.path.isfile(path):
-                for root, _dirs, names in os.walk(a.target):
+                for root, _dirs, names in os.walk(a.target, onerror=unlistable):
                     for name in names:
                         if name.lower().endswith((".json", ".csv")):
                             continue
@@ -496,20 +561,35 @@ def main(argv=None):
                             ap.error(f"{flag} would overwrite an input file: {path}")
     if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
+    for flag, path in (("--out", a.out), ("--csv", a.csv)):
+        problem = report_path_problem(path) if path else None
+        if problem:
+            ap.error(f"{flag} cannot be written to {path}: {problem}")
     below_normal()
     if os.path.isdir(a.target):
-        rows, summaries = scan_dir(a.target, a.max_inflate)
+        skipped = []
+        rows, summaries = scan_dir(a.target, a.max_inflate, skipped)
     else:
+        skipped = []
         try:
             rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)
         except (OSError, ValueError) as e:
-            print(f"{a.target}: {e}", file=sys.stderr)
+            # An OSError repeats the target we already print, and reprs it: name the reason once.
+            reason = e.strerror if isinstance(e, OSError) and e.filename and e.strerror else e
+            print(f"{a.target}: {reason}", file=sys.stderr)
             return 2
     for s in summaries:
         print(json.dumps(s, indent=1))
-    write_outputs(rows, summaries, a.out, a.csv)
+    try:
+        write_outputs(rows, summaries, a.out, a.csv)
+    except OSError as e:   # a full disk, a folder removed or locked since the preflight: a line, not a traceback
+        print(f"cannot write the report: {e}", file=sys.stderr)
+        return 2
     if not rows:
         print("no zlib streams found", file=sys.stderr)
+    if skipped:
+        print(f"{len(skipped)} archive(s) or folder(s) could not be scanned; the report is incomplete", file=sys.stderr)
+        return 1
     return 0
 
 

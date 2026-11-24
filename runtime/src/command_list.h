@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <memory>
 #include <string>
 #include <utility>
 #include <variant>
@@ -179,6 +180,11 @@ inline constexpr std::uint32_t video_decode_statistics = 8;
 inline constexpr std::uint32_t pipeline_statistics1 = 10;
 } // namespace d3d12_query
 
+// A stream-output statistics query (SO_STATISTICS_STREAM0..3).
+constexpr bool is_so_statistics(std::uint32_t query_type) {
+    return query_type >= d3d12_query::so_statistics_stream0 && query_type <= d3d12_query::so_statistics_stream3;
+}
+
 // Whether a heap of `heap_type` holds queries of `query_type` (the D3D12 pairing rules).
 constexpr bool query_fits_heap(std::uint32_t heap_type, std::uint32_t query_type) {
     namespace h = d3d12_query_heap;
@@ -196,7 +202,8 @@ constexpr bool query_fits_heap(std::uint32_t heap_type, std::uint32_t query_type
 }
 
 // Bytes one resolved query takes: a UINT64 for occlusion and timestamps, D3D12_QUERY_DATA_PIPELINE_STATISTICS
-// (11 UINT64s) for pipeline statistics. 0 for the types this layer does not resolve.
+// (11 UINT64s) for pipeline statistics, D3D12_QUERY_DATA_SO_STATISTICS (2 UINT64s) for stream output. 0 for the
+// types this layer does not resolve.
 constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     namespace q = d3d12_query;
     switch (query_type) {
@@ -204,6 +211,11 @@ constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     case q::binary_occlusion:
     case q::timestamp: return 8;
     case q::pipeline_statistics: return 11 * 8;
+    // D3D12_QUERY_DATA_SO_STATISTICS: NumPrimitivesWritten, PrimitivesStorageNeeded.
+    case q::so_statistics_stream0:
+    case q::so_statistics_stream0 + 1:
+    case q::so_statistics_stream0 + 2:
+    case q::so_statistics_stream3: return 2 * 8;
     default: return 0;
     }
 }
@@ -327,6 +339,7 @@ struct CopyTexture {
     CopyLocation src;
     bool has_box;
     CopyBox box;
+    bool tile_footprint = false;  // RGBA8 CopyTiles: rows in a linear 64 KiB tile, at any byte offset
 };
 
 // CopyResource: every subresource, or the whole buffer.
@@ -392,17 +405,27 @@ struct IndexBufferView {
     std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
 };
 
-// DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
-// render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
-// the draw. resource 0 marks an unbound render-target slot or no depth buffer.
+// The views a draw captured, at the D3D12 maxima. Kept by value because the CPU descriptor slots and the bound
+// views can change after the draw is recorded, and out of line because the command variant is sized by its largest
+// member: inline they made every recorded command, barriers included, 976 bytes.
+struct DrawViews {
+    std::array<TargetView, 8> render_targets{};
+    std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
+    std::uint32_t render_target_count = 8;
+};
+
+// DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:
+// D3D12 reads render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the
+// list's state at the draw. resource 0 marks an unbound render-target slot or no depth buffer. A mesh draw
+// (DispatchMesh) takes its thread-group counts in count (x), instances (y) and first (z), and ignores the vertex
+// and index buffers and the topology.
 // Render targets and vertex buffer views are inlined (8 simultaneous targets, 32 input slots), eliminating heap allocations
 // during command list recording (D3D-289).
 struct Draw {
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
-    std::array<TargetView, 8> render_targets{};
+    std::shared_ptr<const DrawViews> views;  // null: no render targets or vertex buffers captured
     TargetView depth{};
-    std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
     IndexBufferView index{};
     std::uint32_t topology = 0;  // D3D_PRIMITIVE_TOPOLOGY
     Viewport viewport{};       // the first; more viewports are not modelled yet
@@ -416,7 +439,7 @@ struct Draw {
     std::uint32_t first = 0;  // first vertex or first index
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
-    std::uint32_t render_target_count = 8;
+    bool mesh = false;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -462,7 +485,8 @@ struct WriteImmediate {
     std::uint32_t mode;
 };
 
-// D3D12_SUBRESOURCE_RANGE_UINT64 of a dependent resource: [begin, end) in bytes of one subresource.
+// D3D12_SUBRESOURCE_RANGE_UINT64 of a dependent resource: [begin, end) in bytes of one subresource
+// (end == UINT64_MAX is the D3D12 sentinel meaning through the end of the subresource).
 struct DependentRange {
     ResourceId resource;
     std::uint32_t subresource;
@@ -604,6 +628,9 @@ struct BuildAccelerationStructure {
     std::uint64_t scratch_va = 0;
     std::uint64_t instances_va = 0;
     std::uint32_t instance_count = 0;
+    // D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS: instances_va is an array of instance_count GPU virtual addresses, one
+    // per 64-byte D3D12_RAYTRACING_INSTANCE_DESC; otherwise the descs themselves, consecutively.
+    bool instance_pointers = false;
     std::vector<RtTriangleGeometry> triangles;
 };
 
@@ -680,15 +707,18 @@ public:
     }
 
     bool copy_texture(const CopyTexture& copy) {
-        if (!valid(copy.dst) || !valid(copy.src) || (copy.dst.footprint && copy.src.footprint)) return false;
+        const auto alignment = copy.tile_footprint ? 1u : texture_data_placement_alignment;
+        if (!valid(copy.dst, alignment) || !valid(copy.src, alignment) || (copy.dst.footprint && copy.src.footprint))
+            return false;
         if (copy.has_box && (copy.box.right <= copy.box.left || copy.box.bottom <= copy.box.top ||
                              copy.box.back <= copy.box.front))
-            return false;
+            return !closed_;  // D3D12 accepts empty/inverted source boxes; emit no zero-extent Vulkan region.
         return append(copy);
     }
 
     bool copy_resource(const CopyResource& copy) {
-        if (!copy.dst || !copy.src || copy.dst == copy.src) return false;
+        if (!copy.dst || !copy.src) return false;
+        if (copy.dst == copy.src) return !closed_;  // A self-copy is a legal no-op, not a failed command list.
         return append(copy);
     }
 
@@ -712,10 +742,11 @@ public:
         return append(dispatch);
     }
 
-    // A draw with no vertices or instances does nothing in D3D12, and is not recorded.
+    // A draw with no vertices or instances, or a mesh draw with no thread groups, does nothing in D3D12, and is
+    // not recorded.
     bool draw(const Draw& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
+        if (!draw.count || !draw.instances || (draw.mesh && !draw.first)) return !closed_;
         return append(draw);
     }
     bool draw(Draw&& draw) {
@@ -731,12 +762,13 @@ public:
     }
 
     // ClearDepthStencilView; the cleared planes must be in depth_write state at execution.
-    // D3D12 requires depth in [0, 1] and at least one clear flag.
+    // A D32_FLOAT target keeps the depth exactly as given, outside [0, 1] and NaN included (measured on WARP,
+    // d3d12_clear_test); a D16 target quantizes it at replay. Flags that name no plane close the list and clear nothing.
     bool clear_depth_stencil(const TargetView& target, std::uint32_t flags, float depth, std::uint8_t stencil,
                              std::span<const Rect> rects = {}) {
         if (!valid(target)) return false;
-        if (!flags || (flags & ~(clear_depth | clear_stencil))) return false;
-        if ((flags & clear_depth) && !(depth >= 0.0f && depth <= 1.0f)) return false;
+        if (flags & ~(clear_depth | clear_stencil)) return false;
+        if (!flags) return !closed_;
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
     }
 
@@ -756,16 +788,15 @@ public:
         return append(write);
     }
 
-    // AtomicCopyBufferUINT/UINT64, with the rules of the D3D12 debug layer's ATOMICCOPYBUFFER_* messages (IDs
-    // 1027-1040 in d3d12sdklayers.h): both offsets aligned to the copy's size and at least one dependency, each on a
-    // named resource. A copy of a value onto itself (vkCmdCopyBuffer forbids the overlap) is refused too.
+    // AtomicCopyBufferUINT/UINT64: both offsets aligned to the copy's size and each dependency on a named resource with
+    // a non-empty, non-inverted range (zero dependencies is accepted by the Windows 11 WARP and RTX 5090 D3D12
+    // runtimes). A copy of a value onto itself (vkCmdCopyBuffer forbids the overlap) is refused too.
     bool atomic_copy(const AtomicCopyBuffer& copy) {
         if ((copy.bytes != 4 && copy.bytes != 8) || !copy.dst || !copy.src) return false;
         if (copy.dst == copy.src && copy.dst_offset == copy.src_offset) return false;
         if (copy.dst_offset % copy.bytes || copy.src_offset % copy.bytes) return false;
-        if (copy.dependencies.empty()) return false;
         for (const auto& d : copy.dependencies)
-            if (!d.resource) return false;
+            if (!d.resource || d.begin >= d.end) return false;
         return append(copy);
     }
 
@@ -840,22 +871,26 @@ public:
     }
 
     bool execute_indirect(const ExecuteIndirect& indirect) {
-        if (!indirect.argument_buffer || !indirect.stride) return false;
+        if (!indirect.argument_buffer || !indirect.stride || indirect.stride % 4) return false;
+        if (indirect.argument_offset % 4) return false;
+        if (!indirect.count_buffer && indirect.count_offset) return false;
+        if (indirect.count_buffer && indirect.count_offset % 4) return false;
         if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }
 
+    // D3D12: acceleration structures and build scratch are 256-byte aligned; postbuild destinations 8-byte aligned.
     bool build_acceleration_structure(BuildAccelerationStructure build) {
-        if (!build.dst_va || !build.scratch_va) return false;
+        if (!build.dst_va || build.dst_va % 256 || !build.scratch_va || build.scratch_va % 256) return false;
+        if (build.update && (!build.src_va || build.src_va % 256)) return false;
         return append(std::move(build));
     }
-    // D3D12: acceleration structures are 256-byte aligned, postbuild destinations 8-byte aligned.
     bool copy_acceleration_structure(CopyAccelerationStructure copy) {
-        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256) return false;
+        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256 || copy.mode > 4) return false;
         return append(copy);
     }
     bool acceleration_structure_postbuild(AccelerationStructurePostbuild info) {
-        if (!info.dest_va || info.dest_va % 8 || info.sources.empty()) return false;
+        if (!info.dest_va || info.dest_va % 8 || info.type > 3 || info.sources.empty()) return false;
         for (const auto va : info.sources)
             if (!va || va % 256) return false;
         return append(std::move(info));
@@ -881,11 +916,11 @@ private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
 
     // A placed footprint needs aligned offsets and pitches and a non-empty size.
-    static bool valid(const CopyLocation& location) {
+    static bool valid(const CopyLocation& location, std::uint32_t alignment) {
         if (!location.resource) return false;
         if (!location.footprint) return true;
         return location.width && location.height && location.depth && location.row_pitch &&
-               location.offset % texture_data_placement_alignment == 0 &&
+               location.offset % alignment == 0 &&
                location.row_pitch % texture_data_pitch_alignment == 0;
     }
 

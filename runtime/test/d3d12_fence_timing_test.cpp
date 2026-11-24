@@ -1,10 +1,13 @@
 // D3D-30 on the Vulkan device, through the Xbox-ABI proxy: SetEventOnMultipleFenceCompletion (ALL and ANY, with an
-// event and blocking), queue GetClockCalibration on both paths (calibrated timestamps on the standalone device when
-// it exposes both clock domains, the submitted timestamp query otherwise), GetAdapterLuid (must name a
-// DXGI adapter) and GetCustomHeapProperties (compared with the host PC runtime's answer when the host adapter is
-// NUMA, as the layer reports itself). No shaders or game data. LEONIDA_VK_VALIDATION=1 runs the test-made device
-// under VK_LAYER_KHRONOS_validation; any validation error fails the test.
+// event and blocking), a CPU fence signal held behind a pending queue signal, queue GetClockCalibration on both
+// paths (calibrated timestamps on the standalone device when it exposes both clock domains, the submitted timestamp
+// query otherwise), GetAdapterLuid (must name a DXGI adapter) and GetCustomHeapProperties (compared with the host PC
+// runtime's answer when the host adapter has the architecture the layer reports: NUMA on a discrete GPU, UMA on an
+// integrated one). No shaders or game data.
+// LEONIDA_VK_VALIDATION=1 runs the test-made device under VK_LAYER_KHRONOS_validation; any validation error fails
+// the test.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -165,6 +168,82 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
     return 0;
 }
 
+// A CPU Signal above a queue Signal the GPU has not reached yet: vkSignalSemaphore would break
+// VUID-VkSemaphoreSignalInfo-value-03259, so the layer holds the CPU signal until the GPU passes the queue's value.
+// The queue's signal is kept pending by a Wait on a gate fence the CPU opens later.
+int check_held_cpu_signal(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    Ref<ID3D12Fence> gate, f;
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f.p))));
+    EXPECT(SUCCEEDED(queue->Wait(gate.p, 1)));
+    EXPECT(SUCCEEDED(queue->Signal(f.p, 10)));
+    EXPECT(SUCCEEDED(f->Signal(20)));
+    Event reached;
+    EXPECT(SUCCEEDED(f->SetEventOnCompletion(20, reached.h)));
+    EXPECT(!reached.set_within(50));
+    EXPECT(f->GetCompletedValue() < 10);  // held: the GPU has not reached 10, so 20 is not applied either
+    EXPECT(SUCCEEDED(gate->Signal(1)));
+    EXPECT(reached.set_within(5000));
+    EXPECT(f->GetCompletedValue() == 20);
+
+    // Two CPU signals held behind one queue signal are applied in order: the fence ends on the later one.
+    EXPECT(SUCCEEDED(queue->Wait(gate.p, 2)));
+    EXPECT(SUCCEEDED(queue->Signal(f.p, 30)));
+    EXPECT(SUCCEEDED(f->Signal(40)));
+    EXPECT(SUCCEEDED(f->Signal(50)));
+    EXPECT(f->GetCompletedValue() == 20);
+    EXPECT(SUCCEEDED(gate->Signal(2)));
+    EXPECT(SUCCEEDED(f->SetEventOnCompletion(50, nullptr)));
+    EXPECT(f->GetCompletedValue() == 50);
+
+    // A cross-queue Wait held in QueueHolds for a deferred CPU Signal must wake when the dispatcher applies it.
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    Ref<ID3D12CommandQueue> queue_b;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue_b.p))));
+    Ref<ID3D12Fence> done;
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done.p))));
+
+    EXPECT(SUCCEEDED(queue->Wait(gate.p, 3)));
+    EXPECT(SUCCEEDED(queue->Signal(f.p, 60)));
+    EXPECT(SUCCEEDED(queue_b->Wait(f.p, 70)));
+    EXPECT(SUCCEEDED(queue_b->Signal(done.p, 1)));
+    EXPECT(SUCCEEDED(f->Signal(70)));
+    Event done_ev;
+    EXPECT(SUCCEEDED(done->SetEventOnCompletion(1, done_ev.h)));
+    EXPECT(!done_ev.set_within(50));
+    EXPECT(done->GetCompletedValue() == 0);
+    EXPECT(SUCCEEDED(gate->Signal(3)));
+    if (!done_ev.set_within(5000)) {
+        std::fprintf(stderr, "held CPU signal did not wake QueueHolds: f=%llu done=%llu\n",
+                     static_cast<unsigned long long>(f->GetCompletedValue()),
+                     static_cast<unsigned long long>(done->GetCompletedValue()));
+        return 1;
+    }
+    EXPECT(done->GetCompletedValue() == 1);
+    EXPECT(f->GetCompletedValue() == 70);
+
+    // Same release when the Wait is queued while the CPU signal is already held behind the GPU signal.
+    EXPECT(SUCCEEDED(queue->Wait(gate.p, 4)));
+    EXPECT(SUCCEEDED(queue->Signal(f.p, 80)));
+    EXPECT(SUCCEEDED(f->Signal(90)));
+    EXPECT(SUCCEEDED(queue_b->Wait(f.p, 90)));
+    EXPECT(SUCCEEDED(queue_b->Signal(done.p, 2)));
+    Event done_ev2;
+    EXPECT(SUCCEEDED(done->SetEventOnCompletion(2, done_ev2.h)));
+    EXPECT(!done_ev2.set_within(50));
+    EXPECT(done->GetCompletedValue() == 1);
+    EXPECT(SUCCEEDED(gate->Signal(4)));
+    if (!done_ev2.set_within(5000)) {
+        std::fprintf(stderr, "already-held CPU signal did not wake QueueHolds: f=%llu done=%llu\n",
+                     static_cast<unsigned long long>(f->GetCompletedValue()),
+                     static_cast<unsigned long long>(done->GetCompletedValue()));
+        return 1;
+    }
+    EXPECT(done->GetCompletedValue() == 2);
+    EXPECT(f->GetCompletedValue() == 90);
+    return 0;
+}
+
 int check_luid(ID3D12Device* device) {
     const LUID luid = device->GetAdapterLuid();
     EXPECT(luid.LowPart || luid.HighPart);
@@ -185,8 +264,14 @@ int check_custom_heap_properties(ID3D12Device* device) {
         D3D12_CPU_PAGE_PROPERTY page;
         D3D12_MEMORY_POOL pool;
     };
+    // The D3D12 documentation's table for the architecture the layer reports: a NUMA adapter (a discrete GPU) keeps
+    // DEFAULT in L1, a UMA one (an integrated GPU) has everything in L0.
+    D3D12_FEATURE_DATA_ARCHITECTURE ours_arch{};
+    EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &ours_arch, sizeof(ours_arch))));
+    EXPECT(!ours_arch.CacheCoherentUMA);
+    const D3D12_MEMORY_POOL gpu_pool = ours_arch.UMA ? D3D12_MEMORY_POOL_L0 : D3D12_MEMORY_POOL_L1;
     const Want table[] = {
-        {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE, D3D12_MEMORY_POOL_L1},
+        {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE, gpu_pool},
         {D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0},
         {D3D12_HEAP_TYPE_READBACK, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0},
     };
@@ -202,16 +287,19 @@ int check_custom_heap_properties(ID3D12Device* device) {
            custom.MemoryPoolPreference == D3D12_MEMORY_POOL_UNKNOWN && custom.CreationNodeMask == 1 &&
            custom.VisibleNodeMask == 1);
 
-    // The host runtime on a NUMA adapter (the answer the layer gives in D3D12_FEATURE_ARCHITECTURE) must agree.
+    // The host runtime on an adapter of the architecture the layer reports (D3D12_FEATURE_ARCHITECTURE) must agree.
     Ref<ID3D12Device> host;
-    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+    if (hostwine::host_is_wine() ||
+        FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
         std::printf("GetCustomHeapProperties: no host D3D12 device to compare with\n");
         return 0;
     }
     D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
     EXPECT(SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))));
-    if (architecture.UMA) {
-        std::printf("GetCustomHeapProperties: the host adapter is UMA; not compared\n");
+    if (architecture.UMA != ours_arch.UMA || architecture.CacheCoherentUMA != ours_arch.CacheCoherentUMA) {
+        std::printf("GetCustomHeapProperties: the host adapter is %s and the layer's %s; not compared\n",
+                    architecture.UMA ? (architecture.CacheCoherentUMA ? "cache-coherent UMA" : "UMA") : "NUMA",
+                    ours_arch.UMA ? "UMA" : "NUMA");
         return 0;
     }
     for (const Want& want : table) {
@@ -282,6 +370,7 @@ int main() {
         EXPECT(!rt::d3d12::queue_uses_calibrated_timestamps(queue.p));
         EXPECT(check_calibration(queue.p, gpu_frequency, "fallback (submitted timestamp query)") == 0);
         EXPECT(check_multiple_fences(device.p, queue.p) == 0);
+        EXPECT(check_held_cpu_signal(device.p, queue.p) == 0);
         EXPECT(check_luid(device.p) == 0);
         EXPECT(check_custom_heap_properties(device.p) == 0);
     }
@@ -328,6 +417,7 @@ int main() {
         const char* clock_path = calibrated ? "calibration-capable queue" : "standalone fallback";
         EXPECT(check_calibration(queue.p, gpu_frequency, clock_path) == 0);
         EXPECT(check_multiple_fences(standalone.p, queue.p) == 0);
+        EXPECT(check_held_cpu_signal(standalone.p, queue.p) == 0);
         EXPECT(check_luid(standalone.p) == 0);
     }
 
@@ -335,7 +425,7 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("fences and timing: multiple-fence waits, clock calibration, adapter LUID and custom heap "
-                "properties all checked\n");
+    std::printf("fences and timing: multiple-fence waits, held CPU signals, clock calibration, adapter LUID and "
+                "custom heap properties all checked\n");
     return 0;
 }

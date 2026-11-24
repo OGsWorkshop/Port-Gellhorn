@@ -54,12 +54,14 @@ The exporters use three tag types:
 | `0x48` | streamed-music descriptor |
 
 `tools/rsc8_audio.py` additionally decodes the speech companions `0x36` (peaks), `0xa3` (seek
-table), `0xb2` (loudness), `0xbd` (marker) and the two structural tags below; every other tag type
-is skipped.
+table), `0xb2` (loudness), `0xbd` (cue records) and the two structural tags below; every other tag type
+is skipped. The `0xbd` record layout is in [rsc8_audio.md](rsc8_audio.md#the-0xbd-cue-records); the music banks
+have the tag too (945 tags in 938 of the 3,008 streamed-music banks, counted by `tools/awc_markers.py`), and
+what their records mark is in [audio_config.md](audio_config.md#marker-events-awc-tag-0xbd).
 
 | Tag | Meaning |
 |---|---|
-| `0x5a` | 20-byte-entry grid table (`12345678` marker; see [rsc8_audio.md](rsc8_audio.md#the-undocumented-0x5a0xd9-companion-tags)) |
+| `0x5a` | 20-byte entries, a sample position and a pitch each (`12345678` marker; see [rsc8_audio.md](rsc8_audio.md#the-undocumented-0x5a0xd9-companion-tags)) |
 | `0xd9` | grouped ascending index runs into the sibling `0x5a` entries |
 
 Both appear only in `audio.rpf`, on 1,185 streams (32,000 Hz; 804 of them carry both).
@@ -154,6 +156,15 @@ When exporting a directory, `awc_opus.py` keeps the path to each bank below the 
 `a/music.awc` writes under `<out>/a/music/`. Passing that file on its own writes under `<out>/music/`.
 To regenerate a flat export from an earlier version, run `awc_opus.py` with the original bank directory and a fresh output directory.
 
+To import music cues into Audacity, run
+`python -I tools/awc_cue_labels.py <bank>/cue_regions.json <new-label-directory>` on a sheet
+exported by `awc_opus.py --cue-sheet`. Open the channel Ogg in Audacity at time zero, then use
+**File > Import > Labels** to load the matching `.txt` by filename stem. Each region shows its
+hexadecimal cue hash followed by its one-based row number in the bank sheet. Overlapping and
+repeated regions keep individual labels. Start and end times use nine decimal places in seconds
+so rounding back to the nearest 48 kHz frame recovers both endpoints.
+[Audacity label file format](https://manual.audacityteam.org/man/importing_and_exporting_labels.html)
+
 `audio_manifest.json` is the bank index: each bank's `Path`, `Offset`, `Size`, and its `Streams` with `Index`,
 `Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`. For streamed music,
 `Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's
@@ -208,16 +219,34 @@ programming is assembled by the game from many assets, so a lone AWC is rarely a
 
 The music/radio **config table** is a separate structure: 1,589 records with exact durations, AWC stream ids,
 contiguous station grouping and no per-track start offsets. See [audio_config.md](audio_config.md) for the record
-layout and the station-content references.
+layout, the station-content references and the marker events (tag `0xBD`) that mark track boundaries in five
+long mixes.
 
 ## Mission music: Home Sweet Home
 
 The credited "Burn This Shit Down" is not a radio-station track. It is the song for the
 **Home Sweet Home** mission (Chapter 1, mission 21/25): Lucia at Jason's house in Key Lento
 during the house fire and the escape. The mission and its localized objective/fail strings are
-present in `data.rpf`; the song audio is not.
+present in `data.rpf`.
 
-Measured coverage on the Xbox Series 1.0.2.1 package:
+The song audio is in 1.0.2.1 too, as stems, not as one stream (found by @jefftern4 in the coordination thread,
+PROC-178). It is the plain (not streamed) `audio.rpf` bank at offset `0x300695000`, 9,481,280 bytes, bank 5,573 of
+7,162 in the exporter's `audio_manifest.json` order:
+
+| Field | Value |
+|---|---|
+| Streams | 73, all stereo, all codec `0x0B` (Opus, 48 kHz) |
+| Common length | 47 streams declare 771,213 samples (16.067 s); the manifest's rounded `DurationSeconds` gives 771,213 for 32 of them and 771,214 for 15 |
+| Other lengths | 6 × 1,156,820, 2 × 2,313,640 and 2 × 385,607 samples (1.5, 3 and 0.5 times the loop), and one 24,100-sample stream |
+| Range | 0.439 s to 114.477 s, 1,297.2 s in total |
+
+The 47 equal-length streams are loop stems meant to play together (vocals, melodic, sub-bass and ad-lib layers per
+slot, by the finder's listening), so no single stream is the song and a whole-file fingerprint of each stream
+misses it. That is why the searches below came back empty. The bank's shape (field values above) was re-measured
+from `audio_manifest.json` on a second 1.0.2.1 copy; the stem roles are the finder's and were not re-checked here.
+
+Measured coverage of the earlier search, which looked for the song as one stream. The `audio.rpf` all-banks row
+is the one the stems fall under:
 
 | Container | Searched | Result |
 |---|---|---|
@@ -226,7 +255,7 @@ Measured coverage on the Xbox Series 1.0.2.1 package:
 | `story000.rpf` Bink | 264 streams / 162 with audio / 165 tracks / 5,090 s | none |
 | `movies.rpf` Bink | 229 tracks / 12,401 s | none |
 | `audio.rpf` streamed cues under 30 s | 1,149 channels / 5.78 h | none |
-| `audio.rpf` all banks | 7,162 banks, all streams | none |
+| `audio.rpf` all banks | 7,162 banks, all streams | none as a single stream; the stems are bank `0x300695000` (above) |
 | loop/chunked banks | 1,099 banks / 118,180 streams | none |
 | `packs.rpf` inflated | 144,364 files / 9.74 GB | 0 AWC, 0 Bink2 |
 | `data.rpf` inflated | 28,509 files / 1.41 GB | mission text, 0 song strings |
@@ -242,11 +271,21 @@ A `data.rpf` hash table contains 12 occurrences of `joaat("burn")`, but it is no
 config blob has none, no AWC stream ID matches its low 29 bits, and the table has no audio
 reference.
 
-Residual uncertainty: `levels.rpf` (76 GB) was not fully inflated, and a custom RSC8 audio
-resource is the only mission-side container not decoded; the retail track may be a third master
-or patch content not covered by the public references; sub-30 s stings were not exhaustively
+Residual uncertainty: `levels.rpf` (76 GB) was not fully inflated; the retail track may be a third
+master or patch content not covered by the public references; sub-30 s stings were not exhaustively
 fingerprinted. No game audio is stored in the repository; the searches ran on a local copy and
 `radio-dump-v3` was not modified.
+Residual uncertainty: how the game sequences the stems (which layers play in which slot, and the
+order of the longer streams) is not decoded; the mission's audio config is the likely place (a
+hypothesis, not measured). No game audio is stored in the repository; the searches ran on a local
+copy and `radio-dump-v3` was not modified.
+
+This search first listed the `RSC8` resources of the story and minigame archives as the only
+mission-side container not decoded. They are decoded in [rsc8_audio.md](rsc8_audio.md), and none of
+them holds the song: all 641,428 raw `RSC8` headers in the package (225,281 in `story000.rpf`, 1,957
+in `shared_minigame000.rpf`, 9 in `story000_restofworld.rpf` and 414,181 in `audio.rpf`) are AWC tag
+`0x5c` facial/lip-sync clips. Each sits in an `ADAT` bank next to the 48 kHz mono Opus dialogue line
+it animates, none lies outside a bank, and none contains an `ADAT`, Ogg Opus or RIFF WAVE header.
 
 ## Stream names
 
@@ -274,9 +313,11 @@ The dictionary comes from two kinds of input:
   they give 138,104 wave names.
 
 Measured on the 1.0.2.1 package (2026-11-22) with 2,455,498 distinct lowercase words: identifiers harvested from the
-carved archives (by a scan like `hashdict.py`, not `hashdict.py` itself) plus the conversation waves:
+carved archives (by a scan like `hashdict.py`, not `hashdict.py` itself) plus the conversation waves. The columns are
+the ones the tool prints per source, so the second one is its distinct bank/ID pairs: an id that appears in two banks
+counts once in each (`Index.streams` in `tools/awc_names.py`):
 
-| Archive | Banks | Distinct ids | Named | Dialogue | Family | Control (expected false) |
+| Archive | Banks | Distinct bank/ID pairs | Named | Dialogue | Family | Control (expected false) |
 |---|---:|---:|---:|---:|---:|---:|
 | `audio.rpf` | 7,162 | 1,606,237 | 92,043 | 0 | 92,043 | 352 |
 | `story000.rpf` | 63,861 | 234,458 | 173,800 | 120,511 | 53,289 | 62 |
@@ -299,6 +340,11 @@ Each positional source is reported and thresholded on its own. A source is a dir
 bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
 took about 3 minutes on one core.
 
+The dictionary is also readable the other way, which needs no carve folder:
+`python -I tools/hashdict.py --lookup <temp>/hashes.json <hash>...` takes a dictionary path followed by one or more
+32-bit hashes in hexadecimal and prints each with the name the dictionary holds for it, or `?` when it holds none
+(`tools/hashdict.py:70,82-93`). That answers "which wave is this id" when another tool prints a hash and no name.
+
 You can also pass the JSON inventory written by `awc_manifest.py --out inventory.json`. The naming tool reads
 the plain stream IDs and streamed-music channel IDs directly from its rows. Bank labels keep the nested path
 and drop the `.awc` extension to match the export folders. Banks with no stream rows have no names in this inventory.
@@ -320,6 +366,10 @@ Subtitle markup (`~n~`, `~sl:...~`, `~COLOR_...~` and other `~...~` tokens) beco
 out. A file is matched by its stream id and its bank: the folder below the Opus folder, or that path with leading
 folders removed, so one Opus folder can hold several archives' exports. `--source` limits the names to one source
 label of the names CSV.
+
+Dialogue wave names are matched without case. Repeated rows are accepted when they produce identical tags,
+including after subtitle markup is removed. Conflicting labels, speakers or subtitles stop the pass with a CSV
+line diagnostic before any Ogg file is modified; this also applies to `--dry-run`.
 
 ```sh
 python -I tools/opus_tags.py <work>/assets/audio/ogg --names <temp>/awc_names.csv --dialogue <temp>/dialogue.csv
@@ -362,3 +412,14 @@ the audio itself is not. See the ground rules in [design.md](design.md#ground-ru
 
 The tools export the streams and channels as stored. They do not reconstruct runtime mixing, looping, ducking or
 music-segment selection; that belongs to the game's audio system.
+
+## Streamed-music cue sheets
+
+Run `python -I tools/awc_opus.py <bank-or-directory> <output> --cue-sheet` to write
+`cue_regions.json` next to the Ogg files for each bank with verified regions. Each row names
+a sibling audio file and the hexadecimal cue-name hash. The integer interval
+`[start_sample, end_sample)` counts 48 kHz frames per channel from the start of playback.
+Overlapping regions keep their original endpoints. The exporter pairs consecutive same-name
+start/end records within one ordered marker tag. It requires a unique stream entry and
+descriptor channel with the same ID, exported packets, and endpoints within the declared
+and exported audio. A rerun with the option refreshes an existing sheet even if it becomes empty.

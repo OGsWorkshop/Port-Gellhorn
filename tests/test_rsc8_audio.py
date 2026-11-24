@@ -4,7 +4,9 @@
 
 Every byte is synthesized by the test. No game file, game audio, or game asset name is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "rsc8_audio.py")
@@ -519,6 +522,21 @@ class AwcAndArchiveScanTest(unittest.TestCase):
         self.assertEqual(res["records"][0]["audio_codec"], 0x0B)
         self.assertAlmostEqual(res["records"][0]["audio_duration"], 89600 / 48000.0, places=5)
 
+    def test_progress_does_not_interrupt_the_json_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "empty.rpf")
+            with open(archive, "wb") as f:
+                f.write(bytes(64))
+            for quiet in (False, True):
+                with self.subTest(quiet=quiet), mock.patch.object(rsc8_audio, "PROGRESS_BYTES", 64), \
+                        contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(rsc8_audio.main([archive] + (["--quiet"] if quiet else [])), 0)
+                    self.assertEqual(json.loads(out.getvalue())["span"], 64)
+                    if quiet:
+                        self.assertEqual(err.getvalue(), "")
+                    else:
+                        self.assertIn("100.0%", err.getvalue())
+
     def test_scan_rpf_with_and_without_stray_rsc8(self):
         c0 = build_synthetic_rsc8(stream_hash=0x20112233, frames=142)
         c1 = build_synthetic_rsc8(stream_hash=0x80778899, frames=74, inline_dict_name=True)
@@ -730,6 +748,233 @@ class AwcAndArchiveScanTest(unittest.TestCase):
                     rep = json.load(f)
                 self.assertEqual(rep["records"], [])
 
+# The packed blocks are anim_clips sequences, so the synthetic ones come from that tool's test encoder.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_anim_clips import encode_sequence  # noqa: E402
+
+
+def build_synthetic_curve_clip(sequences, frames, formats, pad=()):
+    """A synthetic RSC8 clip whose blocks are real encoded sequences.
+
+    `sequences` are `encode_sequence` outputs (each grown by its `pad` bytes so the builder's block sizes
+    fit), `frames` their frame counts and `formats` the value format of each track-directory entry.
+    """
+    pad = list(pad) or [0] * len(sequences)
+    blocks = []
+    for seq, extra in zip(sequences, pad):
+        seq = bytearray(seq) + bytes(extra)
+        struct.pack_into("<I", seq, 0x04, len(seq) - 0x20)
+        struct.pack_into("<I", seq, 0x10, len(seq))
+        blocks.append(bytes(seq))
+    clip = bytearray(build_synthetic_rsc8(
+        block_frames=list(frames), track_count=len(formats), anim_payload_len=len(blocks[0]) - 0x20,
+    ))
+    dec = rsc8_audio.decode_rsc8(bytes(clip))
+    base = rsc8_audio.RSC8_VIRTUAL_BASE
+    for seq, block in zip(blocks, dec["anim"]["blocks"]):
+        assert block["anim_size"] == len(seq), (block["anim_size"], len(seq))
+        clip[base + block["voff"]:base + block["voff"] + len(seq)] = seq
+    at = base + dec["anim_desc"]["track_ptr"]
+    for i, fmt in enumerate(formats):
+        struct.pack_into("<III", clip, at + 12 * i, 0x01000000 + i, rsc8_audio.TRACK_SCHEMA_HASH, fmt)
+    return bytes(clip)
+
+
+class FacialCurvesTest(unittest.TestCase):
+    NF = 70                                              # more than 64 frames: two type-10 chunks, one boundary
+    RAMP = [3 * f + (f * f) // 7 for f in range(NF)]     # track 2, component 0 (type 10)
+    STEPS = [(5 * f) % 16 for f in range(NF)]            # track 1 (type 4, 4 bits)
+    FORMATS = (4, 4, 3)                                  # two one-value tracks and one two-value track
+
+    def clip(self):
+        seq = encode_sequence(self.NF, [
+            (2, 0, 0, 0.25),
+            (4, 1, 0, (4, 0.5, -1.0, self.STEPS)),
+            (10, 2, 0, (0.125, 2.0, self.RAMP)),
+            (2, 2, 1, -0.75),
+        ])
+        return build_synthetic_curve_clip([seq], [self.NF], self.FORMATS)
+
+    def test_track_type_hash_is_facialtranslation(self):
+        from anim_index import joaat32
+        self.assertEqual(joaat32("facialtranslation"), rsc8_audio.TRACK_SCHEMA_HASH)
+        self.assertIn(rsc8_audio.TRACK_SCHEMA_HASH, rsc8_audio.anim_clips.TRACK_TYPES)
+
+    def test_block_decodes_to_the_encoded_values(self):
+        clip = self.clip()
+        dec = rsc8_audio.decode_rsc8(clip, curves=True)
+        self.assertTrue(dec["valid"], dec["checks"])
+        self.assertEqual(dec["curves"], {
+            "decoded": True,
+            "error": None,
+            "frames": self.NF,
+            "frames_match": True,
+            "quantize_bits_match": True,
+            "tracks_with_values": 3,
+            "channels": {"02_static_float": 2, "04_quantize_float": 1, "10_delta2_float": 1},
+            "delta2_boundaries": 1,
+            "delta2_boundaries_closed": 1,
+            "components": {"4:1": 2, "3:2": 1},
+        })
+        values, frames, tracks = rsc8_audio.decode_facial_curves(
+            memoryview(clip)[rsc8_audio.RSC8_VIRTUAL_BASE:], dec["anim"], dec["anim_desc"])
+        self.assertEqual(frames, self.NF)
+        self.assertEqual([t[2] for t in tracks], list(self.FORMATS))
+        self.assertEqual(values[0], [(0.25,)] * self.NF)
+        self.assertEqual(values[1], [(x * 0.5 - 1.0,) for x in self.STEPS])
+        self.assertEqual(values[2], [(x * 0.125 + 2.0, -0.75) for x in self.RAMP])
+
+    def test_curves_are_opt_in(self):
+        clip = self.clip()
+        self.assertIsNone(rsc8_audio.decode_rsc8(clip)["curves"])
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 56000}])
+        res = rsc8_audio.decode_awc_bank(bank)
+        self.assertIsNone(res["records"][0]["curves"])
+
+    def test_two_blocks_share_their_boundary_frame(self):
+        def seq(lo):
+            ints = [(lo + f) % 16 for f in range(33)]
+            return encode_sequence(33, [(4, 0, 0, (4, 1.0, 0.0, ints)), (2, 1, 0, 0.5)])
+
+        clip = build_synthetic_curve_clip([seq(0), seq(32)], [33, 33], (4, 4), pad=(0, 16))
+        dec = rsc8_audio.decode_rsc8(clip, curves=True)
+        self.assertTrue(dec["valid"], dec["checks"])
+        self.assertEqual(dec["anim"]["frame_count"], 65)
+        self.assertTrue(dec["curves"]["decoded"])
+        self.assertEqual(dec["curves"]["frames"], 65)
+        self.assertTrue(dec["curves"]["frames_match"])
+        values, _frames, _tracks = rsc8_audio.decode_facial_curves(
+            memoryview(clip)[rsc8_audio.RSC8_VIRTUAL_BASE:], dec["anim"], dec["anim_desc"])
+        self.assertEqual(values[0], [(float(f % 16),) for f in range(65)])
+
+    def test_a_clip_that_fails_its_structure_checks_is_not_decoded(self):
+        def seq(lo):
+            ints = [(lo + f) % 16 for f in range(33)]
+            return encode_sequence(33, [(4, 0, 0, (4, 1.0, 0.0, ints)), (2, 1, 0, 0.5)])
+
+        good = build_synthetic_curve_clip([seq(0), seq(32)], [33, 33], (4, 4), pad=(0, 16))
+        dec = rsc8_audio.decode_rsc8(good)
+        base = rsc8_audio.RSC8_VIRTUAL_BASE
+        first, second = dec["anim"]["blocks"][0]["voff"], dec["anim"]["blocks"][1]["voff"]
+
+        # The first block's size word cut to its header: the size checks fail, so nothing is decoded.
+        short = bytearray(good)
+        struct.pack_into("<I", short, base + first + 0x10, 32)
+        bad = rsc8_audio.decode_rsc8(bytes(short), curves=True)
+        self.assertFalse(bad["valid"])
+        self.assertEqual(bad["curves"], {"decoded": False, "error": "structural checks failed"})
+
+        # The first block grown four bytes into the second one's header, with its payload size and the
+        # descriptor's maximum kept consistent: every structure check passes, the overlap is caught.
+        grown = bytearray(good)
+        size = second - first + 4
+        struct.pack_into("<I", grown, base + first + 0x04, size - 32)
+        struct.pack_into("<I", grown, base + first + 0x10, size)
+        desc = base + dec["anim_desc"]["voff"]
+        struct.pack_into("<I", grown, desc + 0x48, max(size, dec["anim"]["blocks"][1]["anim_size"]))
+        overlap = rsc8_audio.decode_rsc8(bytes(grown), curves=True)
+        self.assertTrue(overlap["valid"], overlap["checks"])
+        self.assertEqual(overlap["curves"], {"decoded": False, "error": "block or track extents overlap"})
+
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": good, "samples": 56000},
+            {"id": 0x00112233, "rsc8": bytes(short), "samples": 56000},
+            {"id": 0x00112233, "rsc8": bytes(grown), "samples": 56000},
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            awc = os.path.join(tmp, "bank.awc")
+            with open(awc, "wb") as f:
+                f.write(bank)
+            out_json = os.path.join(tmp, "report.json")
+            cp = subprocess.run([sys.executable, "-I", TOOL, awc, out_json, "--curves", "--quiet"],
+                                capture_output=True, text=True)
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            with open(out_json, encoding="utf-8") as f:
+                summary = json.load(f)["summary"]
+        self.assertEqual(summary["curve_clips"], 3)
+        self.assertEqual(summary["curve_clips_decoded"], 1)
+        self.assertEqual(summary["curve_errors"],
+                         {"structural checks failed": 1, "block or track extents overlap": 1})
+
+    def test_curves_decode_the_resource_in_place(self):
+        import tracemalloc
+
+        clip = self.clip()
+        dec = rsc8_audio.decode_rsc8(clip)
+        padded = clip + bytes(4 << 20)                  # the curve data is unchanged; only the buffer grows
+        view = memoryview(padded)[rsc8_audio.RSC8_VIRTUAL_BASE:]
+        want = rsc8_audio.decode_facial_curves(memoryview(clip)[rsc8_audio.RSC8_VIRTUAL_BASE:],
+                                               dec["anim"], dec["anim_desc"])
+        tracemalloc.start()
+        try:
+            got = rsc8_audio.decode_facial_curves(view, dec["anim"], dec["anim_desc"])
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(got, want)
+        self.assertLess(peak, 1 << 20)                  # a copy of the 4 MiB resource would exceed this
+        # A non-contiguous view is still accepted (it is copied).
+        stride = memoryview(bytes(b for c in clip for b in (c, 0)))[::2]
+        self.assertEqual(rsc8_audio.decode_facial_curves(stride[rsc8_audio.RSC8_VIRTUAL_BASE:],
+                                                         dec["anim"], dec["anim_desc"]), want)
+
+    def test_block_that_does_not_decode_is_counted_not_raised(self):
+        clip = bytearray(self.clip())
+        dec = rsc8_audio.decode_rsc8(bytes(clip))
+        block = rsc8_audio.RSC8_VIRTUAL_BASE + dec["anim"]["blocks"][0]["voff"]
+        frame_offset = struct.unpack_from("<I", clip, block + 0x0C)[0]
+        struct.pack_into("<I", clip, block + 0x0C, frame_offset - 4)     # definitions no longer end at the frames
+        bad = rsc8_audio.decode_rsc8(bytes(clip), curves=True)
+        self.assertTrue(bad["valid"], bad["checks"])                     # the structural checks still pass
+        self.assertFalse(bad["curves"]["decoded"])
+        self.assertTrue(bad["curves"]["error"])
+
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": self.clip(), "samples": 56000},
+            {"id": 0x00112233, "rsc8": bytes(clip), "samples": 56000},
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                f.write(bank)
+                f.write(bytes(0x40))
+            _records, plain = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual(plain["curve_clips"], 0)
+            records, summary = rsc8_audio.scan_rpf(rpf, curves=True)
+            self.assertEqual(summary["curve_clips"], 2)
+            self.assertEqual(summary["curve_clips_decoded"], 1)
+            self.assertEqual(sum(summary["curve_errors"].values()), 1)
+            self.assertEqual(summary["curve_frames_mismatch"], 0)
+            self.assertEqual(summary["curve_quantize_bits_mismatch"], 0)
+            self.assertEqual(summary["curve_channels"],
+                             {"02_static_float": 2, "04_quantize_float": 1, "10_delta2_float": 1})
+            self.assertEqual(summary["curve_components"], {"4:1": 2, "3:2": 1})
+            self.assertEqual(summary["curve_delta2_boundaries"], 1)
+            self.assertEqual(summary["curve_delta2_boundaries_closed"], 1)
+            self.assertEqual([r["curves"]["decoded"] for r in records], [True, False])
+
+            # The CLI flag reaches bank, directory and archive scans, and the report holds counts, not values.
+            awc = os.path.join(tmp, "bank.awc")
+            with open(awc, "wb") as f:
+                f.write(bank)
+            for source in (rpf, awc, tmp):
+                out_json = os.path.join(tmp, "report.json")
+                if os.path.exists(out_json):
+                    os.remove(out_json)
+                cp = subprocess.run(
+                    [sys.executable, "-I", TOOL, source, out_json, "--curves", "--quiet"],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(cp.returncode, 0, cp.stderr)
+                with open(out_json, encoding="utf-8") as f:
+                    rep = json.load(f)
+                self.assertEqual(rep["summary"]["curve_clips"], 2, source)
+                self.assertEqual(rep["summary"]["curve_clips_decoded"], 1, source)
+                for rec in rep["records"]:
+                    self.assertFalse([k for k, v in rec["curves"].items() if isinstance(v, list)], source)
+
+
 def build_synthetic_empty_bank(flags=0xFF210001, hdr_sz=20):
     """Build a synthetic zero-stream ADAT bank whose flag-selected tables fill the header exactly.
 
@@ -847,12 +1092,12 @@ def build_minimal_tag_bank(sid, tags):
     return bytes(hdr) + b"".join(parts)
 
 
-def build_synthetic_grid20(entries):
-    """8-byte header (magic 12345678, unknown) + 20-byte entries, field order as measured."""
-    out = struct.pack("<II", rsc8_audio.GRID20_MAGIC, 7)
-    for value, p, z, lo, hi, s, t, counter in entries:
-        out += struct.pack("<fHHHHHHI", value, p, z, lo, hi, s, t, counter)
-    return out
+def build_synthetic_grid20(entries, trailer=2 / 3):
+    """u32 magic 12345678 + 20-byte entries {u32 position, f32 value, 6 x u16} + f32 trailer (ASSET-256)."""
+    out = struct.pack("<I", rsc8_audio.GRID20_MAGIC)
+    for position, value, p, z, lo, hi, s, t in entries:
+        out += struct.pack("<IfHHHHHH", position, value, p, z, lo, hi, s, t)
+    return out + struct.pack("<f", trailer)
 
 
 def build_synthetic_indexruns(groups, declared=None, hash_=0x4C633D07):
@@ -865,9 +1110,9 @@ def build_synthetic_indexruns(groups, declared=None, hash_=0x4C633D07):
 
 class UndocumentedTagsTest(unittest.TestCase):
     GRID = build_synthetic_grid20([
-        (14.21, 0, 0, 1, 2, 0x39CC, 0x4C15, 2894),
-        (14.12, 32, 0, 1, 2, 0x4193, 0x4C03, 5181),
-        (14.03, 32, 1, 2, 3, 0x49B5, 0x4B15, 7488),
+        (20, 14.21, 0, 0, 1, 2, 0x39CC, 0x4C15),
+        (2894, 14.12, 32, 0, 1, 2, 0x4193, 0x4C03),
+        (5181, 14.03, 32, 1, 2, 3, 0x49B5, 0x4B15),
     ])
     RUNS = build_synthetic_indexruns([(2, [1, 5, 9]), (2, [20, 21])])
 
@@ -875,15 +1120,16 @@ class UndocumentedTagsTest(unittest.TestCase):
         g = rsc8_audio.decode_grid20_table(self.GRID)
         self.assertTrue(g["size_ok"])
         self.assertTrue(g["magic_ok"])
-        self.assertEqual(g["unknown"], 7)
         self.assertEqual(g["entries"], 3)
-        self.assertEqual(g["counter_first"], 2894)
-        self.assertEqual(g["counter_last"], 7488)
-        self.assertTrue(g["counter_increasing"])
+        self.assertEqual(g["position_first"], 20)
+        self.assertEqual(g["position_last"], 5181)
+        self.assertTrue(g["position_increasing"])
+        self.assertAlmostEqual(g["tail_f32"], 2 / 3, places=6)
         self.assertTrue(g["p_multiple_of_32"])
-        empty = rsc8_audio.decode_grid20_table(struct.pack("<II", rsc8_audio.GRID20_MAGIC, 0))
+        empty = rsc8_audio.decode_grid20_table(build_synthetic_grid20([]))
         self.assertTrue(empty["size_ok"] and empty["magic_ok"])
         self.assertEqual(empty["entries"], 0)
+        self.assertIsNone(empty["position_last"])
 
     def test_grid20_flags_violations(self):
         bad_magic = struct.pack("<II", 87654321, 0) + self.GRID[8:]
@@ -891,11 +1137,20 @@ class UndocumentedTagsTest(unittest.TestCase):
         self.assertFalse(rsc8_audio.decode_grid20_table(self.GRID[:-1])["size_ok"])
         self.assertFalse(rsc8_audio.decode_grid20_table(self.GRID[:6])["size_ok"])
         flat = build_synthetic_grid20([
-            (1.0, 0, 0, 0, 1, 0, 0, 500),
-            (2.0, 32, 0, 0, 1, 0, 0, 400),
+            (500, 1.0, 0, 0, 0, 1, 0, 0),
+            (400, 2.0, 32, 0, 0, 1, 0, 0),
         ])
-        self.assertFalse(rsc8_audio.decode_grid20_table(flat)["counter_increasing"])
-        skewed = build_synthetic_grid20([(1.0, 33, 0, 0, 1, 0, 0, 10)])
+        self.assertFalse(rsc8_audio.decode_grid20_table(flat)["position_increasing"])
+        # The trailer is a float after the entries, not a position: its bits never enter the position checks.
+        tail = build_synthetic_grid20([
+            (500, 1.0, 0, 0, 0, 1, 0, 0),
+            (900, 2.0, 32, 0, 0, 1, 0, 0),
+        ], trailer=0.5)
+        g = rsc8_audio.decode_grid20_table(tail)
+        self.assertTrue(g["position_increasing"])
+        self.assertEqual(g["position_last"], 900)
+        self.assertEqual(g["tail_f32"], 0.5)
+        skewed = build_synthetic_grid20([(10, 1.0, 33, 0, 0, 1, 0, 0)])
         self.assertFalse(rsc8_audio.decode_grid20_table(skewed)["p_multiple_of_32"])
 
     def test_indexrun_group_parse(self):
@@ -943,7 +1198,7 @@ class UndocumentedTagsTest(unittest.TestCase):
 
     def test_bank_tally_and_scan_summary(self):
         grid25 = build_synthetic_grid20([
-            (float(i), 32 * i, i % 17, i, i + 1, 0x39CC + i, 0x4C15 - i, 1000 + 7 * i)
+            (1000 + 7 * i, float(i), 32 * i, i % 17, i, i + 1, 0x39CC + i, 0x4C15 - i)
             for i in range(25)
         ])
         bank = build_minimal_tag_bank(0x00112233, {
@@ -957,6 +1212,7 @@ class UndocumentedTagsTest(unittest.TestCase):
         self.assertEqual(res["grid20_streams"], 1)
         self.assertEqual(res["grid20_entries"], 25)
         self.assertEqual(res["grid20_invalid"], 0)
+        self.assertEqual(res["grid20_position_past_samples"], 0)
         self.assertEqual(res["indexrun_streams"], 1)
         self.assertEqual(res["indexrun_groups"], 2)
         self.assertEqual(res["indexrun_invalid"], 0)
@@ -971,6 +1227,18 @@ class UndocumentedTagsTest(unittest.TestCase):
         res_bad = rsc8_audio.decode_awc_bank(bad)
         self.assertEqual(res_bad["indexrun_index_overruns"], 1)
         self.assertEqual(res_bad["grid20_invalid"], 0)
+
+        # Positions that reach the 0x76 sample count are counted (the package has none).
+        long_grid = build_synthetic_grid20([
+            (50000, 1.0, 0, 0, 0, 1, 0, 0),
+            (96000, 2.0, 32, 0, 0, 1, 0, 0),
+        ])
+        past = build_minimal_tag_bank(0x00778899, {
+            0x55: b"\xF8\x00" + bytes(62),
+            0x76: struct.pack("<I", 96000) + bytes(4) + struct.pack("<H", 48000) + bytes(18) + b"\x0B\x01",
+            0x5A: long_grid,
+        })
+        self.assertEqual(rsc8_audio.decode_awc_bank(past)["grid20_position_past_samples"], 1)
 
         with tempfile.TemporaryDirectory() as tmp:
             rpf = os.path.join(tmp, "synth.rpf")
@@ -997,6 +1265,407 @@ class UndocumentedTagsTest(unittest.TestCase):
                 rep = json.load(f)
             self.assertEqual(rep["summary"]["grid20_entries"], 25)
             self.assertEqual(rep["summary"]["indexrun_groups"], 2)
+
+
+def _joaat(name):
+    """Jenkins one-at-a-time, the hash the cue names and the tag ids are stored as."""
+    h = 0
+    for c in name.encode("ascii"):
+        h = (h + c) & 0xFFFFFFFF
+        h = (h + (h << 10)) & 0xFFFFFFFF
+        h ^= h >> 6
+    h = (h + (h << 3)) & 0xFFFFFFFF
+    h ^= h >> 11
+    return (h + (h << 15)) & 0xFFFFFFFF
+
+
+def build_synthetic_markers(records):
+    """16-byte cue records: u32 name hash, f32 value, u32 sample offset, u32 extra. No header."""
+    return b"".join(struct.pack("<IfII", name, value, offset, extra) for name, value, offset, extra in records)
+
+
+class MarkerRecordsTest(unittest.TestCase):
+    INTRO, BEAT, OUTRO = _joaat("intro"), _joaat("beat"), _joaat("outro")
+    MARKS = build_synthetic_markers([
+        (INTRO, 0.0, 0, 0),
+        (BEAT, 1.0, 24000, 0),
+        (BEAT, 2.0, 48000, 0),
+        (OUTRO, 0.0, 90000, 3),
+    ])
+
+    def test_tag_ids_are_the_low_byte_of_the_chunk_name_hash(self):
+        for name, tag in (
+            ("markers", rsc8_audio.TAG_MARKER),
+            ("data", rsc8_audio.TAG_DATA),
+            ("peak", rsc8_audio.TAG_PEAK),
+            ("seektable", rsc8_audio.TAG_SEEKTABLE),
+            ("streamformat", rsc8_audio.TAG_STREAMED_MUSIC),
+        ):
+            self.assertEqual(_joaat(name) & 0xFF, tag, name)
+
+    def test_decodes_every_record_not_a_header(self):
+        m = rsc8_audio.decode_marker_records(self.MARKS, 96000)
+        self.assertTrue(m["size_ok"])
+        self.assertEqual(m["records"], 4)
+        self.assertEqual(m["names"], {self.INTRO: 1, self.BEAT: 2, self.OUTRO: 1})
+        self.assertEqual(m["first_name"], self.INTRO)
+        self.assertNotEqual(m["first_name"], rsc8_audio.MARKER_NAME_COMMON)
+        self.assertTrue(m["offsets_ascending"])
+        self.assertEqual(m["offset_max"], 90000)
+        self.assertEqual(m["extra_max"], 3)
+        self.assertTrue(m["offsets_within_samples"])
+        # Two cues may share one sample offset; that is still in order.
+        tied = build_synthetic_markers([(self.BEAT, 1.0, 10, 0), (self.OUTRO, 0.0, 10, 0)])
+        self.assertTrue(rsc8_audio.decode_marker_records(tied)["offsets_ascending"])
+        self.assertIsNone(rsc8_audio.decode_marker_records(tied)["offsets_within_samples"])
+
+    def test_flags_violations(self):
+        self.assertFalse(rsc8_audio.decode_marker_records(b"")["size_ok"])
+        self.assertFalse(rsc8_audio.decode_marker_records(self.MARKS[:-1])["size_ok"])
+        self.assertFalse(rsc8_audio.decode_marker_records(self.MARKS[:8])["size_ok"])
+        swapped = build_synthetic_markers([(self.BEAT, 1.0, 500, 0), (self.INTRO, 0.0, 0, 0)])
+        self.assertFalse(rsc8_audio.decode_marker_records(swapped)["offsets_ascending"])
+        self.assertFalse(rsc8_audio.decode_marker_records(self.MARKS, 89999)["offsets_within_samples"])
+
+    def test_bank_tally_and_scan_summary(self):
+        fmt = struct.pack("<I", 96000) + bytes(4) + struct.pack("<H", 48000) + bytes(18) + b"\x0B\x01"
+        music = build_minimal_tag_bank(0x00112233, {0x55: b"\xF8\x00" + bytes(62), 0x76: fmt, 0xBD: self.MARKS})
+        speech = build_minimal_tag_bank(0x00445566, {
+            0x55: b"\xF8\x00" + bytes(62),
+            0xBD: build_synthetic_markers([(rsc8_audio.MARKER_NAME_COMMON, 2.0, 0, 2)]),
+        })
+        broken = build_minimal_tag_bank(0x00778899, {0x55: b"\xF8\x00" + bytes(62), 0xBD: self.MARKS[:-4]})
+
+        res = rsc8_audio.decode_awc_bank(music)
+        self.assertEqual(res["marker_streams"], 1)
+        self.assertEqual(res["marker_records"], 4)
+        self.assertEqual(res["marker_invalid"], 0)
+        self.assertEqual(res["marker_first_names"], {f"0x{self.INTRO:08x}": 1})
+        res_bad = rsc8_audio.decode_awc_bank(broken)
+        self.assertEqual(res_bad["marker_streams"], 1)
+        self.assertEqual(res_bad["marker_invalid"], 1)
+        self.assertEqual(res_bad["marker_records"], 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                for bank in (music, speech, music, broken):
+                    f.write(bank)
+                    f.write(bytes(0x40))
+            _records, summary = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual(summary["marker_streams"], 4)
+            self.assertEqual(summary["marker_records"], 9)
+            self.assertEqual(summary["marker_invalid"], 1)
+            self.assertEqual(summary["marker_first_names"], {
+                f"0x{self.INTRO:08x}": 2,
+                f"0x{rsc8_audio.MARKER_NAME_COMMON:08x}": 1,
+            })
+
+            # Directory and single-bank scans merge the per-name map the same way.
+            for i, bank in enumerate((music, speech, music)):
+                with open(os.path.join(tmp, f"bank{i}.awc"), "wb") as f:
+                    f.write(bank)
+            os.remove(rpf)
+            out_json = os.path.join(tmp, "report.json")
+            cp = subprocess.run(
+                [sys.executable, "-I", TOOL, tmp, out_json, "--quiet"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            with open(out_json, encoding="utf-8") as f:
+                rep = json.load(f)
+            self.assertEqual(rep["summary"]["marker_records"], 9)
+            self.assertEqual(rep["summary"]["marker_first_names"][f"0x{self.INTRO:08x}"], 2)
+            _records, single = rsc8_audio.scan_single_file(os.path.join(tmp, "bank1.awc"))
+            self.assertEqual(single["marker_first_names"], {f"0x{rsc8_audio.MARKER_NAME_COMMON:08x}": 1})
+
+    def test_speech_stream_companion_decodes_its_marker(self):
+        clip = build_synthetic_rsc8()
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+        comp = {}
+        real = rsc8_audio._make_record
+
+        def spy(bank_offset, tag_offset, stream_id, decoded, companion):
+            comp.update(companion or {})
+            return real(bank_offset, tag_offset, stream_id, decoded, companion)
+
+        rsc8_audio._make_record = spy
+        try:
+            rsc8_audio.decode_awc_bank(bank)
+        finally:
+            rsc8_audio._make_record = real
+        self.assertEqual(comp["markers"]["records"], 1)
+        self.assertEqual(comp["markers"]["first_name"], rsc8_audio.MARKER_NAME_COMMON)
+        self.assertTrue(comp["markers"]["offsets_within_samples"])
+
+
+def build_synthetic_region_markers(records):
+    """16-byte cue records with the value as a u32 word, as a region cue stores it: name, value, offset, extra."""
+    return b"".join(struct.pack("<IIII", *record) for record in records)
+
+
+class MarkerRegionsTest(unittest.TestCase):
+    """Region cues matched into start/end pairs record by record (ASSET-320). The names are made up."""
+    S, E = _joaat("start"), _joaat("end")
+    VERSE, FILL, BEAT = 0x11111111, 0x22222222, _joaat("beat")
+    FMT = struct.pack("<I", 96000) + bytes(4) + struct.pack("<H", 48000) + bytes(18) + b"\x0B\x01"
+
+    def pair(self, records):
+        return rsc8_audio.pair_marker_regions(rsc8_audio.marker_records(build_synthetic_region_markers(records)))
+
+    def kinds(self, paired):
+        return [(e["kind"], e["index"], e["before"], e["after"]) for e in paired["exceptions"]]
+
+    def check_sums(self, paired):
+        for counts in paired["names"].values():
+            self.assertEqual(counts["starts"],
+                             counts["pairs"] + counts["start_without_end"] + counts["end_before_start"])
+            self.assertEqual(counts["ends"], counts["pairs"] + counts["end_without_start"] + counts["end_before_start"])
+
+    def test_value_words_are_the_hashes_of_start_and_end(self):
+        self.assertEqual(rsc8_audio.MARKER_VALUE_START, self.S)
+        self.assertEqual(rsc8_audio.MARKER_VALUE_END, self.E)
+
+    def test_marker_records_are_the_whole_records(self):
+        blob = build_synthetic_region_markers([(self.VERSE, self.S, 100, 0), (self.VERSE, self.E, 200, 1)])
+        self.assertEqual(rsc8_audio.marker_records(blob), [(self.VERSE, self.S, 100, 0), (self.VERSE, self.E, 200, 1)])
+        self.assertEqual(len(rsc8_audio.marker_records(blob[:-1])), 1)
+        self.assertEqual(rsc8_audio.marker_records(b""), [])
+
+    def test_well_formed_pairs(self):
+        p = self.pair([
+            (self.BEAT, struct.unpack("<I", struct.pack("<f", 4.0))[0], 0, 0),   # not a region cue: ignored
+            (self.VERSE, self.S, 100, 0),
+            (self.VERSE, self.E, 200, 0),
+            (self.VERSE, self.S, 200, 0),   # starts where the last one ended
+            (self.BEAT, struct.unpack("<I", struct.pack("<f", 8.0))[0], 200, 0),
+            (self.VERSE, self.E, 200, 0),   # a zero-length region is still a pair
+            (self.VERSE, self.S, 300, 2),
+            (self.VERSE, self.E, 900, 3),
+        ])
+        self.assertEqual(p["exceptions"], [])
+        self.assertEqual(list(p["names"]), [self.VERSE])
+        self.assertEqual(p["names"][self.VERSE], {
+            "starts": 3, "ends": 3, "other_value": 0, "pairs": 3,
+            "start_without_end": 0, "end_without_start": 0, "end_before_start": 0,
+        })
+        self.assertEqual([(r["start"], r["end"], r["start_index"], r["end_index"]) for r in p["regions"]],
+                         [(100, 200, 1, 2), (200, 200, 3, 5), (300, 900, 6, 7)])
+        self.assertEqual([r["extra_differs"] for r in p["regions"]], [False, False, True])
+        self.check_sums(p)
+        # A tag without a start/end value has no region name at all.
+        self.assertEqual(self.pair([(self.BEAT, 0, 0, 0), (self.VERSE, 0x33333333, 5, 0)]),
+                         {"regions": [], "exceptions": [], "names": {}})
+
+    def test_unmatched_start(self):
+        p = self.pair([(self.VERSE, self.S, 100, 0), (self.VERSE, self.E, 200, 0), (self.VERSE, self.S, 300, 0)])
+        self.assertEqual(len(p["regions"]), 1)
+        self.assertEqual(self.kinds(p), [("start_without_end", 2, "end", None)])   # open at the end of the tag
+        self.assertEqual(p["exceptions"][0], {
+            "kind": "start_without_end", "name": self.VERSE, "value": self.S, "index": 2, "offset": 300,
+            "before": "end", "before_offset": 200, "after": None, "after_offset": None,
+        })
+        self.check_sums(p)
+
+    def test_unmatched_end(self):
+        p = self.pair([(self.VERSE, self.E, 50, 0), (self.VERSE, self.S, 100, 0), (self.VERSE, self.E, 200, 0),
+                       (self.VERSE, self.E, 250, 0)])
+        self.assertEqual([(r["start"], r["end"]) for r in p["regions"]], [(100, 200)])
+        self.assertEqual(self.kinds(p), [("end_without_start", 0, None, "start"),   # open at the start of the tag
+                                         ("end_without_start", 3, "end", None)])    # a second end
+        self.check_sums(p)
+
+    def test_end_before_its_start(self):
+        # In record order: the end comes first, so neither record has a partner.
+        p = self.pair([(self.VERSE, self.E, 100, 0), (self.VERSE, self.S, 200, 0)])
+        self.assertEqual(p["regions"], [])
+        self.assertEqual(self.kinds(p), [("end_without_start", 0, None, "start"),
+                                         ("start_without_end", 1, "end", None)])
+        self.check_sums(p)
+        # In offsets: the end follows its start but lies before it. The pair is refused, once.
+        p = self.pair([(self.VERSE, self.S, 500, 0), (self.VERSE, self.E, 400, 0), (self.VERSE, self.S, 600, 0),
+                       (self.VERSE, self.E, 600, 0)])
+        self.assertEqual([(r["start"], r["end"]) for r in p["regions"]], [(600, 600)])
+        self.assertEqual(self.kinds(p), [("end_before_start", 1, "start", "start")])
+        self.assertEqual(p["names"][self.VERSE]["end_before_start"], 1)
+        self.assertEqual(p["names"][self.VERSE]["start_without_end"], 0)
+        self.check_sums(p)
+
+    def test_nesting_in_one_name_is_not_paired_inside_out(self):
+        p = self.pair([(self.VERSE, self.S, 100, 0), (self.VERSE, self.S, 200, 0), (self.VERSE, self.E, 300, 0),
+                       (self.VERSE, self.E, 400, 0)])
+        self.assertEqual([(r["start"], r["end"]) for r in p["regions"]], [(200, 300)])
+        self.assertEqual(self.kinds(p), [("start_without_end", 0, None, "start"),
+                                         ("end_without_start", 3, "end", None)])
+        self.check_sums(p)
+
+    def test_two_names_interleaved(self):
+        p = self.pair([
+            (self.VERSE, self.S, 100, 0),
+            (self.FILL, self.S, 150, 0),
+            (self.VERSE, self.E, 200, 0),    # VERSE 100..200 and FILL 150..250 cross
+            (self.FILL, self.E, 250, 0),
+            (self.VERSE, self.S, 300, 0),
+            (self.FILL, self.S, 300, 0),
+            (self.FILL, self.E, 350, 0),     # FILL 300..350 inside VERSE 300..400, same start
+            (self.VERSE, self.E, 400, 0),
+            (self.FILL, self.S, 400, 0),     # FILL 400..450 only touches VERSE 300..400
+            (self.FILL, self.E, 450, 0),
+            (self.VERSE, self.S, 500, 0),
+            (self.FILL, self.S, 520, 0),
+            (self.FILL, self.E, 520, 0),     # a zero-length region shares no sample
+            (self.FILL, self.S, 530, 0),
+            (self.FILL, self.E, 600, 0),     # FILL 530..600 inside VERSE 500..600, same end
+            (self.VERSE, self.E, 600, 0),
+        ])
+        self.assertEqual(p["exceptions"], [])
+        self.assertEqual(p["names"][self.VERSE]["pairs"], 3)
+        self.assertEqual(p["names"][self.FILL]["pairs"], 5)
+        self.assertEqual([r["start_index"] for r in p["regions"]], [0, 1, 4, 5, 8, 10, 11, 13])
+        # {(smaller hash, larger hash): [nested, crossing]}
+        self.assertEqual(rsc8_audio.marker_region_overlaps(p["regions"]), {(self.VERSE, self.FILL): [2, 1]})
+        # Each name's regions alone overlap nothing.
+        for name in (self.VERSE, self.FILL):
+            own = [r for r in p["regions"] if r["name"] == name]
+            self.assertEqual(rsc8_audio.marker_region_overlaps(own), {})
+        self.check_sums(p)
+
+    def test_a_third_value_opens_and_closes_nothing(self):
+        other = 0x44444444
+        p = self.pair([(self.VERSE, self.S, 100, 0), (self.VERSE, other, 150, 0), (self.VERSE, self.E, 200, 0),
+                       (self.VERSE, self.S, 300, 0), (self.VERSE, self.E, 400, 0)])
+        self.assertEqual([(r["start"], r["end"]) for r in p["regions"]], [(300, 400)])
+        self.assertEqual(self.kinds(p), [("start_without_end", 0, None, "other"),
+                                         ("other_value", 1, "start", "end"),
+                                         ("end_without_start", 2, "other", "start")])
+        self.assertEqual(p["exceptions"][1]["value"], other)
+        self.assertEqual(p["names"][self.VERSE]["other_value"], 1)
+        self.check_sums(p)
+
+    def region_bank(self, sid, records, fmt=True):
+        tags = {0x55: b"\xF8\x00" + bytes(62), 0xBD: build_synthetic_region_markers(records)}
+        if fmt:
+            tags[0x76] = self.FMT
+        return build_minimal_tag_bank(sid, tags)
+
+    def test_bank_tally_and_scan_summary(self):
+        clean = self.region_bank(0x00112233, [
+            (self.VERSE, self.S, 100, 0), (self.FILL, self.S, 150, 0), (self.VERSE, self.E, 200, 0),
+            (self.FILL, self.E, 450, 0), (self.VERSE, self.S, 1000, 0), (self.VERSE, self.E, 1700, 1),
+        ])
+        ragged = self.region_bank(0x00445566, [
+            (self.BEAT, 0, 0, 0), (self.FILL, self.E, 10, 0), (self.FILL, self.S, 20, 0), (self.FILL, self.E, 60, 0),
+            (self.FILL, self.S, 90, 0),
+        ], fmt=False)
+        plain = self.region_bank(0x00778899, [(self.BEAT, 0, 0, 0), (self.BEAT, 0, 100, 0)])
+        # Offsets that decrease make the tag invalid; its records are not paired.
+        broken = self.region_bank(0x00AABBCC, [(self.VERSE, self.S, 500, 0), (self.VERSE, self.E, 400, 0)])
+
+        res = rsc8_audio.decode_awc_bank(clean)
+        rep = rsc8_audio.marker_region_report(res["marker_regions"])
+        self.assertEqual((rep["tags"], rep["tags_all_paired"], rep["tags_with_sample_count"]), (1, 1, 1))
+        self.assertEqual((rep["starts"], rep["ends"], rep["pairs"]), (3, 3, 3))
+        self.assertEqual(rep["pairs_per_tag"], {"min": 3, "median": 3, "max": 3})
+        self.assertEqual(rep["pairs_extra_differs"], 1)
+        both = f"0x{self.VERSE:08x}+0x{self.FILL:08x}"
+        self.assertEqual(rep["overlaps_between_names"], {
+            "nested": 0, "crossing": 1, "by_names": {both: {"nested": 0, "crossing": 1}},
+        })
+        self.assertEqual(list(rep["names"]), [f"0x{self.VERSE:08x}", f"0x{self.FILL:08x}"])   # most records first
+        self.assertEqual(rep["names"][f"0x{self.VERSE:08x}"], {
+            "tags": 1, "starts": 2, "ends": 2, "other_value": 0, "pairs": 2,
+            "start_without_end": 0, "end_without_start": 0, "end_before_start": 0,
+            "length_samples": {"min": 100, "median": 400, "max": 700},
+        })
+        self.assertEqual((rep["exceptions_total"], rep["exceptions"]), (0, []))
+        self.assertEqual(rsc8_audio.decode_awc_bank(plain)["marker_regions"]["tags"], 0)
+        res_broken = rsc8_audio.decode_awc_bank(broken)
+        self.assertEqual((res_broken["marker_invalid"], res_broken["marker_regions"]["tags"]), (1, 0))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            offsets = []
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                for bank in (clean, ragged, plain, broken, clean):
+                    offsets.append(f.tell())
+                    f.write(bank)
+                    f.write(bytes(0x40))
+            _records, summary = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual((summary["marker_streams"], summary["marker_invalid"]), (5, 1))
+            rep = summary["marker_regions"]
+            self.assertEqual((rep["tags"], rep["tags_all_paired"], rep["tags_with_sample_count"]), (3, 2, 2))
+            self.assertEqual((rep["starts"], rep["ends"], rep["pairs"]), (8, 8, 7))
+            self.assertEqual(rep["pairs_per_tag"], {"min": 1, "median": 3, "max": 3})
+            self.assertEqual(rep["overlaps_between_names"], {
+                "nested": 0, "crossing": 2, "by_names": {both: {"nested": 0, "crossing": 2}},
+            })
+            self.assertEqual(rep["names"][f"0x{self.FILL:08x}"], {
+                "tags": 3, "starts": 4, "ends": 4, "other_value": 0, "pairs": 3,
+                "start_without_end": 1, "end_without_start": 1, "end_before_start": 0,
+                "length_samples": {"min": 40, "median": 300, "max": 300},
+            })
+            self.assertEqual(rep["exceptions_total"], 2)
+            self.assertEqual(rep["exceptions"], [
+                {"kind": "end_without_start", "name": f"0x{self.FILL:08x}", "value": f"0x{self.E:08x}",
+                 "before": None, "before_offset": None, "after": "start", "after_offset": 20,
+                 "record": 1, "tag_records": 5, "offset": 10,
+                 "tag_last_offset": 90, "stream_samples": None, "bank_offset": offsets[1],
+                 "stream_id": "0x00445566"},
+                {"kind": "start_without_end", "name": f"0x{self.FILL:08x}", "value": f"0x{self.S:08x}",
+                 "before": "end", "before_offset": 60, "after": None, "after_offset": None,
+                 "record": 4, "tag_records": 5, "offset": 90,
+                 "tag_last_offset": 90, "stream_samples": None, "bank_offset": offsets[1],
+                 "stream_id": "0x00445566"},
+            ])
+
+            # The list of exceptions is capped; the counts are not.
+            old_cap = rsc8_audio.MAX_REGION_EXCEPTIONS_LISTED
+            try:
+                rsc8_audio.MAX_REGION_EXCEPTIONS_LISTED = 1
+                _records, capped = rsc8_audio.scan_rpf(rpf)
+            finally:
+                rsc8_audio.MAX_REGION_EXCEPTIONS_LISTED = old_cap
+            self.assertEqual(capped["marker_regions"]["exceptions_total"], 2)
+            self.assertEqual(capped["marker_regions"]["exceptions"], rep["exceptions"][:1])
+
+            # Directory and single-bank scans report the same block; the CLI writes it as JSON.
+            os.remove(rpf)
+            for i, bank in enumerate((clean, ragged, plain, broken, clean)):
+                with open(os.path.join(tmp, f"bank{i}.awc"), "wb") as f:
+                    f.write(bank)
+            out_json = os.path.join(tmp, "report.json")
+            cp = subprocess.run(
+                [sys.executable, "-I", TOOL, tmp, out_json, "--summary-only", "--quiet"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            with open(out_json, encoding="utf-8") as f:
+                from_dir = json.load(f)["summary"]["marker_regions"]
+            self.assertEqual(json.loads(cp.stdout)["marker_regions"], from_dir)
+            for entry in from_dir["exceptions"]:
+                self.assertEqual(entry.pop("bank_offset"), 0)
+            for entry in rep["exceptions"]:
+                entry.pop("bank_offset")
+            self.assertEqual(from_dir, rep)
+            _records, single = rsc8_audio.scan_single_file(os.path.join(tmp, "bank1.awc"))
+            self.assertEqual((single["marker_regions"]["pairs"], single["marker_regions"]["exceptions_total"]), (1, 2))
+            self.assertEqual(single["marker_regions"]["names"][f"0x{self.FILL:08x}"]["length_samples"],
+                             {"min": 40, "median": 40, "max": 40})
+
+    def test_a_scan_without_region_cues_reports_an_empty_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rsc_path = os.path.join(tmp, "only.rsc8")
+            with open(rsc_path, "wb") as f:
+                f.write(build_synthetic_rsc8(stream_hash=0x11112222, frames=45))
+            _records, summary = rsc8_audio.scan_single_file(rsc_path)
+        self.assertEqual(summary["marker_regions"], {
+            "tags": 0, "tags_all_paired": 0, "tags_with_sample_count": 0, "starts": 0, "ends": 0, "pairs": 0,
+            "pairs_per_tag": None, "pairs_extra_differs": 0,
+            "overlaps_between_names": {"nested": 0, "crossing": 0, "by_names": {}},
+            "names": {}, "exceptions_total": 0, "exceptions": [],
+        })
 
 
 if __name__ == "__main__":

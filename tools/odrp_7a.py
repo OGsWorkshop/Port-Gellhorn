@@ -37,8 +37,12 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 SIGNATURE = b"0DRP"
 VERSION = 0x7A
@@ -976,6 +980,10 @@ def _carve_stored_map(folder):
         return {}
 
 
+def _is_carved_file(path):
+    return path.lower().endswith(".bin") and os.path.isfile(path)
+
+
 def scan_dir(path, max_inflate=MAX_INFLATE):
     """Scan a directory of carved `.bin` files in bounded memory."""
     t0 = time.time()
@@ -984,10 +992,7 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
     skipped = 0
     for idx, name in enumerate(sorted(os.listdir(path))):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
-            continue
-        low = name.lower()
-        if low.endswith((".json", ".csv", ".bk2")) or not low.endswith(".bin"):
+        if not _is_carved_file(full):
             continue
         fsize = os.path.getsize(full)
         if fsize > max_inflate:
@@ -1114,26 +1119,44 @@ def summarise(
 
 def write_output(path, rows, summary):
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".json":
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"summary": summary, "records": rows}, fh, indent=1)
-        return
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=COLUMNS, lineterminator="\n")
-        writer.writeheader()
-        for row in rows:
-            out = {}
-            for col in COLUMNS:
-                val = row[col]
-                if col == "offset":
-                    out[col] = f"0x{val:x}"
-                elif isinstance(val, bool):
-                    out[col] = int(val)
-                elif val is None:
-                    out[col] = ""
-                else:
-                    out[col] = val
-            writer.writerow(out)
+    parent = os.path.dirname(os.path.abspath(path))
+    tmp = None
+    try:
+        if ext == ".json":
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
+                                             prefix=".odrp_7a-", suffix=".tmp", delete=False) as fh:
+                tmp = fh.name
+                json.dump({"summary": summary, "records": rows}, fh, indent=1)
+        else:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=parent,
+                                             prefix=".odrp_7a-", suffix=".tmp", delete=False) as fh:
+                tmp = fh.name
+                writer = csv.DictWriter(fh, fieldnames=COLUMNS, lineterminator="\n")
+                writer.writeheader()
+                for row in rows:
+                    out = {}
+                    for col in COLUMNS:
+                        val = row[col]
+                        if col == "offset":
+                            out[col] = f"0x{val:x}"
+                        elif isinstance(val, bool):
+                            out[col] = int(val)
+                        elif val is None:
+                            out[col] = ""
+                        else:
+                            out[col] = val
+                    writer.writerow(out)
+        os.chmod(tmp, published_mode(path))
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                if os.path.lexists(tmp):
+                    os.chmod(tmp, 0o600)
+                    os.remove(tmp)
+            except OSError:
+                pass
+        raise
 
 
 def _offset_arg(text):
@@ -1207,7 +1230,7 @@ def main(argv=None):
         if os.path.isfile(args.out):
             for name in os.listdir(args.source):
                 cand = os.path.join(args.source, name)
-                if os.path.isfile(cand) and _same_path(cand, args.out):
+                if _is_carved_file(cand) and _same_path(cand, args.out):
                     ap.error(f"output would overwrite an input file: {args.out}")
     elif os.path.isfile(args.source):
         is_rpf = _is_rpf_file(args.source)

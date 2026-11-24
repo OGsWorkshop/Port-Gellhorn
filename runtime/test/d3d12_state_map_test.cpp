@@ -614,7 +614,9 @@ int main() {
                    replay(invalid, VK_NULL_HANDLE, resolve, vk) == ReplayResult::invalid_indirect_arguments;
         };
         CHECK(rejected({IndirectKind::draw, 12, 1, 1, 0, 0, 0}));
-        CHECK(rejected({IndirectKind::draw, 16, 1, 1, 2, 0, 0}));
+        CHECK(!CommandList{}.execute_indirect({IndirectKind::draw, 16, 1, 1, 2, 0, 0}));
+        CHECK(!CommandList{}.execute_indirect({IndirectKind::draw, 16, 1, 1, 0, 2, 2}));
+        CHECK(!CommandList{}.execute_indirect({IndirectKind::draw, 16, 1, 1, 0, 0, 4}));
         CHECK(rejected({IndirectKind::draw, 16, 2, 1, 112, 0, 0}));
         CHECK(rejected({IndirectKind::draw, 16, 1, 1, 4, 2, 16}));
         arguments.buffer_offset = UINT64_MAX - 3;
@@ -658,6 +660,21 @@ int main() {
         CHECK(!resizable_bar(memory({{8ull << 30, 0}}, {{local | host, 0}})));
         CHECK(!resizable_bar(memory({{8ull << 30, vram}}, {{local | host, 1}})));
         CHECK(!resizable_bar(VkPhysicalDeviceMemoryProperties{}));
+    }
+
+    // D3D-299: a texture (required 0, preferred DEVICE_LOCAL) in host memory has spilled; the arena (required
+    // HOST_VISIBLE | HOST_COHERENT, preferred DEVICE_LOCAL) in host memory has not, and neither has anything that
+    // got DEVICE_LOCAL or never asked for it.
+    {
+        constexpr VkMemoryPropertyFlags local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        CHECK(spilled_to_host(0, local, host));
+        CHECK(spilled_to_host(0, local, 0));
+        CHECK(!spilled_to_host(0, local, local));
+        CHECK(!spilled_to_host(0, local, local | host));
+        CHECK(!spilled_to_host(host, local, host));
+        CHECK(!spilled_to_host(host, 0, host));
+        CHECK(!spilled_to_host(0, 0, host));
     }
 
     // Memory type choice. Heaps as an RTX 3090 without Resizable BAR reports them: VRAM, system memory, and the

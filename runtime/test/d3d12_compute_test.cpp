@@ -9,7 +9,9 @@
 // The shader (test/glsl/cs_user_data.comp) is written to the translator's push-constant and address contract.
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/cached_pso.h"
@@ -203,9 +205,11 @@ std::vector<HRESULT> cached_pso_cases(Device* device, D3D12_COMPUTE_PIPELINE_STA
 }
 
 // The same cases on the PC runtime, with an empty compute shader from d3dcompiler_47: the default adapter, then WARP.
-// Empty when the host has no D3D12 device or no compiler (Wine), which the caller reports as a skip.
+// Empty when the host has no D3D12 device or no compiler, or is Wine's, which the caller reports as a skip: vkd3d has
+// both, but its GetCachedBlob is a stub, so every host answered nothing and the comparison failed on each run.
 std::vector<std::vector<HRESULT>> host_cached_pso_cases(const std::vector<std::uint8_t>& root_blob,
                                                         const std::vector<std::uint8_t>& other_root_blob) {
+    if (hostwine::host_is_wine()) return {};
     using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT,
                                        ID3DBlob**, ID3DBlob**);
     using CreateDeviceFn = decltype(&::D3D12CreateDevice);
@@ -268,10 +272,9 @@ int main() {
     for (std::uint32_t i = 0; i < 14; ++i) put32(fssm, 0xbf810000u + i);  // filler, s_endpgm-like words
     const auto container = shader_container(fssm);
     EXPECT(leonida::fssm_program(container) == fssm);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_compute_test";
-    std::filesystem::create_directories(library);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv",
-                               std::filesystem::copy_options::overwrite_existing);
+    const testfiles::ScratchDir scratch("leonida_compute_test");
+    const auto& library = scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         // An entry for the same program with set-0 bindings comes first, as in one group of the corpus: the PSO
@@ -282,11 +285,27 @@ int main() {
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
                  "\"uses_code_base\": true, \"wave64\": false}}";
     }
+    // A second program whose only translation is in <library>/bvh/index.json, where make_game.py puts the programs
+    // of XboxBvhBuilder.dll (docs/embedded_shaders.md): the same container shape and the same key, another folder.
+    auto builder_fssm = fssm;
+    builder_fssm[4] ^= 0x40;  // another code word, so another hash
+    const auto builder_container = shader_container(builder_fssm);
+    std::filesystem::create_directories(library / "bvh");
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
+                                library / "bvh" / "BuilderProgram.spv"));
+    {
+        std::ofstream index(library / "bvh" / "index.json", std::ios::binary);
+        index << "{\"BuilderProgram\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(builder_fssm)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
+                 "\"uses_code_base\": true, \"wave64\": false}}";
+    }
 
     constexpr UINT elements = 64, bytes = elements * 4;
     const std::uint32_t table_values[4] = {1000, 2000, 3000, 4000};
     std::vector<std::uint32_t> first(elements), second(elements), third(elements);
     std::vector<std::uint32_t> cbv_a_out(elements), cbv_oob_out(elements), cbv_b_out(elements), cbv_null_out(elements);
+    std::vector<std::uint32_t> srv_raw_a(elements), srv_raw_b(elements), srv_struct_a(elements),
+        srv_struct_b(elements), srv_typed(elements), srv_null(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -305,7 +324,8 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
 
-        // Root signature: [0] two constants (s0, s1), [1] a root UAV (s2:s3), [2] a one-CBV table (s4:s5).
+        // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
+        // the console compute layout (rt::rootsig::pack_stage, D3D-448).
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -337,6 +357,14 @@ int main() {
         const auto other_container = shader_container(other);
         pso_desc.CS = {other_container.data(), other_container.size()};
         EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
+        {
+            // XboxBvhBuilder.dll's call: slot 62 with a container whose program is translated in <library>/bvh.
+            Ref<ID3D12PipelineState> builder_pso;
+            pso_desc.CS = {builder_container.data(), builder_container.size()};
+            EXPECT(SUCCEEDED(reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
+                device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&builder_pso.p))));
+            EXPECT(builder_pso.p && builder_pso.p != pso.p);
+        }
         pso_desc.CS = {container.data(), container.size()};
 
         // The PSO through slot 67, compute pipeline from native code; maps to CreateComputePipelineState.
@@ -385,7 +413,9 @@ int main() {
                                                    E_INVALIDARG, E_INVALIDARG, S_OK};
             EXPECT(layer == expected);
             const auto hosts = host_cached_pso_cases(root_blob, other_root_blob);
-            if (hosts.empty()) std::printf("SKIP: no host D3D12 device or compiler for the CachedPSO comparison\n");
+            if (hosts.empty())
+                std::printf("SKIP: no host D3D12 reference (Wine, or no device or compiler) for the CachedPSO "
+                            "comparison\n");
             for (const auto& host : hosts) EXPECT(host == layer);
             if (!hosts.empty()) std::printf("cached PSO: %zu host adapter(s) gave the same %d answers\n", hosts.size(), cached_case_count);
 
@@ -393,15 +423,15 @@ int main() {
             Ref<ID3DBlob> blob;
             EXPECT(pso->GetCachedBlob(&blob.p) == S_OK && blob.p);
             const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
-            std::vector<std::uint8_t> bytes(p, p + blob->GetBufferSize());
+            std::vector<std::uint8_t> blob_bytes(p, p + blob->GetBufferSize());
             auto attempt = [&](const std::vector<std::uint8_t>& b) {
                 D3D12_COMPUTE_PIPELINE_STATE_DESC d = pso_desc;
                 d.CachedPSO = {b.data(), b.size()};
                 Ref<ID3D12PipelineState> made;
                 return device->CreateComputePipelineState(&d, IID_PPV_ARGS(&made.p));
             };
-            for (std::size_t at = 0; at < bytes.size(); ++at) {
-                auto changed = bytes;
+            for (std::size_t at = 0; at < blob_bytes.size(); ++at) {
+                auto changed = blob_bytes;
                 changed[at] ^= 0x01;
                 EXPECT(attempt(changed) == E_INVALIDARG);
             }
@@ -411,11 +441,11 @@ int main() {
                 for (int i = 0; i < 4; ++i) b[b.size() - 4 + i] = std::uint8_t(sum >> (8 * i));
                 return b;
             };
-            EXPECT(attempt(resealed(bytes, 8)) == D3D12_ERROR_ADAPTER_NOT_FOUND);   // vendor
-            EXPECT(attempt(resealed(bytes, 12)) == D3D12_ERROR_ADAPTER_NOT_FOUND);  // device
-            EXPECT(attempt(resealed(bytes, 16)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);
-            EXPECT(attempt(resealed(bytes, 20)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);  // pipelineCacheUUID
-            EXPECT(attempt(resealed(bytes, 4)) == E_INVALIDARG);  // version
+            EXPECT(attempt(resealed(blob_bytes, 8)) == D3D12_ERROR_ADAPTER_NOT_FOUND);   // vendor
+            EXPECT(attempt(resealed(blob_bytes, 12)) == D3D12_ERROR_ADAPTER_NOT_FOUND);  // device
+            EXPECT(attempt(resealed(blob_bytes, 16)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);
+            EXPECT(attempt(resealed(blob_bytes, 20)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);  // pipelineCacheUUID
+            EXPECT(attempt(resealed(blob_bytes, 4)) == E_INVALIDARG);  // version
         }
 
         // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
@@ -434,6 +464,44 @@ int main() {
             limited_desc.pRootSignature = limited_root.p;
             Ref<ID3D12PipelineState> refused;
             EXPECT(limited->CreateComputePipelineState(&limited_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+        }
+
+        // The GPU address arena is no larger than the device's maxBufferSize and maxMemoryAllocationSize
+        // (src/arena_size.h), whatever LEONIDA_ARENA_MB asks for: with LEONIDA_ARENA_MB=3000 on a GPU that reports
+        // 2 GiB (RX 6800), a run under LEONIDA_VK_VALIDATION=1 has no vkAllocateMemory error. A device that reports
+        // a 32 MiB maxMemoryAllocationSize (simulated) gets at most 32 MiB from the default 256, and a buffer past
+        // that is refused.
+        {
+            VkPhysicalDeviceMaintenance4Properties m4{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES};
+            VkPhysicalDeviceMaintenance3Properties m3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES, &m4};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &m3};
+            d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &properties);
+            const std::uint64_t arena = rt::d3d12::device_arena_size(device.p);
+            EXPECT(arena > 0 && arena <= m4.maxBufferSize && arena <= m3.maxMemoryAllocationSize);
+
+            constexpr std::uint64_t capped_limit = 32ull << 20;
+            rt::d3d12::VulkanDeviceInfo capped_info = info;
+            capped_info.max_memory_allocation_size = capped_limit;
+            Ref<ID3D12Device> capped;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(capped_info, IID_PPV_ARGS(&capped.p))));
+            const std::uint64_t capped_arena = rt::d3d12::device_arena_size(capped.p);
+            EXPECT(capped_arena > 0 && capped_arena <= capped_limit);
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            const auto fits = buffer_desc(1u << 20, D3D12_RESOURCE_FLAG_NONE);
+            const auto too_large = buffer_desc(capped_limit + (1u << 20), D3D12_RESOURCE_FLAG_NONE);
+            Ref<ID3D12Resource> inside, past;
+            EXPECT(SUCCEEDED(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &fits,
+                                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&inside.p))));
+            EXPECT(inside->GetGPUVirtualAddress() + (1u << 20) <= capped_arena);
+            EXPECT(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &too_large, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, IID_PPV_ARGS(&past.p)) == E_OUTOFMEMORY && !past.p);
+            std::printf("arena: %llu MiB (device limits: maxBufferSize %llu MiB, maxMemoryAllocationSize %llu MiB); "
+                        "%llu MiB with a simulated 32 MiB maxMemoryAllocationSize\n",
+                        static_cast<unsigned long long>(arena >> 20),
+                        static_cast<unsigned long long>(m4.maxBufferSize >> 20),
+                        static_cast<unsigned long long>(m3.maxMemoryAllocationSize >> 20),
+                        static_cast<unsigned long long>(capped_arena >> 20));
         }
 
         // Buffers in the arena, an upload buffer outside it, a readback buffer for the results.
@@ -470,7 +538,7 @@ int main() {
         std::memcpy(mapped, table_values, sizeof(table_values));
 
         // A shader-visible heap in the arena; its first slot gets the upload buffer's VA, written as raw bytes.
-        const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+        const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
                                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
@@ -499,7 +567,7 @@ int main() {
         list->SetComputeRootUnorderedAccessView(0, va_a);
         EXPECT(list->Close() == E_INVALIDARG);
 
-        // Two dispatches: the second changes s0 and the UAV; each must keep what it was recorded with.
+        // Two dispatches: the second changes s4 and the UAV; each must keep what it was recorded with.
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         ID3D12DescriptorHeap* heaps[] = {heap.p};
         list->SetDescriptorHeaps(1, heaps);
@@ -686,6 +754,191 @@ int main() {
             std::memcpy(cbv_null_out.data(), src_bytes + 3 * bytes, bytes);
         }
 
+        // CreateShaderResourceView(buffer): raw, structured, and typed GFX10 V# descriptors in the shader-visible heap.
+        {
+            const UINT inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            EXPECT(inc == 32);
+            // 1024-byte arena buffer = 256 uint32 words = 64 16-byte structs / float4 elements.
+            constexpr UINT buf_bytes = 1024;
+            const auto srv_buf_desc = buffer_desc(buf_bytes, D3D12_RESOURCE_FLAG_NONE);
+            const auto deny_buf_desc = buffer_desc(256, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+            Ref<ID3D12Resource> srv_upload, srv_default, srv_deny, srv_readback;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &srv_buf_desc,
+                                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                             IID_PPV_ARGS(&srv_upload.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &srv_buf_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&srv_default.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &deny_buf_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&srv_deny.p))));
+            const auto srv_rb_desc = buffer_desc(6 * bytes, D3D12_RESOURCE_FLAG_NONE);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &srv_rb_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&srv_readback.p))));
+            void* srv_mapped = nullptr;
+            EXPECT(SUCCEEDED(srv_upload->Map(0, nullptr, &srv_mapped)));
+            auto* words = static_cast<std::uint32_t*>(srv_mapped);
+            for (UINT w = 0; w < buf_bytes / 4; ++w) words[w] = 0x50000u + w;
+            const D3D12_GPU_VIRTUAL_ADDRESS srv_va = srv_default->GetGPUVirtualAddress();
+            EXPECT(srv_va >= 0x10000 && srv_va < (1ull << 32));
+
+            const auto slot_cpu = [&](UINT idx) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(cpu + idx * inc)}; };
+            const auto slot_gpu = [&](UINT idx) { return D3D12_GPU_DESCRIPTOR_HANDLE{gpu + idx * inc}; };
+            std::uint8_t zeros[32] = {};
+
+            // Slot 1: Raw buffer SRV A (FirstElement = 0, NumElements = 32 -> 128 bytes; words 32..63 must read 0).
+            D3D12_SHADER_RESOURCE_VIEW_DESC raw_a{};
+            raw_a.Format = DXGI_FORMAT_R32_TYPELESS;
+            raw_a.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            raw_a.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            raw_a.Buffer = {0, 32, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+            device->CreateShaderResourceView(srv_default.p, &raw_a, slot_cpu(1));
+
+            // Slot 2: Raw buffer SRV B (FirstElement = 64, NumElements = 32 -> negative control shifted by +64 dwords).
+            D3D12_SHADER_RESOURCE_VIEW_DESC raw_b = raw_a;
+            raw_b.Buffer.FirstElement = 64;
+            device->CreateShaderResourceView(srv_default.p, &raw_b, slot_cpu(2));
+
+            // Slot 3: Structured buffer SRV A (stride 16, FirstElement = 0, NumElements = 32 -> elements 32..63 OOB).
+            D3D12_SHADER_RESOURCE_VIEW_DESC struct_a{};
+            struct_a.Format = DXGI_FORMAT_UNKNOWN;
+            struct_a.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            struct_a.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            struct_a.Buffer = {0, 32, 16, D3D12_BUFFER_SRV_FLAG_NONE};
+            device->CreateShaderResourceView(srv_default.p, &struct_a, slot_cpu(3));
+
+            // Slot 4: Structured buffer SRV B (stride 16, FirstElement = 16, NumElements = 32 -> shifted +16 structs).
+            D3D12_SHADER_RESOURCE_VIEW_DESC struct_b = struct_a;
+            struct_b.Buffer.FirstElement = 16;
+            device->CreateShaderResourceView(srv_default.p, &struct_b, slot_cpu(4));
+
+            // Slot 5: Typed buffer SRV (R32G32B32A32_FLOAT, stride 16, FirstElement = 8, NumElements = 24, custom swizzle).
+            D3D12_SHADER_RESOURCE_VIEW_DESC typed_desc{};
+            typed_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            typed_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            typed_desc.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 1, 0, 5);  // B,G,R,1
+            typed_desc.Buffer = {8, 24, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+            device->CreateShaderResourceView(srv_default.p, &typed_desc, slot_cpu(5));
+
+            // Slot 6: Typed RGB96 buffer SRV (R32G32B32_FLOAT, stride 12, FirstElement = 2, NumElements = 10).
+            D3D12_SHADER_RESOURCE_VIEW_DESC rgb96_desc{};
+            rgb96_desc.Format = DXGI_FORMAT_R32G32B32_FLOAT;
+            rgb96_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            rgb96_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            rgb96_desc.Buffer = {2, 10, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+            device->CreateShaderResourceView(srv_default.p, &rgb96_desc, slot_cpu(6));
+
+            // CPU V# decode verification for slots 1..6.
+            const auto decode_slot = [&](UINT idx, leonida::gfx10::Buffer& dec) -> bool {
+                leonida::gfx10::BufferWords rw{};
+                std::memcpy(rw.data(), reinterpret_cast<const void*>(slot_cpu(idx).ptr), sizeof(rw));
+                return leonida::gfx10::decode(rw, dec) &&
+                       std::memcmp(reinterpret_cast<const std::uint8_t*>(slot_cpu(idx).ptr) + 16, zeros, 16) == 0;
+            };
+            {
+                leonida::gfx10::Buffer d1{}, d2{}, d3{}, d4{}, d5{}, d6{};
+                EXPECT(decode_slot(1, d1));
+                EXPECT(d1.address == srv_va && d1.stride == 0 && d1.num_records == 128 &&
+                       d1.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT) &&
+                       d1.oob_select == leonida::gfx10::OobSelect::raw);
+                EXPECT(decode_slot(2, d2));
+                EXPECT(d2.address == srv_va + 256 && d2.stride == 0 && d2.num_records == 128 &&
+                       d2.oob_select == leonida::gfx10::OobSelect::raw);
+                EXPECT(decode_slot(3, d3));
+                EXPECT(d3.address == srv_va && d3.stride == 16 && d3.num_records == 32 &&
+                       d3.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT) &&
+                       d3.oob_select == leonida::gfx10::OobSelect::structured);
+                EXPECT(decode_slot(4, d4));
+                EXPECT(d4.address == srv_va + 256 && d4.stride == 16 && d4.num_records == 32 &&
+                       d4.oob_select == leonida::gfx10::OobSelect::structured);
+                EXPECT(decode_slot(5, d5));
+                const leonida::gfx10::Swizzle want_swz = {leonida::gfx10::select_z, leonida::gfx10::select_y,
+                                                          leonida::gfx10::select_x, leonida::gfx10::select_one};
+                EXPECT(d5.address == srv_va + 8 * 16 && d5.stride == 16 && d5.num_records == 24 &&
+                       d5.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32G32B32A32_SFLOAT) &&
+                       d5.swizzle == want_swz && d5.oob_select == leonida::gfx10::OobSelect::structured);
+                EXPECT(decode_slot(6, d6));
+                EXPECT(d6.address == srv_va + 2 * 12 && d6.stride == 12 && d6.num_records == 10 &&
+                       d6.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32G32B32_SFLOAT) &&
+                       d6.oob_select == leonida::gfx10::OobSelect::structured);
+            }
+
+            // Invalid/refused buffer SRVs must all leave slot 7 zeroed.
+            const auto expect_zero_srv = [&](ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* d) -> bool {
+                std::memset(reinterpret_cast<void*>(slot_cpu(7).ptr), 0xA5, inc);
+                device->CreateShaderResourceView(res, d, slot_cpu(7));
+                return std::memcmp(reinterpret_cast<const void*>(slot_cpu(7).ptr), zeros, sizeof(zeros)) == 0;
+            };
+            EXPECT(expect_zero_srv(srv_default.p, nullptr));          // null desc on buffer
+            EXPECT(expect_zero_srv(srv_deny.p, &raw_a));              // DENY_SHADER_RESOURCE
+            auto bad = raw_a;
+            bad.Format = DXGI_FORMAT_R32_UINT;
+            EXPECT(expect_zero_srv(srv_default.p, &bad));             // RAW requires R32_TYPELESS
+            bad = raw_a;
+            bad.Buffer.StructureByteStride = 4;
+            EXPECT(expect_zero_srv(srv_default.p, &bad));             // RAW requires stride 0
+            bad = struct_a;
+            bad.Format = DXGI_FORMAT_R32_FLOAT;
+            EXPECT(expect_zero_srv(srv_default.p, &bad));             // structured requires DXGI_FORMAT_UNKNOWN
+            bad = struct_a;
+            bad.Buffer.FirstElement = 60;
+            bad.Buffer.NumElements = 10;
+            EXPECT(expect_zero_srv(srv_default.p, &bad));             // out of bounds (70 * 16 > 1024)
+            EXPECT(expect_zero_srv(nullptr, &raw_a));                 // null resource -> null V#
+
+            // Upload buffer contents to arena and dispatch 6 GPU passes through the shader-visible descriptor table.
+            // out_a is already in D3D12_RESOURCE_STATE_UNORDERED_ACCESS at the end of the CBV pass.
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
+            list->CopyBufferRegion(srv_default.p, 0, srv_upload.p, 0, buf_bytes);
+            const auto srv_ready = transition(srv_default.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &srv_ready);
+            list->SetDescriptorHeaps(1, heaps);
+            list->SetComputeRootSignature(root.p);
+            list->SetComputeRootUnorderedAccessView(1, va_a);
+
+            const struct SrvDispatch {
+                UINT slot_idx;
+                UINT readback_offset;
+            } srv_dispatches[] = {
+                {1, 0 * bytes},
+                {2, 1 * bytes},
+                {3, 2 * bytes},
+                {4, 3 * bytes},
+                {5, 4 * bytes},
+                {7, 5 * bytes},
+            };
+            const std::uint32_t srv_mode[2] = {0u, 0xFFFFFFFFu};  // s1 == 0xFFFFFFFF selects buffer SRV V# mode
+            list->SetComputeRoot32BitConstants(0, 2, srv_mode, 0);
+            for (const auto& cfg : srv_dispatches) {
+                list->SetComputeRootDescriptorTable(2, slot_gpu(cfg.slot_idx));
+                list->Dispatch(1, 1, 1);
+                const auto to_src =
+                    transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &to_src);
+                list->CopyBufferRegion(srv_readback.p, cfg.readback_offset, out_a.p, 0, bytes);
+                const auto to_uav =
+                    transition(out_a.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                list->ResourceBarrier(1, &to_uav);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)));
+            EXPECT(SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+
+            void* srv_res = nullptr;
+            EXPECT(SUCCEEDED(srv_readback->Map(0, nullptr, &srv_res)));
+            const auto* rb = static_cast<const std::uint8_t*>(srv_res);
+            std::memcpy(srv_raw_a.data(), rb + 0 * bytes, bytes);
+            std::memcpy(srv_raw_b.data(), rb + 1 * bytes, bytes);
+            std::memcpy(srv_struct_a.data(), rb + 2 * bytes, bytes);
+            std::memcpy(srv_struct_b.data(), rb + 3 * bytes, bytes);
+            std::memcpy(srv_typed.data(), rb + 4 * bytes, bytes);
+            std::memcpy(srv_null.data(), rb + 5 * bytes, bytes);
+        }
+
         for (auto* r : {&out_a, &out_b, &out_c, &constants, &readback}) r->reset();
         pso67.reset();
         unknown67.reset();
@@ -702,7 +955,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     unsigned mismatches = 0;
     for (std::uint32_t i = 0; i < elements; ++i) {
@@ -735,6 +987,35 @@ int main() {
     std::printf("CreateConstantBufferView: 64/64 dwords matched for CBV A, 32 in-bounds + 32 OOB-zero matched at "
                 "+128, negative controls flipped %u/%u (CBV B) and %u/%u (null CBV)\n",
                 cbv_b_diff, elements, cbv_null_diff, elements);
+    UINT raw_diff = 0, struct_diff = 0, null_diff = 0;
+    for (std::uint32_t i = 0; i < elements; ++i) {
+        const std::uint32_t want_raw_a = i < 32 ? (0x50000u + i) : 0u;
+        const std::uint32_t want_raw_b = i < 32 ? (0x50000u + 64u + i) : 0u;
+        const std::uint32_t want_struct_a = i < 32 ? (0x50000u + i * 4u) : 0u;
+        const std::uint32_t want_struct_b = i < 32 ? (0x50000u + (16u + i) * 4u) : 0u;
+        const std::uint32_t want_typed = i < 24 ? (0x50000u + (8u + i) * 4u) : 0u;
+        if (srv_raw_a[i] != want_raw_a && mismatches++ < 4)
+            std::fprintf(stderr, "SRV raw A[%u]: got 0x%x want 0x%x\n", i, srv_raw_a[i], want_raw_a);
+        if (srv_raw_b[i] != want_raw_b && mismatches++ < 4)
+            std::fprintf(stderr, "SRV raw B[%u]: got 0x%x want 0x%x\n", i, srv_raw_b[i], want_raw_b);
+        if (srv_struct_a[i] != want_struct_a && mismatches++ < 4)
+            std::fprintf(stderr, "SRV struct A[%u]: got 0x%x want 0x%x\n", i, srv_struct_a[i], want_struct_a);
+        if (srv_struct_b[i] != want_struct_b && mismatches++ < 4)
+            std::fprintf(stderr, "SRV struct B[%u]: got 0x%x want 0x%x\n", i, srv_struct_b[i], want_struct_b);
+        if (srv_typed[i] != want_typed && mismatches++ < 4)
+            std::fprintf(stderr, "SRV typed[%u]: got 0x%x want 0x%x\n", i, srv_typed[i], want_typed);
+        if (srv_null[i] != 0u && mismatches++ < 4)
+            std::fprintf(stderr, "SRV null[%u]: got 0x%x want 0\n", i, srv_null[i]);
+        if (srv_raw_b[i] != srv_raw_a[i]) ++raw_diff;
+        if (srv_struct_b[i] != srv_struct_a[i]) ++struct_diff;
+        if (srv_null[i] != srv_raw_a[i]) ++null_diff;
+    }
+    EXPECT(!mismatches);
+    EXPECT(raw_diff == 32 && struct_diff == 32 && null_diff == 32);
+    std::printf("CreateShaderResourceView(buffer): raw (32 in-bounds + 32 OOB-zero), structured (32 + 32 OOB-zero), "
+                "typed (24 + 40 OOB-zero) matched; negative controls flipped %u/32 (raw B), %u/32 (struct B), %u/32 "
+                "(null)\n",
+                raw_diff, struct_diff, null_diff);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

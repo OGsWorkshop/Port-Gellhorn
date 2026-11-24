@@ -34,6 +34,7 @@ The source is read with ``bink_index.py`` (an archive or directory is scanned; a
 directory, or any directory of files; only payloads that mention ``$(common)/movies/`` are used. A list longer than
 one zlib stream is rebuilt whole by ``gamedata_index.py``. The output names game files: it is a local work product and must not be
 committed or attached to an issue. The tests use synthetic headers and lists only.
+Usage: `python -I tools/bink_names.py --help` lists the options.
 """
 import argparse
 import csv
@@ -41,16 +42,19 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import bink_index  # noqa: E402
 import gamedata_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import gamedata_xml  # noqa: E402
 
 LIST_ENTRY = re.compile(r"<filename>\s*\$\(common\)/movies/([^<]+?\.bk2)\s*</filename>", re.I)
-FAMILY_TAIL = re.compile(r"(_?\d+|_?(left|right|top|topleft|topright|side|high|low|medium|light|dark|close|far))+$",
+FAMILY_TAIL = re.compile(r"(_?\d+|_?(4k|left|right|top|topleft|topright|side|high|low|medium|light|dark|close|far))+$",
                          re.I)
 LIST_MARKER = b"$(common)/movies/"
 MAX_LIST_BYTES = 16 << 20
@@ -94,6 +98,9 @@ def mount_documents(paths):
     A carve directory (``index.json`` from rpf9_carve.py) and an ``.rpf`` are read as whole XML payloads, so a list
     split over several zlib streams stays in one piece. Any other directory is searched file by file.
     """
+    def scan_failed(error):
+        raise error
+
     for path in paths:
         if os.path.isdir(path) and os.path.isfile(os.path.join(path, "index.json")):
             for doc in gamedata_xml.carve_documents(path):
@@ -101,7 +108,7 @@ def mount_documents(paths):
         elif os.path.isfile(path) and path.lower().endswith(".rpf"):
             yield from _archive_documents(path)
         elif os.path.isdir(path):
-            for root, _dirs, files in os.walk(path):
+            for root, _dirs, files in os.walk(path, onerror=scan_failed):
                 for name in sorted(files):
                     full = os.path.join(root, name)
                     if os.path.getsize(full) <= MAX_LIST_BYTES:
@@ -128,7 +135,9 @@ def read_mount_lists(paths):
 
 
 def _int(value):
-    return int(value, 0) if isinstance(value, str) else int(value)
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise TypeError(f"expected an integer, got {type(value).__name__}")
+    return int(value, 0) if isinstance(value, str) else value
 
 
 def load_streams(source, skip_report=None):
@@ -158,15 +167,30 @@ def load_streams(source, skip_report=None):
         try:
             if not isinstance(row, dict):
                 raise TypeError("row is not an object")
-            out.append({"source": row["source"], "offset": _int(row["offset"]), "size": _int(row["size"]),
-                        "width": _int(row["width"]), "height": _int(row["height"]), "frames": _int(row["frames"])})
+            offset = _int(row["offset"])
+            size = _int(row["size"])
+            width = _int(row["width"])
+            height = _int(row["height"])
+            frames = _int(row["frames"])
+            if offset < 0 or size <= 0 or width <= 0 or height <= 0 or frames <= 0:
+                raise ValueError("negative offset or non-positive stream field")
+            out.append({"source": row["source"], "offset": offset, "size": size,
+                        "width": width, "height": height, "frames": frames})
         except (KeyError, ValueError, TypeError, OverflowError) as error:
             raise ValueError(f"{label.format(i=start + j)} is missing or unusable: {error}") from None
         if not isinstance(out[-1]["source"], str):
             raise ValueError(f"{label.format(i=start + j)} has a non-string source")
+        out[-1]["source"] = out[-1]["source"].replace("\\", "/")  # an older Windows index wrote "\"
     # A directory of carved files sorts by file name; carves name files by archive offset.
     out.sort(key=lambda r: (r["source"], r["offset"]))
     return out
+
+
+def _normalize_pin_path(raw):
+    path = raw.strip().replace("\\", "/").lower()
+    if path.startswith("$(common)/movies/"):
+        path = path[len("$(common)/movies/"):]
+    return path
 
 
 def load_pins(path):
@@ -182,13 +206,19 @@ def load_pins(path):
             raise ValueError(f"CSV header is missing required fields: {', '.join(missing)}")
         for j, row in enumerate(reader, start=2):
             try:
-                key = ((row.get("source") or "").strip(), _int(row["offset"]))
+                offset = _int(row["offset"])
+                if offset < 0:
+                    raise ValueError("offset must be non-negative")
+                key = ((row.get("source") or "").strip().replace("\\", "/"), offset)  # pins from before "/" too
                 raw_path = row["path"]
                 if not isinstance(raw_path, str):
                     raise TypeError("path is missing")
+                parsed = [item for item in (_normalize_pin_path(p) for p in raw_path.split("|")) if item]
+                if not parsed:
+                    raise ValueError("empty path")
             except (KeyError, ValueError, TypeError, OverflowError) as error:
                 raise ValueError(f"row {j} is missing or unusable: {error}") from None
-            pins.setdefault(key, set()).update(p.strip().lower() for p in raw_path.split("|") if p.strip())
+            pins.setdefault(key, set()).update(parsed)
     return pins
 
 
@@ -259,7 +289,7 @@ def align(names, streams, scorer, skip_cost=SKIP_COST, max_skip=MAX_SKIP):
             if arg is not None:
                 score[j][i] = best + scorer.unary(names[i], streams[j])
                 back[j][i] = arg
-    last = score[n_streams - 1]
+    last = {i: value for i, value in score[-1].items() if n_names - 1 - i <= max_skip}
     if not last:
         raise ValueError("no alignment within --max-skip; the lists do not match this source")
     i = max(last, key=lambda k: last[k] - skip_cost * (n_names - 1 - k))
@@ -272,12 +302,13 @@ def align(names, streams, scorer, skip_cost=SKIP_COST, max_skip=MAX_SKIP):
 
 def classify(names, streams, path, scorer):
     """Confidence per aligned pair, in path order."""
+    unaries = [scorer.unary(names[i], streams[j]) for i, j in path]
     anchored = []
     for k, (i, j) in enumerate(path):
-        neighbours = [path[k + d] for d in (-1, 1) if 0 <= k + d < len(path)]
-        fam = any(family(names[i2]) == family(names[i]) and _shape(streams[j2]) == _shape(streams[j])
-                  for i2, j2 in neighbours)
-        anchored.append(fam or scorer.unary(names[i], streams[j]) > 0)
+        neighbours = [(k + d, *path[k + d]) for d in (-1, 1) if 0 <= k + d < len(path)]
+        fam = any(unaries[k2] >= 0 and family(names[i2]) == family(names[i]) and _shape(streams[j2]) == _shape(streams[j])
+                  for k2, i2, j2 in neighbours)
+        anchored.append(unaries[k] > 0 or (fam and unaries[k] >= 0))
     out = []
     for k, (i, j) in enumerate(path):
         pin = scorer.pin(streams[j]) or set()
@@ -286,6 +317,8 @@ def classify(names, streams, path, scorer):
             out.append("verified")
         elif name in pin or anchored[k]:
             out.append("anchored")
+        elif unaries[k] < 0:
+            out.append("positional")
         else:
             a = max((x for x in range(k) if anchored[x]), default=None)
             b = min((x for x in range(k + 1, len(path)) if anchored[x]), default=None)
@@ -311,14 +344,61 @@ def name_streams(names, streams, pins=None, max_skip=MAX_SKIP):
 
 
 def write(out, rows, unmatched, summary):
-    if out.lower().endswith(".json"):
-        with open(out, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"summary": summary, "streams": rows, "unmatched_list_entries": unmatched}, fh, indent=1)
+    """Publish a complete report, or leave the previous file intact on replace failure."""
+    destination = os.path.abspath(out)
+    parent = os.path.dirname(destination) or "."
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    except OSError:
+        # Non-regular destinations (pipes/devices) keep a direct write.
+        _write_report_body(destination, rows, unmatched, summary)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".bink_names-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            _write_report_body(staged, rows, unmatched, summary, json_out=out.lower().endswith(".json"))
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
+def _write_report_body(fh_or_path, rows, unmatched, summary, json_out=None):
+    if isinstance(fh_or_path, str):
+        path = fh_or_path
+        if json_out is None:
+            json_out = path.lower().endswith(".json")
+        if json_out:
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"summary": summary, "streams": rows, "unmatched_list_entries": unmatched}, fh, indent=1)
+        else:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=FIELDS, lineterminator="\n")
+                w.writeheader()
+                w.writerows(rows)
+        return
+    fh = fh_or_path
+    if json_out:
+        json.dump({"summary": summary, "streams": rows, "unmatched_list_entries": unmatched}, fh, indent=1)
     else:
-        with open(out, "w", encoding="utf-8", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=FIELDS, lineterminator="\n")
-            w.writeheader()
-            w.writerows(rows)
+        w = csv.DictWriter(fh, fieldnames=FIELDS, lineterminator="\n")
+        w.writeheader()
+        w.writerows(rows)
 
 
 def main(argv=None):
@@ -328,8 +408,11 @@ def main(argv=None):
                     help="a mount-list XML, an archive or carve directory holding the lists, or a directory to "
                          "search (repeatable)")
     ap.add_argument("--pins", help="CSV with offset,path[,source] of streams identified by viewing them")
-    ap.add_argument("--max-skip", type=int, default=MAX_SKIP, help="most list entries skipped in a row")
-    ap.add_argument("--out", help="names.csv or names.json; default is a summary only")
+    ap.add_argument("--max-skip", type=int, default=MAX_SKIP,
+                    help="most list entries skipped before, between or after stream matches "
+                         "(an empty source leaves all entries unmatched)")
+    ap.add_argument("--out", help="names.csv or names.json; index.json in a source or mount directory is reserved "
+                                  "for the carve manifest (default: a summary only)")
     a = ap.parse_args(argv)
     if a.max_skip < 0:
         ap.error("--max-skip must be 0 or more")
@@ -343,12 +426,27 @@ def main(argv=None):
     if a.out and os.path.isdir(a.out):
         ap.error(f"--out is a folder, not a report file: {a.out}")
     if a.out:
+        def unlistable(error):
+            # os.walk skips a folder it cannot list unless onerror stops it. An --out inside that folder could then
+            # be an input this check never saw, so refuse it. Any other unlistable folder is left to the scan,
+            # which stops on it with exit 1 whether or not the report already exists.
+            locked = error.filename or folder
+            out_key = os.path.normcase(os.path.realpath(a.out))
+            locked_key = os.path.normcase(os.path.realpath(locked))
+            try:
+                inside = os.path.commonpath([out_key, locked_key]) == locked_key
+            except ValueError:  # different drives on Windows
+                inside = False
+            if inside:
+                ap.error(f"--out cannot be checked against the inputs: cannot list {locked}: "
+                         f"{error.strerror or error}")
+
         for folder in [p for p in [a.source, *a.mount] if os.path.isdir(p)]:
             manifest = os.path.join(folder, "index.json")
-            if os.path.isfile(manifest) and bink_index.same_output_path(a.out, manifest):
-                ap.error(f"--out would overwrite the carve manifest: {a.out}")
+            if bink_index.same_output_path(a.out, manifest):
+                ap.error(f"--out is reserved for the carve manifest: {a.out}")
             if os.path.isfile(a.out):
-                for root, _dirs, names in os.walk(folder):
+                for root, _dirs, names in os.walk(folder, onerror=unlistable):
                     for name in names:
                         if name.lower().endswith((".json", ".csv")):
                             continue

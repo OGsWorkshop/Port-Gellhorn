@@ -1,7 +1,7 @@
 """Progress dashboard: what works, what changed and what blocks next, from outcomes the project already produces.
 
     python -I tools/progress_dashboard.py --out <folder outside the repository> [--work <work>] [--run-tests]
-                                          [--junit FILE ...] [--github] [--login NAME]
+                                          [--ctest-junit FILE] [--junit FILE ...] [--github] [--login NAME]
 
 Writes, into --out only (a folder inside the repository is refused, so nothing here can be committed by accident):
     progress.html                 one self-contained page (no network, no packages; open it from disk)
@@ -12,7 +12,8 @@ Writes, into --out only (a folder inside the repository is refused, so nothing h
 Sources, each optional and reported as missing rather than counted as zero when absent:
     unit tests      --run-tests runs tests/test_*.py the way CI selects them (standard-library files with a
                     __main__ block), one process each; the outcome and the commit it ran on are kept
-    ctest           runtime/build/Testing/Temporary/LastTest.log, and any --junit file (CTest or pytest flavour)
+    ctest           --ctest-junit selects the local CTest report (default: runtime/build/Testing/Temporary/LastTest.log).
+                    --junit adds independent CTest or pytest runs.
     gpu tests       --gpu-log: saved output of runtime/test/shaders/check.py, one panel group per GPU
     contract        the translator contract table in docs/design.md, by how each row says it was confirmed
     imports         the measured import tables in docs/runtime_imports.md
@@ -23,6 +24,7 @@ Sources, each optional and reported as missing rather than counted as zero when 
 
 No game data leaves the inputs: the page and the JSON carry counts, pass/fail, error classes and the project's
 own document text; never a shader name, a carved file name or a path into the game copy.
+Usage: `python -I tools/progress_dashboard.py --help` lists the options.
 """
 import argparse
 import base64
@@ -34,9 +36,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE = os.path.join(ROOT, "tools", "progress_dashboard.html")
@@ -70,16 +77,28 @@ def parse_iso(s):
     return d if d.tzinfo else d.astimezone()
 
 
-def read_text(path):
+def read_utf8(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         return f.read()
 
 
 def save_text(path, text):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    # A fixed `path + ".tmp"` blocks refreshes when that name is taken by a stale directory
+    # or a concurrent writer. Publish from a unique temp in the same directory instead.
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.chmod(tmp, published_mode(path))          # mkstemp creates 0600
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)                     # a read-only temp cannot be unlinked on Windows
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def dump_json(obj):
@@ -100,14 +119,38 @@ HOME = os.path.expanduser("~")
 
 
 def scrub(text, limit=240):
-    """One line of tool output, with the user's home folder and drive paths reduced to their last component."""
+    """One line of tool output with every absolute path replaced: a path inside the repository becomes its relative
+    path, any other path (the work folder, the home folder, a temp folder) becomes <path>, file name included, since
+    a file name outside the repository can be a carved shader's name."""
     if not text:
         return ""
     line = text.strip().splitlines()[-1] if text.strip() else ""
+
+    def shown(m):
+        path = m.group(0)
+        if os.name != "nt" and re.match(r"(?i)[a-z]:[\\/]", path):
+            # A drive-letter path is relative to the current folder elsewhere, so realpath would put it inside the
+            # repository and print it whole (user name and file name included): it is never one of ours here.
+            return "<path>"
+        if inside(path, ROOT):
+            rel = os.path.relpath(os.path.realpath(path), os.path.realpath(ROOT)).replace(os.sep, "/")
+            return "." if rel == "." else rel
+        return "<path>"
+
+    # Match the known checkout prefix before the generic patterns stop at whitespace.
+    if os.name == "nt":
+        root = r"[\\/]".join(re.escape(part) for part in re.split(r"[\\/]", ROOT))
+        checkout = rf"(?i:(?<![\w/\\]){root})"
+    else:
+        checkout = rf"(?<![\w.:/~]){re.escape(ROOT)}"
+    # Consume a same-prefix sibling too, so shown() can redact its entire path.
+    checkout_path = rf"{checkout}[^\s'\"]*"
+    drive_path = r"(?i:\b[a-z]:[\\/][^\s'\"]*)"
+    posix_path = r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*"
+    line = re.sub(rf"{checkout_path}|{drive_path}|{posix_path}", shown, line)
     if HOME and len(HOME) > 3:
         line = line.replace(HOME, "~")
-    line = re.sub(r"(?i)\b[a-z]:[\\/](?:[^\s\\/:'\"]+[\\/])+([^\s\\/'\"]+)", r"<path>/\1", line)
-    line = re.sub(r"(?<![\w.])/(?:[^\s/'\"]+/)+([^\s/'\"]+)", r"<path>/\1", line)
+    line = re.sub(r"~[\\/][^\s'\"]*", "<path>", line)
     return line[:limit]
 
 
@@ -198,17 +241,23 @@ def last_commit_time(path):
 
 
 # ----------------------------------------------------------------------------------------------- unit tests
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; the dashboard must not report an
+    # incomplete test selection or code digest as complete. main() turns the OSError into one error line.
+    raise exc
+
+
 def ci_test_files():
     """tests/test_*.py that CI runs one by one: standard-library files with a __main__ block (ci.yml)."""
     found = []
     tests = os.path.join(ROOT, "tests")
-    for base, dirs, files in os.walk(tests):
+    for base, dirs, files in os.walk(tests, onerror=_walk_error):
         dirs[:] = sorted(d for d in dirs if d not in ("semantic", "__pycache__", "fixtures"))
         for name in sorted(files):
             if not (name.startswith("test_") and name.endswith(".py")):
                 continue
             path = os.path.join(base, name)
-            text = read_text(path)
+            text = read_utf8(path)
             if PYTEST_MARKERS.search(text) or "__main__" not in text:
                 continue
             found.append(os.path.relpath(path, ROOT).replace("\\", "/"))
@@ -220,17 +269,18 @@ def run_one_test(rel, timeout):
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, rel)], cwd=ROOT, capture_output=True, timeout=timeout)
         out = (r.stdout + r.stderr).decode("utf-8", "replace")
-        skipped = re.search(r"^OK \(skipped=(\d+)\)", out, re.M) and not re.search(r"Ran [1-9]\d* tests?", out.replace("skipped", ""))
+        skipped = re.search(r"^OK \(skipped=(\d+)\)\r?$", out, re.M)
         res = "pass" if r.returncode == 0 else "fail"
         tail = "" if res == "pass" else scrub(out)
         ran = re.search(r"Ran (\d+) tests?", out)
+        cases = int(ran.group(1)) if ran else None
         return {"test": rel, "result": res, "seconds": round(time.monotonic() - t0, 2), "detail": tail,
-                "cases": int(ran.group(1)) if ran else None, "all_skipped": bool(skipped)}
+                "cases": cases, "all_skipped": bool(skipped and cases == int(skipped.group(1)))}
     except subprocess.TimeoutExpired:
         return {"test": rel, "result": "fail", "seconds": timeout, "detail": f"timed out after {timeout} s"}
 
 
-CODE_DIRS = ("tools", "scripts")
+CODE_DIRS = ("tools", "scripts", "runtime/test/shaders")
 
 
 def file_digest(rel):
@@ -242,12 +292,11 @@ def file_digest(rel):
 
 
 def code_digest():
-    """One digest over the Python code the unit tests exercise: tools/, scripts/ and make_game.py (content, not
-    timestamps, so it does not depend on git or on whether the change is committed)."""
+    """Hash make_game.py and the Python files in CODE_DIRS by content, including uncommitted edits."""
     h = hashlib.sha256()
     rels = ["make_game.py"]
     for d in CODE_DIRS:
-        for base, dirs, files in os.walk(os.path.join(ROOT, d)):
+        for base, dirs, files in os.walk(os.path.join(ROOT, d), onerror=_walk_error):
             dirs[:] = sorted(x for x in dirs if x not in ("__pycache__", "bin", "obj", "target", "build") and not x.startswith("."))
             rels += [os.path.relpath(os.path.join(base, f), ROOT).replace("\\", "/") for f in sorted(files) if f.endswith(".py")]
     for rel in rels:
@@ -255,8 +304,7 @@ def code_digest():
     return h.hexdigest()[:16]
 
 
-def run_unit_tests(match, jobs, timeout):
-    files = [f for f in ci_test_files() if not match or re.search(match, f)]
+def run_unit_tests(files, jobs, timeout):
     before = code_digest()
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         results = list(pool.map(lambda f: run_one_test(f, timeout), files))
@@ -273,11 +321,11 @@ def collect_unit(col, out_dir, args):
     col.panel("tests", "Unit tests (CI selection)", "test files")
     path = os.path.join(out_dir, "unit_results.json")
     if args.run_tests:
-        print(f"running unit tests ({len(ci_test_files())} files, {args.jobs} at a time)...")
-        data = run_unit_tests(args.tests, args.jobs, args.test_timeout)
+        print(f"running unit tests ({len(args.test_files)} selected, {args.jobs} at a time)...")
+        data = run_unit_tests(args.test_files, args.jobs, args.test_timeout)
         save_text(path, dump_json(data))
     elif os.path.isfile(path):
-        data = json.loads(read_text(path))
+        data = json.loads(read_utf8(path))
     else:
         col.source("unit_results", None, "missing", note="no unit-test outcome yet: run with --run-tests")
         return
@@ -308,7 +356,8 @@ def collect_unit(col, out_dir, args):
     n = len(data["results"])
     col.metric("tests.passed", "tests", "Unit-test files passing (last run)", passed, n, "files whose last run exited 0 / files run")
     col.metric("tests.current", "tests", "Unit-test files passing on the current code", current, n,
-               "files that passed with no change since to themselves or to tools/, scripts/, make_game.py / files run")
+               "files that passed with no change since to themselves, make_game.py or Python files under "
+               + ", ".join(d + "/" for d in CODE_DIRS) + " / files run")
 
 
 def group_of_test(name):
@@ -323,9 +372,9 @@ def group_of_test(name):
 
 
 # ----------------------------------------------------------------------------------------------- ctest / junit
-def parse_junit(text):
+def parse_junit(xml):
     """[(name, result, seconds, detail)] from CTest (--output-junit) or pytest (--junitxml) XML."""
-    root = ET.fromstring(text)
+    root = xml if isinstance(xml, ET.Element) else ET.fromstring(xml)
     suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
     out = []
     for suite in suites:
@@ -351,22 +400,48 @@ def parse_junit(text):
     return out
 
 
-def parse_lasttest(text):
+def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
     """[(name, result, seconds)] from CTest's Testing/Temporary/LastTest.log."""
     out, name, secs = [], None, None
-    for line in text.splitlines():
+    captured = False
+    nested_runs = 0
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if captured:
+            # CTest writes child output verbatim, so it can contain complete nested logs.
+            if line.startswith("Start testing: ") and next_line == "-" * 58:
+                nested_runs += 1
+            elif nested_runs and line.startswith("End testing: "):
+                nested_runs -= 1
+            elif not nested_runs and line == "<end of output>" and next_line.startswith("Test time ="):
+                captured = False
+            continue
         m = re.match(r"^\d+/\d+ Test: (.+)$", line)
         if m:
             name, secs = m.group(1).strip(), None
+            continue
+        if not name:
+            continue
+        if line == "Output:":
+            captured = True
             continue
         m = re.match(r"^Test time =\s*([\d.]+) sec", line)
         if m:
             secs = float(m.group(1))
             continue
-        if name and line.startswith(("Test Passed", "Test Failed", "Test Not Run")):
-            res = "pass" if "Passed" in line else ("fail" if "Failed" in line else "skip")
-            out.append((name, res, secs))
-            name = None
+        if line.startswith("Test Passed"):
+            res = "pass"
+        elif line == "Test Pass Reason:" and next_line:
+            res = "skip" if next_line.startswith("Skip regular expression found in output.") else "pass"
+        elif line.startswith("Test Failed") or line == "Test Fail Reason:":
+            res = "fail"
+        elif line.startswith("Test Not Run"):
+            res = "skip"
+        else:
+            continue
+        out.append((name, res, secs))
+        name = None
     return out
 
 
@@ -376,30 +451,44 @@ def collect_ctest(col, args):
     seen = 0
     log = os.path.join(ROOT, "runtime", "build", "Testing", "Temporary", "LastTest.log")
     sets = []
-    if os.path.isfile(log):
-        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_text(log))]))
+    reports = []
+    local_report = getattr(args, "ctest_junit", None)
+    if local_report:
+        reports.append(("ctest_junit", "ctest", local_report))
+    elif os.path.isfile(log):
+        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_utf8(log))], True))
         col.source("ctest_lasttest", log, "ok", len(sets[-1][2]))
     else:
         col.source("ctest_lasttest", log, "missing", note="no runtime/build CTest run on this machine")
     for path in args.junit or []:
+        if local_report and same_report_path(path, local_report):
+            continue
+        reports.append(("junit", "junit:" + os.path.basename(path), path))
+    for source_id, label, path in reports:
         if not os.path.isfile(path):
-            col.source("junit", path, "missing")
+            col.source(source_id, path, "missing")
             continue
         try:
-            rows = parse_junit(read_text(path))
-        except ET.ParseError as e:
-            col.source("junit", path, "invalid", note=str(e))
+            root = ET.parse(path).getroot()
+        except (ET.ParseError, LookupError, ValueError, OSError) as e:
+            col.source(source_id, path, "invalid", note=str(e))
             continue
-        sets.append(("junit:" + os.path.basename(path), path, rows))
-        col.source("junit", path, "ok", len(rows))
-    for label, path, rows in sets:
+        # CTest writes a single testsuite with a disabled count and hostname. pytest wraps its suite in testsuites.
+        is_ctest = root.tag == "testsuite" and {"disabled", "hostname"} <= root.attrib.keys()
+        if source_id == "ctest_junit" and not is_ctest:
+            col.source(source_id, path, "invalid", note="expected a CTest --output-junit report")
+            continue
+        rows = parse_junit(root)
+        sets.append((label, path, rows, is_ctest))
+        col.source(source_id, path, "ok", len(rows))
+    for label, path, rows, is_ctest in sets:
         ran = os.path.getmtime(path)
         for name, res, secs, detail in rows:
             if res == "fail":
                 fresh, status = "failed", "failed"
             elif res == "skip":
                 fresh, status = "unknown", "unknown"
-            elif runtime_changed and ran < runtime_changed and label == "ctest":
+            elif is_ctest and runtime_changed and ran < runtime_changed:
                 fresh, status = "revalidation_required", "partial"
             else:
                 fresh, status = "current", "verified"
@@ -409,7 +498,7 @@ def collect_ctest(col, args):
     if seen:
         ok = sum(1 for c in col.components if c["panel"] == "runtime" and c["status"] == "verified")
         col.metric("runtime.current", "runtime", "Runtime tests passing on the current code", ok, seen,
-                   "tests that passed after the last commit touching runtime/ / tests recorded")
+                   "passing tests, excluding CTest reports older than the last commit touching runtime/ / tests recorded")
 
 
 # ----------------------------------------------------------------------------------------------- GPU tests
@@ -452,7 +541,7 @@ def collect_gpu(col, logs):
         if not os.path.isfile(path):
             col.source("gpu_log", path, "missing")
             continue
-        rows, summary = parse_gpu_log(read_text(path))
+        rows, summary = parse_gpu_log(read_utf8(path))
         label = label or os.path.splitext(os.path.basename(path))[0]
         note = None
         if summary and summary[1] != len(rows):
@@ -543,7 +632,7 @@ def collect_contract(col):
     if not os.path.isfile(path):
         col.source("contract", path, "missing")
         return
-    tables = [t for t in md_tables(read_text(path)) if t[0] and "contract" in t[0].lower()]
+    tables = [t for t in md_tables(read_utf8(path)) if t[0] and "contract" in t[0].lower()]
     if not tables:
         col.source("contract", path, "invalid", note="no table under a 'contract' heading")
         return
@@ -583,7 +672,7 @@ def collect_imports(col):
         col.source("imports", path, "missing")
         return
     n = unimpl = 0
-    for heading, header, rows, _ in md_tables(read_text(path)):
+    for heading, header, rows, _ in md_tables(read_utf8(path)):
         h = [plain(x).lower() for x in header]
         if "binding" in h and "import" in h:
             bi, ii, ci = h.index("binding"), h.index("import"), h.index("consumer") if "consumer" in h else 0
@@ -621,7 +710,7 @@ def collect_corpus(col, work):
     if not os.path.isfile(carved_p):
         col.source("corpus", None, "missing", note="no <work>/shaders/dxbc/index.json (run make_game.py's shaders stage)")
         return
-    carved = json.loads(read_text(carved_p))
+    carved = json.loads(read_utf8(carved_p))
     entries = carved if isinstance(carved, list) else list(carved.values())
     per_stage = {}
     for e in entries:
@@ -629,7 +718,7 @@ def collect_corpus(col, work):
         per_stage.setdefault(st, [0, 0])[0] += 1
     validated_total = 0
     if os.path.isfile(spirv_p):
-        spirv = json.loads(read_text(spirv_p))
+        spirv = json.loads(read_utf8(spirv_p))
         for meta in spirv.values():
             if isinstance(meta, dict) and "error" not in meta:
                 st = meta.get("stage") or "unknown"
@@ -703,6 +792,11 @@ def item_ids(title):
         if f"{prefix}-{num}" not in out:
             out.append(f"{prefix}-{num}")
     return out
+
+
+def d3d_item_ids(pulls):
+    """D3D- item IDs named by the titles of these pull requests."""
+    return {i for p in pulls for i in item_ids(p.get("title")) if i.startswith("D3D-")}
 
 
 def collect_pulls(col, repo, merged, open_prs, limit=PR_LIMIT):
@@ -779,7 +873,8 @@ def collect_github(col, repo, login):
         col.source("github_ci", None, "ok", len(latest))
     issue = gh_json(["issue", "view", "313", "-R", repo, "--json", "body,updatedAt"])
     if issue:
-        n = merged = 0
+        n = 0
+        table_ids, table_done = set(), set()
         for heading, header, rows, _ in md_tables(issue["body"]):
             h = [plain(x).lower() for x in header]
             if h[:1] != ["id"] or "pr" not in h:
@@ -789,15 +884,25 @@ def collect_github(col, repo, login):
                     continue
                 owner, pr, st = plain(row[h.index("owner")]), plain(row[h.index("pr")]), plain(row[h.index("status")]) if "status" in h else ""
                 status, why = d3d_state(owner, pr, st, merged_set, open_set)
-                merged += status == "implemented"
+                table_ids.add(plain(row[0]))
+                if status == "implemented":
+                    table_done.add(plain(row[0]))
                 n += 1
                 col.add(f"d3d.{plain(row[0])}", "d3d12", why, f"{plain(row[0])} {plain(row[1])}"[:120], status,
                         detail=(st or why)[:200], owner=owner, prs=pr[:120])
         col.source("github_313", None, "ok", n, note=f"issue updated {issue.get('updatedAt')}")
         if n:
-            col.metric("d3d12.merged", "d3d12", "D3D- items merged on main", merged, n,
-                       "items with a PR merged into main (the PR column's word, or the repository's merged list) and no PR "
-                       "still open / items")
+            # the table lists only items still in progress; a merged item leaves it, so the merges are counted where they are recorded
+            lists_read = merged_set is not None
+            merged_ids = d3d_item_ids(merged) if lists_read else set()
+            open_ids = d3d_item_ids(open_prs) if lists_read else set()
+            pr_done = (merged_ids - table_ids) - open_ids    # rows in #313 keep the table's state; the rest need a merged PR and no open one
+            col.metric("d3d12.merged", "d3d12", "D3D- items merged on main" + ("" if lists_read else " (partial)"),
+                       len(table_done | pr_done), len(table_ids | merged_ids | open_ids),
+                       "#313 rows whose state is implemented (d3d_state), plus D3D- IDs not in #313 that a merged PR title names "
+                       "and no open PR title names / all known D3D- IDs (#313 rows plus IDs named by any merged or open PR title)",
+                       note=None if lists_read else "partial: the merged or open PR list could not be read, "
+                                                     "so only the #313 rows are counted")
     coord = gh_json(["issue", "list", "-R", repo, "--state", "open", "--search", "Coordinating who works on what in:title",
                      "--json", "number,title,updatedAt"])
     if coord:
@@ -879,7 +984,7 @@ def logo_src():
 
 
 def render_page(snap, history):
-    template = read_text(TEMPLATE)
+    template = read_utf8(TEMPLATE)
     payload = json.dumps({"snapshot": snap, "history": history}, ensure_ascii=False, sort_keys=True)
     payload = payload.replace("</", "<\\/")       # a document string can never close the script element
     return template.replace("/*__PROGRESS_LOGO__*/", logo_src()).replace("/*__PROGRESS_DATA__*/null", payload)
@@ -888,7 +993,7 @@ def render_page(snap, history):
 def write_outputs(snap, out_dir):
     os.makedirs(os.path.join(out_dir, "snapshots"), exist_ok=True)
     hist_path = os.path.join(out_dir, "history.json")
-    history = json.loads(read_text(hist_path)) if os.path.isfile(hist_path) else []
+    history = json.loads(read_utf8(hist_path)) if os.path.isfile(hist_path) else []
     new = not history or history[-1]["content_hash"] != snap["content_hash"][:16]
     if new:
         stamp = snap["generated_at"].replace("-", "").replace(":", "")
@@ -907,13 +1012,25 @@ def main(argv=None):
     ap.add_argument("--tests", metavar="REGEX", help="with --run-tests, only the test files matching REGEX")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="test processes at a time")
     ap.add_argument("--test-timeout", type=int, default=300, help="seconds per test file")
-    ap.add_argument("--junit", nargs="*", metavar="FILE", help="CTest --output-junit or pytest --junitxml files")
+    ap.add_argument("--ctest-junit", metavar="FILE", help="use the local CTest --output-junit report in place of LastTest.log")
+    ap.add_argument("--junit", nargs="*", metavar="FILE", help="additional independent CTest or pytest JUnit reports")
     ap.add_argument("--gpu-log", nargs="*", metavar="FILE[=LABEL]",
                     help="saved output of runtime/test/shaders/check.py; LABEL names the GPU, driver and OS")
     ap.add_argument("--github", action="store_true", help="read pull requests into main, CI runs, #313 and the coordination issue through gh")
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
     ap.add_argument("--login", help="with --github, show this account's claims and pull requests")
     args = ap.parse_args(argv)
+    if args.login is not None and not args.github:
+        ap.error("--login requires --github")
+    if args.jobs < 1:
+        ap.error("--jobs must be a positive integer")
+    if args.test_timeout < 1:
+        ap.error("--test-timeout must be a positive integer")
+    if args.run_tests and args.tests:
+        try:
+            args.tests = re.compile(args.tests)
+        except (re.error, OverflowError, RecursionError) as exc:
+            ap.error(f"--tests: invalid regular expression: {exc}")
     out_dir = os.path.abspath(args.out)
     if inside(out_dir, ROOT):
         print(f"--out must be outside the repository ({ROOT}): the outputs are never meant to be committed", file=sys.stderr)
@@ -921,8 +1038,23 @@ def main(argv=None):
     if args.work and not os.path.isdir(args.work):
         print(f"--work {args.work} is not a folder", file=sys.stderr)
         return 2
-    os.makedirs(out_dir, exist_ok=True)
-    snap = build(args, out_dir)
+    if args.run_tests:
+        args.test_files = [f for f in ci_test_files() if not args.tests or re.search(args.tests, f)]
+        if args.tests and not args.test_files:
+            ap.error("--tests did not match any test files")
+    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
+        print(f"--out {args.out} is not a directory", file=sys.stderr)
+        return 2
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"--out {args.out}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
+    try:
+        snap = build(args, out_dir)
+    except OSError as exc:
+        print(f"error: {exc.filename or ''}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
     new = write_outputs(snap, out_dir)
     n = len(snap["components"])
     print(f"{n} units, {len(snap['metrics'])} metrics -> {os.path.join(out_dir, 'progress.html')}"

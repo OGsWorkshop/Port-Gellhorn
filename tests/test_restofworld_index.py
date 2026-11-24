@@ -4,7 +4,9 @@
 
 Every byte is built by this test. No game file, asset name or payload is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -312,6 +314,22 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
 
+    def test_write_failure_after_scan_names_the_output(self):
+        for ext in (".json", ".csv"):
+            out = os.path.join(self.root, "report" + ext)
+            with self.subTest(ext=ext), \
+                    unittest.mock.patch.object(sys, "argv", [TOOL, self.rpf, out]), \
+                    unittest.mock.patch.object(restofworld_index, "write_output",
+                                               side_effect=OSError("report write denied")) as write, \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(restofworld_index.main(), 1)
+                self.assertEqual(write.call_args.args[0], out)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+                self.assertIn(out, stderr.getvalue())
+                self.assertIn("report write denied", stderr.getvalue())
+
     def test_cli_rejects_output_aliasing_source_archive(self):
         with open(self.rpf, "rb") as f:
             original = f.read()
@@ -346,12 +364,18 @@ class ArchiveTest(unittest.TestCase):
 
         # A hard link at a JSON path naming the payload.
         link = os.path.join(self.root, "payload.json")
-        os.link(os.path.join(folder, f"{0x1000:012x}.bin"), link)
-        linked = subprocess.run(
-            [sys.executable, "-I", TOOL, folder, link],
-            capture_output=True, text=True, encoding="utf-8", errors="replace")
-        self.assertEqual(linked.returncode, 2, linked.stderr)
-        self.assertIn("output must not overwrite the source archive", linked.stderr)
+        try:
+            os.link(os.path.join(folder, f"{0x1000:012x}.bin"), link)
+        except (OSError, NotImplementedError) as e:
+            link = None
+            with self.subTest("hardlink"):
+                self.skipTest(f"hard links unavailable: {e}")
+        if link is not None:
+            linked = subprocess.run(
+                [sys.executable, "-I", TOOL, folder, link],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(linked.returncode, 2, linked.stderr)
+            self.assertIn("output must not overwrite the source archive", linked.stderr)
 
         # Overwriting index.json, part of the carve.
         idx = subprocess.run(
@@ -365,8 +389,9 @@ class ArchiveTest(unittest.TestCase):
             self.assertEqual(f.read(), original, "the carved payload was overwritten")
         with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
             self.assertEqual(f.read(), "{}", "the index was overwritten")
-        with open(link, "rb") as f:
-            self.assertEqual(f.read(), original, "the hard link target changed")
+        if link is not None:
+            with open(link, "rb") as f:
+                self.assertEqual(f.read(), original, "the hard link target changed")
 
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
@@ -539,6 +564,24 @@ class RageTextureDetectionTest(unittest.TestCase):
         self.assertIn("BC1_UNORM:1", row["detail"])
         self.assertIn("BC7_UNORM:1", row["detail"])
 
+    def test_dictionary_keeps_small_textures_and_counts_all_descriptors(self) -> None:
+        blob = _synth_pg_tex_dict([
+            _synth_tex_descriptor(0, 256, 256, 71, mips=7),
+            _synth_tex_descriptor(0x10000, 1, 2, 28, mips=2),
+        ])
+        row = restofworld_index.classify(blob, 0x2000, 128)
+        self.assertEqual(row["count"], 2)
+        self.assertIn("tex980=2;dict=1", row["detail"])
+        self.assertIn("R8G8B8A8_UNORM:1", row["detail"])
+        summary = restofworld_index.summarise([row], span=128, zero=0, unread=0)
+        self.assertEqual((summary["texture_dictionaries"], summary["texture_headers"]), (1, 2))
+
+    def test_small_texture_with_invalid_mip_count_is_excluded(self) -> None:
+        for mips in (0, 3):
+            with self.subTest(mips=mips):
+                descriptor = _synth_tex_descriptor(0, 1, 2, 28, mips=mips)
+                self.assertEqual(restofworld_index.find_rage_textures(descriptor), [])
+
     def test_non_dict_resource_page_with_linear_f16_texture(self):
         header = bytearray(0x60)
         struct.pack_into("<QQ", header, 8, 0x50000040, 0x50000080)  # u10 != 0 -> not standalone pgDictionary
@@ -582,6 +625,47 @@ class RageTextureDetectionTest(unittest.TestCase):
         self.assertEqual(summary["texture_streams"], 2)
         self.assertEqual(summary["texture_dictionaries"], 1)
         self.assertEqual(summary["texture_headers"], 2)
+
+    def test_failed_output_write_preserves_existing_json_and_csv_reports(self):
+        real_named_temp = tempfile.NamedTemporaryFile
+
+        def failing(*args, **kwargs):
+            handle = real_named_temp(*args, **kwargs)
+
+            def fail_write(data):
+                handle.file.write(data[:4])
+                raise OSError(28, "No space left on device")
+
+            handle.write = fail_write
+            return handle
+
+        with tempfile.TemporaryDirectory() as td:
+            rpf = os.path.join(td, "tex.rpf")
+            data_start = 0x100
+            body = bytearray(data_start)
+            body[:4] = b"9FPR"
+            struct.pack_into("<I", body, 4, data_start)
+            body += zlib.compress(b"plain bytes " * 10)
+            with open(rpf, "wb") as f:
+                f.write(body)
+            rows, summary = restofworld_index.scan_rpf(rpf)
+
+            for name, old_text in (("kept.json", '{"previous": true}\n'), ("kept.csv", "offset,stored\n0x0,1\n")):
+                out = os.path.join(td, name)
+                with open(out, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(old_text)
+                for label, patch in (
+                    ("write", unittest.mock.patch.object(restofworld_index.tempfile, "NamedTemporaryFile",
+                                                         side_effect=failing)),
+                    ("replace", unittest.mock.patch.object(restofworld_index.os, "replace",
+                                                           side_effect=PermissionError(13, "Permission denied"))),
+                ):
+                    with self.subTest(name=name, label=label), patch:
+                        with self.assertRaises(OSError):
+                            restofworld_index.write_output(out, rows, summary)
+                        with open(out, encoding="utf-8") as f:
+                            self.assertEqual(f.read(), old_text)
+                        self.assertFalse([n for n in os.listdir(td) if n.startswith(".restofworld_index-")])
 
 if __name__ == "__main__":
     unittest.main()

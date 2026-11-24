@@ -34,6 +34,12 @@ jacket 6      WEIGHTS_0                       196,488   0x26        39,272
 jacket 7      WEIGHTS_1                       235,760   0x26        39,272
 =====  =====  ==============================  ========  ==========  =====
 
+Slots 8/9 may also use the packed layout, format ``0x8C``: 16 bytes per vertex,
+four little-endian u32 words whose low 12 bits are the joint index. The reader
+converts each vertex to the same 4 x u8 row as ``0x25`` and rejects an index
+above 255. Only ``0x8C`` is accepted: no ``0x8B`` joint layout has been measured,
+so ``0x8B`` is rejected rather than guessed.
+
 The joint index is local to the drawable model's own palette: a sorted ``u32``
 joaat32 array at ``grmModel + 0x20`` with its length at ``grmModel + 0x0C``. The
 ped skeleton bind pose is ``drawable.skeleton[].bind_matrix`` from a decoded
@@ -63,11 +69,19 @@ import math
 import os
 import struct
 import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 try:  # optional: the stdlib path below is the fallback and is covered by the tests
     import numpy as _np
 except ImportError:  # pragma: no cover - depends on the interpreter
     _np = None
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -85,6 +99,7 @@ COMPONENT_FLOAT = 5126
 JOINT_SLOTS = (8, 9)
 WEIGHT_SLOTS = (6, 7)
 INDEX_FORMAT = 0x25   # R8G8B8A8_UINT, one 4-byte element per vertex
+PACKED_INDEX_FORMAT = 0x8C  # R32G32B32A32_UINT, 16-byte element, index in bits 0..11
 WEIGHT_FORMAT = 0x26  # R8G8B8A8_UNORM
 COMPONENT_SIZES = {5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4}
 TYPE_COMPONENTS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
@@ -192,8 +207,12 @@ def _finite_matrix(m) -> bool:
 
 # ------------------------------------------------------------------------ files
 def _load_json(path: str) -> dict:
-    with open(path, encoding="utf-8") as handle:
-        value = json.load(handle)
+    # An interrupted export leaves an empty or cut-off model.json: report it like any other bad input (BUILD-1031).
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            value = json.load(handle)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SkinError(f"{path}: invalid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise SkinError(f"{path}: model.json root is not an object")
     return value
@@ -208,11 +227,58 @@ def model_json_path(path: str) -> tuple[str, str]:
     raise SkinError(f"{path}: expected a decoded model directory or its model.json")
 
 
+def _stream_bytes(blob: bytes, base: int, offset: int, size: int, slot: int) -> bytes:
+    """Slice a section at ``base + offset``, rejecting a short graphics buffer."""
+    start = base + offset
+    end = start + size
+    if start < base or end > len(blob):
+        raise SkinError(f"skin stream slot {slot} is outside its graphics buffer")
+    return blob[start:end]
+
+
+def _unpack_packed_joints(data: bytes, slot: int) -> bytes:
+    """Convert four packed u32 joint words per vertex to four u8 indices."""
+    out = bytearray()
+    for at in range(0, len(data), 16):
+        for word in struct.unpack_from("<4I", data, at):
+            index = word & 0xFFF
+            if index > 0xFF:
+                raise SkinError(f"skin stream slot {slot} joint index {index} does not fit u8")
+            out.append(index)
+    return bytes(out)
+
+
+def source_input_paths(source: str) -> list[str]:
+    """Files one --skeleton/--component source may read or reference: its model.json,
+    the model.glb beside it and the buffer files named in model.json. A source that cannot
+    be resolved or read yet contributes only the paths known so far; the normal input checks
+    report it."""
+    try:
+        model_dir, json_path = model_json_path(source)
+    except SkinError:
+        return []
+    paths = [json_path]
+    try:
+        model = _load_json(json_path)
+    except (OSError, ValueError, SkinError):
+        return paths
+    glb_name = model.get("glb", "model.glb")
+    if isinstance(glb_name, str) and glb_name:
+        paths.append(os.path.join(model_dir, glb_name))
+    buffer_files = model.get("buffer_files", [])
+    if isinstance(buffer_files, list):
+        paths += [os.path.join(model_dir, name) for name in buffer_files
+                  if isinstance(name, str) and name]
+    return paths
+
+
 def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
     """Read one mesh's JOINTS_0/1 and WEIGHTS_0/1 streams.
 
-    Returns the four raw byte rows plus the vertex count, local palette length and
-    measured section table. The caller still maps local indices to GLB joints.
+    Joint slots accept the 4 x u8 layout (``0x25``) and the packed 4 x u32 layout
+    (``0x8C``); both become 4 x u8 per vertex. Returns the four raw byte rows plus the
+    vertex count, local palette length and measured section table. The caller still
+    maps local indices to GLB joints.
     """
     drawable = model.get("drawable")
     if not isinstance(drawable, dict):
@@ -277,16 +343,23 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
         if slot not in sections:
             continue
         offset, fmt = sections[slot]
-        expected = WEIGHT_FORMAT if slot in WEIGHT_SLOTS else INDEX_FORMAT
-        if fmt != expected:
+        if slot in WEIGHT_SLOTS:
+            if fmt != WEIGHT_FORMAT:
+                raise SkinError(
+                    f"skin stream slot {slot} has format 0x{fmt:02x}; "
+                    f"expected 0x{WEIGHT_FORMAT:02x}"
+                )
+            rows[slot] = _stream_bytes(blob, base, offset, 4 * vertex_count, slot)
+        elif fmt == INDEX_FORMAT:
+            rows[slot] = _stream_bytes(blob, base, offset, 4 * vertex_count, slot)
+        elif fmt == PACKED_INDEX_FORMAT:
+            packed = _stream_bytes(blob, base, offset, 16 * vertex_count, slot)
+            rows[slot] = _unpack_packed_joints(packed, slot)
+        else:
             raise SkinError(
-                f"skin stream slot {slot} has format 0x{fmt:02x}; expected 0x{expected:02x}"
+                f"skin stream slot {slot} has format 0x{fmt:02x}; "
+                f"expected 0x{INDEX_FORMAT:02x} or 0x{PACKED_INDEX_FORMAT:02x}"
             )
-        start = base + offset
-        end = start + 4 * vertex_count
-        if start < base or end > len(blob):
-            raise SkinError(f"skin stream slot {slot} is outside its graphics buffer")
-        rows[slot] = blob[start:end]
 
     return {
         "j0": rows[8],
@@ -419,7 +492,11 @@ def _alias_tokens(tokens: list[str], side: str | None) -> set[str]:
     return aliases
 
 
-def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
+def infer_ped_parent(
+    name: str,
+    ped_by_name: dict[str, dict],
+    ped_indices: dict[str, int] | None = None,
+) -> int | None:
     """Pick the ped bone a drawable-local helper covers, by name tokens.
 
     Garment helpers such as ``GM_*_L_UpperArm01_CF`` carry no hierarchy of their
@@ -431,10 +508,11 @@ def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
     tokens, side = _ped_tokens(name)
     aliases = _alias_tokens(tokens, side)
     best: tuple[int, int, int, int] | None = None
-    for index, bone in enumerate(ped_by_name.values()):
+    for ordinal, bone in enumerate(ped_by_name.values()):
         ped_name = bone["name"]
         if not ped_name.upper().startswith("SKEL_"):
             continue
+        index = ped_indices[ped_name] if ped_indices is not None and ped_name in ped_indices else ordinal
         ped_tokens, ped_side = _ped_tokens(ped_name)
         if side in ("L", "R") and ped_side in ("L", "R") and side != ped_side:
             continue
@@ -445,7 +523,7 @@ def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
         for alias in aliases:
             if alias in ped_set:
                 score += 10
-            elif any(token.startswith(alias.lower()) for token in ped_set):
+            elif not alias[-1].isdigit() and any(token.startswith(alias) for token in ped_set):
                 score += 5
         if score:
             candidate = (score, -len(ped_name), -index, index)
@@ -453,9 +531,10 @@ def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
                 best = candidate
     if best is not None:
         return best[3]
-    for index, bone in enumerate(ped_by_name.values()):
-        if bone["name"].upper().startswith("SKEL_"):
-            return index
+    for ordinal, bone in enumerate(ped_by_name.values()):
+        ped_name = bone["name"]
+        if ped_name.upper().startswith("SKEL_"):
+            return ped_indices[ped_name] if ped_indices is not None and ped_name in ped_indices else ordinal
     return None
 
 
@@ -499,6 +578,18 @@ class PaletteResolver:
         return found
 
 
+def own_parent_name(record, own_skeleton) -> str | None:
+    """The name of a drawable-local bone's own_skeleton parent, by name or by index."""
+    if not isinstance(record, dict):
+        return None
+    parent_name = record.get("parent_name")
+    if parent_name is None:
+        parent = record.get("parent")
+        if isinstance(parent, int) and 0 <= parent < len(own_skeleton):
+            parent_name = own_skeleton[parent].get("name")
+    return parent_name if isinstance(parent_name, str) and parent_name else None
+
+
 # --------------------------------------------------------------------- weights
 def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
                       local_bones: int, local_to_joint: list[int],
@@ -515,6 +606,14 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
     for row in (j0, j1, w0, w1):
         if len(row) != expected:
             raise SkinError("skin stream is shorter than the vertex count")
+
+    oversized = {slot for slot, joint in enumerate(local_to_joint) if joint > 0xFFFF}
+    if oversized:
+        for indices, weights in ((j0, w0), (j1, w1)):
+            if any(weight and index in oversized for index, weight in zip(indices, weights)):
+                raise SkinError("a weighted joint index exceeds the glTF UNSIGNED_SHORT limit (65535)")
+        # NumPy converts the entire palette, including entries no weighted slot uses.
+        local_to_joint = [0 if slot in oversized else joint for slot, joint in enumerate(local_to_joint)]
 
     if _np is not None:
         indices = _np.concatenate(
@@ -533,9 +632,14 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
             if int(weighted.max()) >= local_bones:
                 raise SkinError("a weighted joint index is outside the local palette")
         weights /= totals[:, None]
+        # A zero-weight component may carry any index; clear it before the palette lookup
+        # so an out-of-palette value cannot raise where the stdlib path returns zeros.
+        zero = weights == 0
+        indices[zero] = 0
         mapping = _np.asarray(local_to_joint, dtype=_np.uint16)
-        indices = mapping[indices]
         indices[weights == 0] = 0
+        indices = mapping[indices]
+        indices[zero] = 0
         if joint_count is not None and bool((indices >= joint_count).any()):
             raise SkinError("remapped joint index is invalid")
         return {
@@ -613,7 +717,7 @@ def accessor_bytes(gltf: dict, bin_data: bytes, index: int) -> tuple[bytes, dict
     if not isinstance(stride, int) or stride < element:
         raise SkinError(f"accessor {index} has an invalid byteStride")
     start = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
-    end = start + stride * count
+    end = start + ((count - 1) * stride + element if count else 0)
     if start < 0 or end > len(bin_data):
         raise SkinError(f"accessor {index} is outside the BIN chunk")
     if stride == element:
@@ -631,21 +735,32 @@ class _GlbBuilder:
         self.views: list[dict] = []
         self.accessors: list[dict] = []
 
-    def view(self, payload: bytes, target: int | None = None) -> int:
+    def view(self, payload: bytes, target: int | None = None, *, stride: int | None = None) -> int:
         self.bin.extend(b"\x00" * ((-len(self.bin)) % 4))
         offset = len(self.bin)
         self.bin.extend(payload)
         entry = {"buffer": 0, "byteOffset": offset, "byteLength": len(payload)}
         if target is not None:
             entry["target"] = target
+        if stride is not None:
+            entry["byteStride"] = stride
         self.views.append(entry)
         return len(self.views) - 1
 
     def accessor(self, payload: bytes, component_type: int, kind: str, count: int,
                  target: int | None, *, normalized: bool = False,
                  minimum: list[float] | None = None, maximum: list[float] | None = None) -> int:
+        stride = None
+        if target == ARRAY_BUFFER:
+            element_size = COMPONENT_SIZES[component_type] * TYPE_COMPONENTS[kind]
+            padding = bytes((-element_size) % 4)
+            if padding:
+                # Accessors are read as tightly packed bytes, but glTF vertex rows must align to four bytes.
+                payload = b"".join(payload[i:i + element_size] + padding
+                                   for i in range(0, len(payload), element_size))
+                stride = element_size + len(padding)
         entry = {
-            "bufferView": self.view(payload, target),
+            "bufferView": self.view(payload, target, stride=stride),
             "componentType": component_type,
             "count": count,
             "type": kind,
@@ -726,6 +841,33 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
             raise SkinError(f"{model_dir}: model has no skinned mesh with skin_influences")
         resolver = PaletteResolver(model, joints.ped_by_name)
 
+        def attach(name: str, chain: tuple = ()) -> int:
+            """Add a drawable-local bone after the own_skeleton ancestors it names.
+
+            A palette can list a child before its parent, and that parent can be an
+            unweighted own_skeleton bone no palette entry names; attaching the ancestors
+            first keeps the explicit link instead of falling back to infer_ped_parent.
+            """
+            existing = joints.find(name)
+            if existing is not None:
+                return existing
+            record = resolver.own_by_name.get(name)
+            parent_name = own_parent_name(record, resolver.own_skeleton)
+            parent_index = joints.find(parent_name) if parent_name else None
+            if parent_index is None and parent_name and parent_name not in chain:
+                if parent_name in resolver.own_by_name:
+                    parent_index = attach(parent_name, chain + (name,))
+            if parent_index is None:
+                parent_index = infer_ped_parent(name, joints.ped_by_name, joints._by_name)
+                if parent_index is None:
+                    parent_index = joints.root
+            bind = None
+            if isinstance(record, dict) and _finite_matrix(record.get("bind_matrix")):
+                bind = bind_to_gltf(record["bind_matrix"])
+            if bind is None:
+                bind = list(joints.binds[parent_index])
+            return joints.add(name, bind, parent_index)
+
         component_joint_start = joints.count
         component_record_start = len(records)
         for mesh, source_primitive in pairs:
@@ -736,26 +878,7 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
             local_to_joint = []
             for value in palette:
                 name, _source = resolver.resolve(value)
-                ped_index = joints.find(name)
-                if ped_index is not None:
-                    local_to_joint.append(ped_index)
-                    continue
-                record = resolver.own_by_name.get(name)
-                parent_name = record.get("parent_name") if isinstance(record, dict) else None
-                if parent_name is None and isinstance(record, dict):
-                    parent = record.get("parent")
-                    if isinstance(parent, int) and 0 <= parent < len(resolver.own_skeleton):
-                        parent_name = resolver.own_skeleton[parent].get("name")
-                parent_index = joints.find(parent_name) if isinstance(parent_name, str) else None
-                if parent_index is None:
-                    inferred = infer_ped_parent(name, joints.ped_by_name)
-                    parent_index = inferred if inferred is not None else joints.root
-                bind = None
-                if isinstance(record, dict) and _finite_matrix(record.get("bind_matrix")):
-                    bind = bind_to_gltf(record["bind_matrix"])
-                if bind is None:
-                    bind = list(joints.binds[parent_index])
-                local_to_joint.append(joints.add(name, bind, parent_index))
+                local_to_joint.append(attach(name))
 
             attributes, index_pair = _component_geometry(gltf, glb_bin, source_primitive)
             position = attributes["POSITION"][1]
@@ -895,14 +1018,23 @@ def write_skinned_glb(path: str, skeleton_path: str, component_paths: list[str],
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    temporary = path + ".tmp"
+    # A fixed `path + ".tmp"` blocks every later export when a stale directory keeps that
+    # name, and two writers to one output race on the same temporary file. Use a unique name
+    # in the output directory so os.replace() still publishes atomically.
+    fd, temporary = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
     try:
-        with open(temporary, "wb") as handle:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
+        os.chmod(temporary, published_mode(path))  # mkstemp creates 0600
         os.replace(temporary, path)
     except BaseException:
         try:
-            os.remove(temporary)
+            # The temp was chmodded to the destination's mode before replace. On Windows a
+            # read-only destination leaves a read-only temp that cannot be unlinked; restore
+            # mkstemp's private writable mode first so a failed publish cleans up after itself.
+            os.chmod(temporary, 0o600)
+            os.unlink(temporary)
         except OSError:
             pass
         raise
@@ -918,6 +1050,16 @@ def main(argv=None) -> int:
                         help="decoded component directory or its model.json (repeatable)")
     parser.add_argument("--generator", default="Leonida skinned_glb")
     args = parser.parse_args(argv)
+
+    # The output must never replace a file the export reads (a source's model.json, its model.glb or a
+    # buffer file). same_report_path also catches a case-only spelling on Windows and macOS's default
+    # volume; sources it cannot resolve yet are left to the normal input checks below.
+    for source in [args.skeleton] + args.component:
+        for source_path in source_input_paths(source):
+            if same_report_path(args.output, source_path):
+                print(f"error: {args.output} must not overwrite the source {source_path}",
+                      file=sys.stderr)
+                return 2
 
     try:
         stats = write_skinned_glb(args.output, args.skeleton, args.component,

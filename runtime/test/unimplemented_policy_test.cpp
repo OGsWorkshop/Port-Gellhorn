@@ -27,6 +27,7 @@
 
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
+#include "free_image_base.h"
 
 namespace {
 
@@ -73,7 +74,7 @@ std::vector<uint8_t> make_image() {
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL | IMAGE_FILE_LARGE_ADDRESS_AWARE;
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-    nt->OptionalHeader.ImageBase = 0x180000000;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x180000000);
     nt->OptionalHeader.AddressOfEntryPoint = 0;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = 0x2000;
@@ -231,7 +232,9 @@ void test_classification() {
     check(cls("dstorage_xs.dll", "DStorageGetFactory") == ReturnClass::HResult,
           "the console dstorage name is hresult");
     check(cls("xg_xs.dll", "XGCreateTexture2DComputer") == ReturnClass::Other, "unmeasured xg_xs import is other");
-    check(cls("acphal.dll", "AcpHalCreate") == ReturnClass::Other, "unmeasured acphal import is other");
+    check(cls("acphal.dll", "AcpHalCreate") == ReturnClass::HResult, "AcpHalCreate is hresult");
+    check(cls("acphal.dll", "ApuFree") == ReturnClass::Other, "ApuFree returns void");
+    check(cls("acphal.dll", "ApuMapVirtualAddress") == ReturnClass::Other, "ApuMapVirtualAddress returns uint32_t");
     check(cls("xgameruntime.dll", "XGameRuntimeInitialize") == ReturnClass::HResult, "XGameRuntimeInitialize");
     check(cls("xgameruntime.dll", "XUserAddAsync") == ReturnClass::HResult, "XUser* is hresult");
     check(cls("xgameruntime.dll", "XTaskQueueCreate") == ReturnClass::HResult, "XTaskQueueCreate is hresult");

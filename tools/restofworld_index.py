@@ -26,8 +26,15 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import zlib
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from file_mode import published_mode  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -95,10 +102,13 @@ def find_rage_textures(data):
         w = int.from_bytes(d[0:2], "little")
         h = int.from_bytes(d[2:4], "little")
         depth = int.from_bytes(d[4:6], "little")
-        if not (4 <= w <= 16384 and 4 <= h <= 16384 and 1 <= depth <= 2048):
+        if not (1 <= w <= 16384 and 1 <= h <= 16384 and 1 <= depth <= 2048):
             continue
         fword = q[k + 5]
-        out.append((w, h, depth, DXGI_FORMATS[fmt], fword & 0xFFFF, (fword >> 16) & 0xFF))
+        mips = (fword >> 16) & 0xFF
+        if min(w, h) < 4 and not 1 <= mips <= max(w, h, depth).bit_length():
+            continue
+        out.append((w, h, depth, DXGI_FORMATS[fmt], fword & 0xFFFF, mips))
     return out
 
 
@@ -269,9 +279,6 @@ def classify(data, offset, stored):
     return row
 
 
-def _gap(gap):
-    return (len(gap), 0) if gap.count(0) == len(gap) else (0, len(gap))
-
 
 def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     """Walk an RPF9 data area. Returns (rows, summary). No TOC is read or decrypted."""
@@ -301,7 +308,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                         pos = s + 1
                         continue
-                    z, u = _gap(m[last:s])
+                    z, u = gap_split(m, last, s)
                     zero += z
                     unread += u
                     rows.append(classify(m[s:s + 256], s, blen))
@@ -348,14 +355,14 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     pos = s + 1
                     continue
                 used = p - s - len(d.unused_data)
-                z, u = _gap(m[last:s])
+                z, u = gap_split(m, last, s)
                 zero += z
                 unread += u
                 row = classify(bytes(body) if keep_body and body else head, s, used)
                 row["size"] = total
                 rows.append(row)
                 last = pos = s + used
-            z, u = _gap(m[last:end])
+            z, u = gap_split(m, last, end)
             zero += z
             unread += u
     summary = summarise(rows, end - span_start, zero, unread)
@@ -442,16 +449,34 @@ def summarise(rows, span, zero, unread):
 
 def write_output(path, rows, summary):
     """Write CSV or JSON from the file extension."""
-    if os.path.splitext(path)[1].lower() == ".json":
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "files": rows}, f, indent=1)
-        return
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f, lineterminator="\n")
-        writer.writerow(COLUMNS)
-        for row in rows:
-            writer.writerow([f"0x{row['offset']:x}" if i == 0 else ("" if row[c] is None else row[c])
-                             for i, c in enumerate(COLUMNS)])
+    parent = os.path.dirname(os.path.abspath(path))
+    tmp = None
+    try:
+        if os.path.splitext(path)[1].lower() == ".json":
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
+                                             prefix=".restofworld_index-", suffix=".tmp", delete=False) as f:
+                tmp = f.name
+                json.dump({"summary": summary, "files": rows}, f, indent=1)
+        else:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=parent,
+                                             prefix=".restofworld_index-", suffix=".tmp", delete=False) as f:
+                tmp = f.name
+                writer = csv.writer(f, lineterminator="\n")
+                writer.writerow(COLUMNS)
+                for row in rows:
+                    writer.writerow([f"0x{row['offset']:x}" if i == 0 else ("" if row[c] is None else row[c])
+                                     for i, c in enumerate(COLUMNS)])
+        os.chmod(tmp, published_mode(path))
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                if os.path.lexists(tmp):
+                    os.chmod(tmp, 0o600)
+                    os.remove(tmp)
+            except OSError:
+                pass
+        raise
 
 
 def offset(text):
@@ -529,7 +554,11 @@ def main():
         sys.exit(f"{args.source}: {e}")
     except OSError as e:
         sys.exit(f"{args.source}: {e.strerror or e}")
-    write_output(args.out, rows, summary)
+    try:
+        write_output(args.out, rows, summary)
+    except OSError as e:
+        print(f"ERROR: cannot write {args.out}: {e.strerror or e}", file=sys.stderr)
+        return 1
     if not args.quiet:
         print(json.dumps({k: summary[k] for k in
                           ("files", "compressed_bytes", "inflated_bytes", "zero_padding",

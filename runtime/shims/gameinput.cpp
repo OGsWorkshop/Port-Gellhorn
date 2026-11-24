@@ -16,6 +16,8 @@
 //     SDL_CreateHapticEffect/RunHapticEffect (IGameInputForceFeedbackEffect); haptic trigger motors, reported from the
 //     trigger motors the pad already has, played as an intensity through the same trigger output as SetRumbleState
 //   - the keyboard pad (LEONIDA_KEYBOARD_PAD): one SDL virtual gamepad driven by the keyboard and mouse
+//   - which kind of device the player used last (rt::gameinput::active_input, LEONIDA_PROMPTS), for the runtime's
+//     own use: the title is told every pad is an Xbox One pad
 //
 // One thread owns SDL: the background poll thread by default, or the caller of rt::gameinput::poll() when
 // LEONIDA_GAMEINPUT_THREAD=0. Title calls never touch SDL: they read the latest snapshot and leave rumble requests
@@ -37,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -56,7 +59,8 @@ namespace {
 
 constexpr uint32_t kBaseKinds =
     GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
-constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion;  // everything a reading may carry
+// Everything a reading may carry: motion on pads with sensors, raw reports on pads opened through HID (RT-175).
+constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion | GameInputKindRawDeviceReport;
 constexpr uint32_t kAxisCount = 6;  // LX, LY, RX, RY, LT, RT
 constexpr uint32_t kButtonCount = SDL_GAMEPAD_BUTTON_COUNT;
 constexpr uint32_t kConnectedStatus = GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
@@ -169,6 +173,19 @@ rt::gameinput::Config read_config() {
     else if (!k.empty() && k != "0" && k != "off")
         std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, always or off), keyboard pad off\n",
                      k.c_str());
+    using leonida::InputFamily;
+    const std::string p = env("LEONIDA_PROMPTS");
+    if (p == "xbox") c.prompts = InputFamily::Xbox;
+    else if (p == "playstation" || p == "ps5") c.prompts = InputFamily::PlayStation5;
+    else if (p == "ps4") c.prompts = InputFamily::PlayStation4;
+    else if (p == "ps3") c.prompts = InputFamily::PlayStation3;
+    else if (p == "nintendo" || p == "switch") c.prompts = InputFamily::Nintendo;
+    else if (p == "keyboard") c.prompts = InputFamily::Keyboard;
+    else if (!p.empty() && p != "auto")
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_PROMPTS=%s unknown (auto, xbox, playstation, ps5, ps4, ps3, "
+                             "nintendo or keyboard), following the devices\n", p.c_str());
+    if (const std::string m = env("LEONIDA_PROMPTS_SWITCH_MS"); !m.empty())
+        c.prompts_switch_ms = static_cast<uint32_t>(std::clamp(std::atoi(m.c_str()), 0, 2000));
     return c;
 }
 
@@ -185,12 +202,18 @@ struct Snapshot {
     bool guide = false;
     GameInputMotionState motion{};  // valid only when has_motion; does not take part in operator==
     bool has_motion = false;
+    // The newest raw input report of a pad opened through HID (RT-175): its report id and payload, without the id
+    // byte. A new report with other bytes is a change, so it makes a reading of its own.
+    bool has_raw = false;
+    uint32_t raw_id = 0;
+    std::vector<uint8_t> raw;
     bool operator==(const Snapshot& o) const {  // field by field: the padding is not initialised
         const GameInputGamepadState &a = gamepad, &b = o.gamepad;
         return a.buttons == b.buttons && a.leftTrigger == b.leftTrigger && a.rightTrigger == b.rightTrigger &&
                a.leftThumbstickX == b.leftThumbstickX && a.leftThumbstickY == b.leftThumbstickY &&
                a.rightThumbstickX == b.rightThumbstickX && a.rightThumbstickY == b.rightThumbstickY && ui == o.ui &&
-               std::memcmp(buttons, o.buttons, sizeof buttons) == 0 && guide == o.guide;
+               std::memcmp(buttons, o.buttons, sizeof buttons) == 0 && guide == o.guide && has_raw == o.has_raw &&
+               raw_id == o.raw_id && raw == o.raw;
     }
 };
 
@@ -217,15 +240,13 @@ public:
     }
 
     uint32_t STDMETHODCALLTYPE GetInputKind() override {
-        return s_.has_motion ? kSupportedKinds : kBaseKinds;  // a reading of a pad without sensors carries no motion
+        // A reading of a pad without sensors carries no motion, and one without a raw report no raw report.
+        return kBaseKinds | (s_.has_motion ? GameInputKindMotion : 0u) | (s_.has_raw ? GameInputKindRawDeviceReport : 0u);
     }
     uint64_t STDMETHODCALLTYPE GetSequenceNumber(uint32_t) override { return seq_; }
     uint64_t STDMETHODCALLTYPE GetTimestamp() override { return ts_; }
     void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) override;
-    bool STDMETHODCALLTYPE GetRawReport(void** report) override {
-        if (report) *report = nullptr;
-        return false;
-    }
+    bool STDMETHODCALLTYPE GetRawReport(void** report) override;
     uint32_t STDMETHODCALLTYPE GetControllerAxisCount() override { return kAxisCount; }
     uint32_t STDMETHODCALLTYPE GetControllerAxisState(uint32_t count, float* out) override {
         const uint32_t n = out ? std::min(count, kAxisCount) : 0;
@@ -422,6 +443,22 @@ bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endle
     return true;
 }
 
+struct TriggerWaveform {
+    float intensity = 0.0f;
+    uint64_t start = 0, end = 0;  // microseconds, end == 0 holds until replaced
+    uint64_t duration = 0, delay = 0;
+
+    float level_at(uint64_t now) const {
+        if (end && now >= end) return 0.0f;
+        if (!duration || !delay || now <= start) return intensity;
+        const uint64_t elapsed = now - start;
+        if (elapsed < duration) return intensity;
+        // A cycle longer than the clock's entire range can only reach its first quiet interval.
+        if (delay > UINT64_MAX - duration) return 0.0f;
+        return elapsed % (duration + delay) < duration ? intensity : 0.0f;
+    }
+};
+
 class Device final : public IGameInputDevice {
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
@@ -450,16 +487,11 @@ public:
     void STDMETHODCALLTYPE SetInputSynchronizationState(bool) override {}
     void STDMETHODCALLTYPE SendInputSynchronizationHint() override {}
     void STDMETHODCALLTYPE PowerOff() override {}
-    HRESULT STDMETHODCALLTYPE CreateRawDeviceReport(uint32_t, int32_t, void** report) override {
-        if (report) *report = nullptr;
-        return E_NOTIMPL;
-    }
-    HRESULT STDMETHODCALLTYPE GetRawDeviceFeature(uint32_t, void** report) override {
-        if (report) *report = nullptr;
-        return E_NOTIMPL;
-    }
-    HRESULT STDMETHODCALLTYPE SetRawDeviceFeature(void*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE SendRawDeviceOutput(void*) override { return E_NOTIMPL; }
+    // Raw HID (RT-175): reports of the pad's HID device through rt::gameinput::HidBackend (SDL_hid_* by default).
+    HRESULT STDMETHODCALLTYPE CreateRawDeviceReport(uint32_t reportId, int32_t reportKind, void** report) override;
+    HRESULT STDMETHODCALLTYPE GetRawDeviceFeature(uint32_t reportId, void** report) override;
+    HRESULT STDMETHODCALLTYPE SetRawDeviceFeature(void* report) override;
+    HRESULT STDMETHODCALLTYPE SendRawDeviceOutput(void* report) override;
     HRESULT STDMETHODCALLTYPE SendRawDeviceOutputWithResponse(void*, void** response) override {
         if (response) *response = nullptr;
         return E_NOTIMPL;
@@ -492,8 +524,7 @@ public:
     float motor_gain = 1.0f;                     // SetForceFeedbackMotorGain, 0..1
     std::vector<ForceFeedbackEffect*> effects;    // every live effect, so the poll thread can drive them
     std::vector<int> retired;                     // SDL effect ids whose object is gone: destroyed on the poll thread
-    float haptic_intensity[kHapticMotors] = {};   // SetHapticMotorState, 0..1
-    uint64_t haptic_until[kHapticMotors] = {};    // when the request ends, 0 for "until changed"
+    TriggerWaveform waveforms[kHapticMotors]{};
     GameInputBatteryState battery{0, 0, 0, 0, GameInputBatteryUnknown};
     AppLocalDeviceId base_id{};  // id_bytes of the identity alone: twins share it, info.deviceId tells them apart
 
@@ -508,10 +539,22 @@ public:
     int sent_gain = -1;               // device gain 0..100 last sent, so a steady gain costs one call
     uint32_t haptic_motors = 0;       // trigger haptic motors the pad reports (0 or 2)
     rt::gameinput::OutputState sent{};
+    leonida::InputFamily family = leonida::InputFamily::Xbox;  // what kind of device it really is (active_input)
     Snapshot last_snap{};  // what the latest reading holds
     uint64_t last_reading_us = 0;  // for the motion cadence: readings stream at ~125 Hz on pads with sensors
     uint64_t motors_sent_at = 0, triggers_sent_at = 0, battery_at = 0;
     bool ds_sent_once = false;
+
+    // Raw HID (RT-175). hid is the backend's handle, null when the pad has no HID device the backend could open;
+    // hid_mu serialises every call on it, from the poll thread (reads) and the title's threads (output, features).
+    // The report tables come from the HID report descriptor; info.input/output/featureReportInfo point into them.
+    std::mutex hid_mu;
+    void* hid = nullptr;
+    const rt::gameinput::HidBackend* hid_backend = nullptr;  // the backend hid was opened with
+    bool hid_ids = false;  // the descriptor declares report ids, so an input report starts with its id byte
+    std::vector<GameInputRawDeviceReportInfo> raw_in, raw_out, raw_feature;
+    const GameInputRawDeviceReportInfo* find_raw(int32_t kind, uint32_t report_id) const;
+    HRESULT send_raw(void* report, GameInputRawDeviceReportKind kind);
 
 private:
     std::atomic<ULONG> refs_{1};
@@ -527,6 +570,180 @@ void Reading::GetDevice(IGameInputDevice** device) {
     device_->AddRef();
     *device = device_;
 }
+
+// ---- raw HID (RT-175) -------------------------------------------------------------------------------------------
+
+// One raw report: its own copy of the report info (so it outlives a reconnect that rebuilds the device's tables) and
+// payload. There are no item tables (itemCount 0), so the item calls answer false; see docs/gameinput.md "Raw HID".
+class RawReport final : public IGameInputRawDeviceReport {
+public:
+    RawReport(Device* device, const GameInputRawDeviceReportInfo& info, const uint8_t* data, size_t size)
+        : device_(device), info_(info), data_(info.size, 0) {
+        info_.itemCount = 0;
+        info_.items = nullptr;
+        if (data) std::memcpy(data_.data(), data, std::min(size, data_.size()));
+        device_->AddRef();
+    }
+    ~RawReport() { device_->Release(); }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (same_guid(riid, IID_IUnknown) || same_guid(riid, IID_IGameInputRawDeviceReport)) {
+            AddRef();
+            *out = static_cast<IGameInputRawDeviceReport*>(this);
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --refs_;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) override;
+    const GameInputRawDeviceReportInfo* STDMETHODCALLTYPE GetReportInfo() override { return &info_; }
+    size_t STDMETHODCALLTYPE GetRawDataSize() override { return data_.size(); }
+    size_t STDMETHODCALLTYPE GetRawData(size_t bufferSize, void* buffer) override {
+        const size_t n = buffer ? std::min(bufferSize, data_.size()) : 0;
+        if (n) std::memcpy(buffer, data_.data(), n);
+        return n;
+    }
+    // The whole payload at once: a buffer of another size is refused, so a report is never half old, half new.
+    bool STDMETHODCALLTYPE SetRawData(size_t bufferSize, const void* buffer) override {
+        if (!buffer || bufferSize != data_.size()) return false;
+        std::memcpy(data_.data(), buffer, bufferSize);
+        return true;
+    }
+    bool STDMETHODCALLTYPE GetItemValue(uint32_t, int64_t* value) override {
+        if (value) *value = 0;
+        return false;
+    }
+    bool STDMETHODCALLTYPE SetItemValue(uint32_t, int64_t) override { return false; }
+    bool STDMETHODCALLTYPE ResetItemValue(uint32_t) override { return false; }
+    bool STDMETHODCALLTYPE ResetAllItems() override { return false; }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    Device* device_;
+    GameInputRawDeviceReportInfo info_;
+    std::vector<uint8_t> data_;
+};
+
+void RawReport::GetDevice(IGameInputDevice** device) {
+    if (!device) return;
+    device_->AddRef();
+    *device = device_;
+}
+
+// The default backend: SDL's hidapi. A pad is opened by the path SDL reports for it; with no such HID path, by its
+// vendor and product id when exactly one game-pad collection (usage page 1, usage 5) matches, so twins never mix.
+// A pad without a path (SDL virtual joysticks, the keyboard pad) gets no HID device.
+void* sdl_hid_open(const char* path, uint16_t vendor, uint16_t product) {
+    if (!path || !*path) return nullptr;
+    static const bool ok = SDL_hid_init() == 0;
+    if (!ok) return nullptr;
+    if (SDL_hid_device* h = SDL_hid_open_path(path)) return h;
+    SDL_hid_device_info* list = SDL_hid_enumerate(vendor, product);
+    const char* only = nullptr;
+    int matches = 0;
+    for (SDL_hid_device_info* i = list; i; i = i->next)
+        if (i->usage_page == 0x01 && i->usage == 0x05 && ++matches == 1) only = i->path;
+    SDL_hid_device* h = (matches == 1 && only) ? SDL_hid_open_path(only) : nullptr;
+    SDL_hid_free_enumeration(list);
+    return h;
+}
+void sdl_hid_close(void* h) { SDL_hid_close(static_cast<SDL_hid_device*>(h)); }
+int sdl_hid_descriptor(void* h, uint8_t* buf, size_t size) {
+    return SDL_hid_get_report_descriptor(static_cast<SDL_hid_device*>(h), buf, size);
+}
+int sdl_hid_read(void* h, uint8_t* buf, size_t size) {
+    return SDL_hid_read_timeout(static_cast<SDL_hid_device*>(h), buf, size, 0);
+}
+int sdl_hid_write(void* h, const uint8_t* buf, size_t size) {
+    return SDL_hid_write(static_cast<SDL_hid_device*>(h), buf, size);
+}
+int sdl_hid_get_feature(void* h, uint8_t* buf, size_t size) {
+    return SDL_hid_get_feature_report(static_cast<SDL_hid_device*>(h), buf, size);
+}
+int sdl_hid_send_feature(void* h, const uint8_t* buf, size_t size) {
+    return SDL_hid_send_feature_report(static_cast<SDL_hid_device*>(h), buf, size);
+}
+const rt::gameinput::HidBackend kSdlHid = {sdl_hid_open,  sdl_hid_close,       sdl_hid_descriptor, sdl_hid_read,
+                                           sdl_hid_write, sdl_hid_get_feature, sdl_hid_send_feature};
+std::atomic<const rt::gameinput::HidBackend*> g_hid{&kSdlHid};
+
+bool Reading::GetRawReport(void** report) {
+    if (!report) return false;
+    *report = nullptr;
+    if (!s_.has_raw) return false;
+    std::lock_guard lock(device_->hid_mu);
+    const GameInputRawDeviceReportInfo* info = device_->find_raw(GameInputRawInputReport, s_.raw_id);
+    if (!info) return false;
+    *report = static_cast<IGameInputRawDeviceReport*>(new RawReport(device_, *info, s_.raw.data(), s_.raw.size()));
+    return true;
+}
+
+const GameInputRawDeviceReportInfo* Device::find_raw(int32_t kind, uint32_t report_id) const {
+    const std::vector<GameInputRawDeviceReportInfo>* list = kind == GameInputRawInputReport    ? &raw_in
+                                                           : kind == GameInputRawOutputReport  ? &raw_out
+                                                           : kind == GameInputRawFeatureReport ? &raw_feature
+                                                                                               : nullptr;
+    if (!list) return nullptr;
+    for (const GameInputRawDeviceReportInfo& r : *list)
+        if (r.id == report_id) return &r;
+    return nullptr;
+}
+
+HRESULT Device::CreateRawDeviceReport(uint32_t reportId, int32_t reportKind, void** report) {
+    if (!report) return E_POINTER;
+    *report = nullptr;
+    std::lock_guard lock(hid_mu);
+    if (!hid) return E_NOTIMPL;  // no raw I/O on this pad (GameInputDeviceRawIoEnabled is not set)
+    const GameInputRawDeviceReportInfo* ri = find_raw(reportKind, reportId);
+    if (!ri) return E_INVALIDARG;
+    *report = static_cast<IGameInputRawDeviceReport*>(new RawReport(this, *ri, nullptr, 0));
+    return S_OK;
+}
+
+HRESULT Device::GetRawDeviceFeature(uint32_t reportId, void** report) {
+    if (!report) return E_POINTER;
+    *report = nullptr;
+    std::lock_guard lock(hid_mu);
+    if (!hid) return E_NOTIMPL;
+    const GameInputRawDeviceReportInfo* ri = find_raw(GameInputRawFeatureReport, reportId);
+    if (!ri) return E_INVALIDARG;
+    std::vector<uint8_t> buf(ri->size + 1, 0);
+    buf[0] = static_cast<uint8_t>(reportId);  // hidapi: the id goes first, 0 for a device without ids
+    const int n = hid_backend->get_feature(hid, buf.data(), buf.size());
+    if (n < 1) return E_FAIL;
+    *report = static_cast<IGameInputRawDeviceReport*>(new RawReport(this, *ri, buf.data() + 1, static_cast<size_t>(n) - 1));
+    return S_OK;
+}
+
+// SetRawDeviceFeature and SendRawDeviceOutput: any IGameInputRawDeviceReport of the right kind whose id this pad
+// declares; the payload is sent with the id byte in front, as hidapi takes it.
+HRESULT Device::send_raw(void* report, GameInputRawDeviceReportKind kind) {
+    if (!report) return E_INVALIDARG;
+    auto* r = static_cast<IGameInputRawDeviceReport*>(report);
+    const GameInputRawDeviceReportInfo* given = r->GetReportInfo();
+    std::lock_guard lock(hid_mu);
+    if (!hid) return E_NOTIMPL;
+    if (!given || given->kind != kind) return E_INVALIDARG;
+    const GameInputRawDeviceReportInfo* ri = find_raw(kind, given->id);
+    if (!ri) return E_INVALIDARG;
+    std::vector<uint8_t> buf(ri->size + 1, 0);
+    buf[0] = static_cast<uint8_t>(ri->id);
+    r->GetRawData(ri->size, buf.data() + 1);
+    const rt::gameinput::HidBackend* b = hid_backend;
+    const int n = kind == GameInputRawFeatureReport ? b->send_feature(hid, buf.data(), buf.size())
+                                                     : b->write(hid, buf.data(), buf.size());
+    return n < 0 ? E_FAIL : S_OK;
+}
+HRESULT Device::SetRawDeviceFeature(void* report) { return send_raw(report, GameInputRawFeatureReport); }
+HRESULT Device::SendRawDeviceOutput(void* report) { return send_raw(report, GameInputRawOutputReport); }
 
 // ---- callbacks --------------------------------------------------------------------------------------------------
 
@@ -579,6 +796,9 @@ public:
     void sync(Device* device, uint64_t now, bool muted);
     // Poll thread, on unplug: the SDL device went with the pad, so forget its effect id without touching SDL.
     void orphan();
+    // Poll thread, under g().mu: a reference unless the title's last Release already ran (the destructor then waits
+    // for g().mu to unlink the effect, so it is still in the device's list but must not be used or revived).
+    bool add_ref_if_live() { return rt::gameinput::add_ref_if_live(refs_); }
 
 private:
     std::atomic<ULONG> refs_{1};
@@ -639,7 +859,7 @@ bool matches(const Callback& c, const Event& e) {
             if (!(c.kind & e.device->info.supportedInput) && c.kind != GameInputKindUnknown) return false;
             return e.only || ((e.current ^ e.previous) & c.status_filter);
         case CbType::Reading:
-            return (c.kind & kSupportedKinds) || c.kind == GameInputKindUnknown;
+            return c.kind == GameInputKindUnknown || (c.kind & e.device->info.supportedInput);
         default:
             return true;
     }
@@ -700,31 +920,32 @@ bool deliver() {
     return !s.queue.empty();
 }
 
-// IGameInputDispatcher::Dispatch: runs queued events oldest first, at least one even with a quota of 0, and takes no
-// further event once quota_us microseconds have passed (an event already started runs to the end, so the quota is a
-// target, as on Windows). While events remain the wait handle is signalled again, so a title that waits on it before
-// each call comes back for the rest. Returns whether events remain.
+// IGameInputDispatcher::Dispatch: runs the events queued when the call starts, oldest first: at least one even with a
+// quota of 0, and no further event once quota_us microseconds have passed (an event already started runs to the end,
+// so the quota is a target, as on Windows). Events queued during the call wait for the next one, so a busy poll thread
+// cannot keep the title inside Dispatch even with an unlimited quota. Events left over go back to the front of the
+// queue, ahead of newer ones, and the wait handle is signalled again while any remain. Returns whether events remain.
 bool deliver_within(uint64_t quota_us) {
     State& s = g();
     std::lock_guard dl(s.deliver_mu);
     const auto start = std::chrono::steady_clock::now();
+    std::vector<Event> batch;
+    {
+        std::lock_guard lock(s.mu);
+        batch.swap(s.queue);
+    }
     s.delivering_thread = GetCurrentThreadId();
-    for (bool first = true;; first = false) {
-        if (!first) {
+    size_t next = 0;
+    while (next < batch.size()) {
+        if (next > 0) {
             const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
             if (static_cast<uint64_t>(spent.count()) >= quota_us) break;
         }
-        Event e;
-        {
-            std::lock_guard lock(s.mu);
-            if (s.queue.empty()) break;
-            e = s.queue.front();
-            s.queue.erase(s.queue.begin());
-        }
-        deliver_event(e);
+        deliver_event(batch[next++]);
     }
     s.delivering_thread = 0;
     std::lock_guard lock(s.mu);
+    if (next < batch.size()) s.queue.insert(s.queue.begin(), batch.begin() + static_cast<std::ptrdiff_t>(next), batch.end());
     const bool remaining = !s.queue.empty();
     if (remaining && s.wait_event) SetEvent(s.wait_event);
     return remaining;
@@ -737,6 +958,79 @@ uint16_t to_u16(float v) { return static_cast<uint16_t>(std::lround(std::clamp(v
 float axis(SDL_Gamepad* p, SDL_GamepadAxis a) { return std::max(-1.0f, SDL_GetGamepadAxis(p, a) / 32767.0f); }
 
 float norm(float v, float max) { return std::clamp(v / max, -1.0f, 1.0f); }
+
+bool is_keyboard_pad(SDL_JoystickID jid);  // with the keyboard pad below
+
+// What kind of device a pad really is, for active_input(): SDL's gamepad type, which it takes from the vendor and
+// product id. Anything SDL does not place (a generic or unknown pad, a GameCube adapter) counts as Xbox, the layout
+// GameInput itself describes.
+leonida::InputFamily family_of(SDL_JoystickID jid, SDL_Gamepad* p) {
+    using leonida::InputFamily;
+    if (is_keyboard_pad(jid)) return InputFamily::Keyboard;
+    switch (SDL_GetGamepadType(p)) {
+    case SDL_GAMEPAD_TYPE_PS5: return InputFamily::PlayStation5;
+    case SDL_GAMEPAD_TYPE_PS4: return InputFamily::PlayStation4;
+    case SDL_GAMEPAD_TYPE_PS3: return InputFamily::PlayStation3;
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: return InputFamily::Nintendo;
+    default: return InputFamily::Xbox;
+    }
+}
+
+// ---- active input (src/active_input.h) ----
+//
+// The tracker is poll-thread state, under poll_mu like the rest of the poll. What it answers is published in one word,
+// so active_input() needs no lock and never sees a family from one change with the generation of another: the family
+// in bits 0-7, forced in bit 8, the generation from bit 16.
+leonida::ActiveInputTracker g_tracker;
+std::atomic<uint64_t> g_active{0};
+
+void publish_active() {
+    g_active.store(static_cast<uint64_t>(g_tracker.active()) | (g_tracker.forced() ? 1ull << 8 : 0) |
+                       (g_tracker.generation() << 16),
+                   std::memory_order_release);
+}
+
+leonida::InputSample sample_of(const Snapshot& s) {
+    static_assert(kButtonCount <= 32, "every SDL gamepad button needs a bit");
+    leonida::InputSample out;
+    for (uint32_t i = 0; i < kButtonCount; ++i)  // all of SDL's buttons: guide, touchpad and paddles included
+        if (s.buttons[i]) out.buttons |= 1u << i;
+    out.left_trigger = s.gamepad.leftTrigger;
+    out.right_trigger = s.gamepad.rightTrigger;
+    out.left_x = s.gamepad.leftThumbstickX;
+    out.left_y = s.gamepad.leftThumbstickY;
+    out.right_x = s.gamepad.rightThumbstickX;
+    out.right_y = s.gamepad.rightThumbstickY;
+    return out;
+}
+
+// LEONIDA_PROMPTS and LEONIDA_PROMPTS_SWITCH_MS, applied at each poll: reload_config can change them at any time.
+void apply_prompt_config() {
+    std::optional<leonida::InputFamily> want;
+    uint32_t switch_ms;
+    {
+        std::lock_guard lock(g().mu);
+        want = g().config.prompts;
+        switch_ms = g().config.prompts_switch_ms;
+    }
+    leonida::ActiveInputTracker::Thresholds t = g_tracker.thresholds();
+    t.min_switch_us = uint64_t{switch_ms} * 1000;
+    g_tracker.set_thresholds(t);
+    const std::optional<leonida::InputFamily> now =
+        g_tracker.forced() ? std::optional<leonida::InputFamily>(g_tracker.active()) : std::nullopt;
+    if (want == now) return;
+    g_tracker.force(want);
+    publish_active();
+    if (want)
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_PROMPTS: input family set to %s\n",
+                     leonida::input_family_name(*want));
+    else
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_PROMPTS cleared: input family follows the devices (%s now)\n",
+                     leonida::input_family_name(g_tracker.active()));
+}
 
 Snapshot read_pad(Device* d) {
     SDL_Gamepad* p = d->pad;
@@ -902,7 +1196,40 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
         d->button_info[b].mappedInputKinds = GameInputKindGamepad;
         d->button_info[b].legacyHidIndex = static_cast<uint16_t>(b);
         d->button_info[b].legacyDInputIndex = static_cast<uint16_t>(b);
+        d->button_info[b].label = GameInputLabelUnknown;  // paddles, touchpad, misc: no gamepad meaning to name
     }
+    // Labels. Every pad is presented as an Xbox One pad (docs/gameinput.md), so every control carries the Xbox label
+    // of its position, whatever is printed on the pad in the player's hands. A stick axis has no label in v0, so
+    // only the triggers are named. UI navigation names the controls read_pad reads it from; scrolling is the right
+    // stick, which has none.
+    const GameInputLabel face[4] = {GameInputLabelXboxA, GameInputLabelXboxB, GameInputLabelXboxX,
+                                    GameInputLabelXboxY};
+    const GameInputLabel menu = GameInputLabelXboxMenu, view = GameInputLabelXboxView;
+    const GameInputLabel up = GameInputLabelXboxDPadUp, down = GameInputLabelXboxDPadDown;
+    const GameInputLabel left = GameInputLabelXboxDPadLeft, right = GameInputLabelXboxDPadRight;
+    const GameInputLabel lb = GameInputLabelXboxLeftShoulder, rb = GameInputLabelXboxRightShoulder;
+    const GameInputLabel ls = GameInputLabelXboxLeftStickButton, rs = GameInputLabelXboxRightStickButton;
+    const GameInputLabel lt = GameInputLabelXboxLeftTrigger, rt = GameInputLabelXboxRightTrigger;
+    const GameInputLabel none = GameInputLabelNone;
+    d->gamepad_info = {menu, view, face[0], face[1], face[2], face[3], up, down, left, right, lb, rb, ls, rs};
+    d->ui_info = {menu, view, face[0], face[1], up, down, left, right, face[2], face[3], ls, rs, lt, rt, lb, rb,
+                  none, none, none, none, GameInputLabelXboxGuide};
+    d->axis_info[4].label = lt;
+    d->axis_info[5].label = rt;
+    const struct {
+        SDL_GamepadButton sdl;
+        GameInputLabel label;
+    } labelled[] = {
+        {SDL_GAMEPAD_BUTTON_SOUTH, face[0]},    {SDL_GAMEPAD_BUTTON_EAST, face[1]},
+        {SDL_GAMEPAD_BUTTON_WEST, face[2]},     {SDL_GAMEPAD_BUTTON_NORTH, face[3]},
+        {SDL_GAMEPAD_BUTTON_BACK, view},        {SDL_GAMEPAD_BUTTON_GUIDE, GameInputLabelXboxGuide},
+        {SDL_GAMEPAD_BUTTON_START, menu},       {SDL_GAMEPAD_BUTTON_LEFT_STICK, ls},
+        {SDL_GAMEPAD_BUTTON_RIGHT_STICK, rs},   {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, lb},
+        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, rb}, {SDL_GAMEPAD_BUTTON_DPAD_UP, up},
+        {SDL_GAMEPAD_BUTTON_DPAD_DOWN, down},   {SDL_GAMEPAD_BUTTON_DPAD_LEFT, left},
+        {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, right},
+    };
+    for (const auto& l : labelled) d->button_info[l.sdl].label = l.label;
     i.controllerAxisInfo = d->axis_info;
     i.controllerButtonInfo = d->button_info;
     i.gamepadInfo = &d->gamepad_info;
@@ -928,6 +1255,92 @@ Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
         h.pop_front();
     }
     return h.back();
+}
+
+// Raw HID (RT-175): opens the pad's HID device with the current backend and builds the report tables from its report
+// descriptor. A pad the backend cannot open, or whose descriptor cannot be read or declares no report, gets no raw
+// I/O: no GameInputKindRawDeviceReport, no report tables, and E_NOTIMPL from the raw device calls. Under g().mu.
+void open_raw(Device* d, const char* path) {
+    std::lock_guard lock(d->hid_mu);
+    if (d->hid) d->hid_backend->close(d->hid);
+    d->hid = nullptr;
+    d->hid_ids = false;
+    d->raw_in.clear();
+    d->raw_out.clear();
+    d->raw_feature.clear();
+    const rt::gameinput::HidBackend* b = g_hid.load();
+    void* h = b->open(path, d->info.vendorId, d->info.productId);
+    if (!h) {
+        // SDL reads Xbox pads on Windows through XInput ("XInput#n"); SDL's hidapi skips their XInput HID interface
+        // (&IG_ in the path), which carries no full HID reports, so they have no raw I/O here.
+        const bool xinput = path && std::strncmp(path, "XInput#", 7) == 0;
+        std::fprintf(stderr, "[rt] gameinput: %s: no raw HID (%s)\n", d->name.c_str(),
+                     xinput             ? "an XInput pad: SDL's hidapi does not open XInput HID interfaces"
+                     : path && *path    ? "its HID device could not be opened"
+                                        : "SDL reports no device path");
+        return;
+    }
+    std::vector<uint8_t> desc(4096);
+    const int n = b->descriptor(h, desc.data(), desc.size());
+    std::vector<rt::gameinput::RawReportSize> reports;
+    const bool parsed = n > 0 && rt::gameinput::parse_report_descriptor(desc.data(), static_cast<size_t>(n), &reports);
+    if (!parsed || reports.empty()) {
+        std::fprintf(stderr, "[rt] gameinput: %s: no raw HID (%s)\n", d->name.c_str(),
+                     n <= 0 ? "no report descriptor" : !parsed ? "malformed report descriptor" : "no reports declared");
+        b->close(h);
+        return;
+    }
+    for (const rt::gameinput::RawReportSize& r : reports) {
+        const GameInputRawDeviceReportInfo info{static_cast<GameInputRawDeviceReportKind>(r.kind), r.id, r.bytes, 0, nullptr};
+        (r.kind == GameInputRawInputReport ? d->raw_in : r.kind == GameInputRawOutputReport ? d->raw_out : d->raw_feature)
+            .push_back(info);
+        d->hid_ids |= r.id != 0;
+    }
+    d->hid = h;
+    d->hid_backend = b;
+    GameInputDeviceInfo& i = d->info;
+    i.supportedInput |= GameInputKindRawDeviceReport;
+    i.inputReportCount = static_cast<uint32_t>(d->raw_in.size());
+    i.inputReportInfo = d->raw_in.empty() ? nullptr : d->raw_in.data();
+    i.outputReportCount = static_cast<uint32_t>(d->raw_out.size());
+    i.outputReportInfo = d->raw_out.empty() ? nullptr : d->raw_out.data();
+    i.featureReportCount = static_cast<uint32_t>(d->raw_feature.size());
+    i.featureReportInfo = d->raw_feature.empty() ? nullptr : d->raw_feature.data();
+}
+
+void close_raw(Device* d) {
+    std::lock_guard lock(d->hid_mu);
+    if (d->hid) d->hid_backend->close(d->hid);
+    d->hid = nullptr;
+}
+
+// Drains the input reports pending since the last poll; the newest one the pad declares goes into snap. With none
+// pending, snap keeps the previous report, so a quiet pad makes no new reading. Poll thread.
+void read_raw(Device* d, Snapshot* snap) {
+    snap->has_raw = d->last_snap.has_raw;
+    snap->raw_id = d->last_snap.raw_id;
+    snap->raw = d->last_snap.raw;
+    std::lock_guard lock(d->hid_mu);
+    if (!d->hid) return;
+    std::vector<uint8_t> buf(4096);
+    for (int k = 0; k < 64; ++k) {  // bounded: a pad that floods cannot hold up the poll
+        const int n = d->hid_backend->read(d->hid, buf.data(), buf.size());
+        if (n <= 0) break;
+        uint32_t id = 0;
+        const uint8_t* p = buf.data();
+        size_t len = static_cast<size_t>(n);
+        if (d->hid_ids) {
+            id = buf[0];
+            ++p;
+            --len;
+        }
+        const GameInputRawDeviceReportInfo* info = d->find_raw(GameInputRawInputReport, id);
+        if (!info) continue;
+        snap->has_raw = true;
+        snap->raw_id = id;
+        snap->raw.assign(p, p + std::min(len, static_cast<size_t>(info->size)));
+        snap->raw.resize(info->size, 0);
+    }
 }
 
 void open_pad(SDL_JoystickID jid, uint64_t ts) {
@@ -972,6 +1385,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     }
     d->pad = p;
     d->id = jid;
+    d->family = family_of(jid, p);
     d->is_dualsense = SDL_GetGamepadType(p) == SDL_GAMEPAD_TYPE_PS5;
     d->has_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
     d->has_trigger_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
@@ -1021,7 +1435,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->haptic_motors = 0;
     if (d->has_trigger_output) {
         for (uint32_t m = 0; m < kHapticMotors; ++m) {
-            d->haptic_waveform_info[m] = {{0x0F, 0x58}, true, true, true, false, 0};
+            d->haptic_waveform_info[m] = {{0x0F, 0x58}, true, true, true, true, 0};
             d->haptic_motor_info[m] = {};
             d->haptic_motor_info[m].mappedRumbleMotors = m ? GameInputRumbleRightTrigger : GameInputRumbleLeftTrigger;
             d->haptic_motor_info[m].location = GameInputLocationChassis;
@@ -1040,6 +1454,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->motors_sent_at = d->triggers_sent_at = d->battery_at = 0;
     d->wanted = {};
     fill_info(d, p, id);
+    open_raw(d, path);
 
     // Player LEDs and SDL's default lightbar colour follow the slot: the lowest one not in use.
     int player = 0;
@@ -1055,6 +1470,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
 
     uint32_t status = kConnectedStatus;
     if (d->info.capabilities & GameInputDeviceCapabilityWireless) status |= GameInputDeviceWireless;
+    if (d->hid) status |= GameInputDeviceRawIoEnabled;
     d->status = status;
     s.connected.push_back(d);
 
@@ -1070,9 +1486,11 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
 
 void close_pad(Device* d, uint64_t ts) {
     State& s = g();
+    g_tracker.forget(d->id);  // poll-thread state: a pad that comes back starts from a fresh baseline
     std::lock_guard lock(s.mu);
     const uint32_t old = d->status.exchange(GameInputDeviceNoStatus);
     SDL_CloseGamepad(d->pad);
+    close_raw(d);
     d->pad = nullptr;
     d->player = -1;
     // The haptic device belongs to the joystick, which goes with the gamepad. Effects a title still holds stay alive
@@ -1087,7 +1505,7 @@ void close_pad(Device* d, uint64_t ts) {
     d->sent_gain = -1;
     d->haptic_motors = 0;
     for (ForceFeedbackEffect* e : d->effects) e->orphan();
-    for (uint32_t m = 0; m < kHapticMotors; ++m) d->haptic_intensity[m] = 0, d->haptic_until[m] = 0;
+    for (auto& waveform : d->waveforms) waveform = {};
     if (!d->history.empty()) d->evicted_order = d->history.back()->order();  // the history ends with the session
     for (Reading* r : d->history) r->Release();
     d->history.clear();
@@ -1125,10 +1543,11 @@ void apply_effects(Device* d, uint64_t now) {
     {
         std::lock_guard lock(s.mu);
         live.reserve(d->effects.size());
-        for (ForceFeedbackEffect* e : d->effects) {  // referenced: the title may release one while this runs
-            e->AddRef();
-            live.push_back(e);
-        }
+        // Referenced: the title may release one while this runs. An effect whose count already reached 0 is being
+        // destroyed (its destructor waits for this lock to unlink it); a plain AddRef revived it, and this loop's own
+        // Release below freed it a second time.
+        for (ForceFeedbackEffect* e : d->effects)
+            if (e->add_ref_if_live()) live.push_back(e);
         retire.swap(d->retired);
         motor_gain = d->motor_gain;
         muted = !s.config.rumble;
@@ -1155,7 +1574,7 @@ void apply_output(Device* d, uint64_t now) {
         std::lock_guard lock(s.mu);
         want = d->wanted;
         for (uint32_t m = 0; m < d->haptic_motors; ++m)
-            if (!d->haptic_until[m] || now < d->haptic_until[m]) haptic[m] = d->haptic_intensity[m];
+            haptic[m] = d->waveforms[m].level_at(now);
     }
     const bool muted = !s.config.rumble;
     if (muted) want = {};
@@ -1362,6 +1781,8 @@ struct KeyboardPad {
 };
 KeyboardPad g_keyboard;
 
+bool is_keyboard_pad(SDL_JoystickID jid) { return jid != 0 && jid == g_keyboard.id; }
+
 void detach_keyboard_pad() {
     if (g_keyboard.js) SDL_CloseJoystick(g_keyboard.js);
     if (g_keyboard.id) SDL_DetachVirtualJoystick(g_keyboard.id);
@@ -1508,6 +1929,7 @@ void poll_once() {
     State& s = g();
     std::lock_guard pl(s.poll_mu);
     if (!init_sdl()) return;
+    apply_prompt_config();
     update_keyboard_pad();
     SDL_UpdateGamepads();
     const uint64_t now = now_us();
@@ -1539,10 +1961,20 @@ void poll_once() {
         connected = s.connected;
     }
     for (Device* d : connected) {
-        const Snapshot snap = read_pad(d);
+        Snapshot snap = read_pad(d);
+        read_raw(d, &snap);
         const bool guide_changed = d->last_snap.guide != snap.guide;
         const bool changed = !(d->last_snap == snap);
         d->last_snap = snap;
+        // A newly opened pad's first sample here is its baseline (active_input.h), so connecting a pad with a button
+        // held changes nothing.
+        if (const leonida::InputEdge edge = g_tracker.observe(d->id, d->family, sample_of(snap), now);
+            edge != leonida::InputEdge::None) {
+            publish_active();
+            if (!g_tracker.forced())
+                std::fprintf(stderr, "[rt] gameinput: input in use: %s (%s, %s)\n",
+                             leonida::input_family_name(d->family), d->name.c_str(), leonida::input_edge_name(edge));
+        }
         // A pad with sensors streams readings at ~125 Hz even when nothing else changes, so motion the title reads
         // between its frames is never stuck at the last button event; pads without sensors only read on change, as
         // before. push_reading stamps last_reading_us, so the cadence follows the actual history.
@@ -1638,19 +2070,27 @@ void Device::SetForceFeedbackMotorGain(uint32_t motorIndex, float masterGain) {
 HRESULT Device::SetHapticMotorState(uint32_t motorIndex, const void* params) {
     std::lock_guard lock(g().mu);
     if (motorIndex >= haptic_motors) return E_INVALIDARG;
+    auto& waveform = waveforms[motorIndex];
     if (!params) {  // stop the motor
-        haptic_intensity[motorIndex] = 0.0f;
-        haptic_until[motorIndex] = 0;
+        waveform = {};
         return S_OK;
     }
     const auto* p = static_cast<const GameInputHapticFeedbackParams*>(params);
     if (p->waveformIndex >= haptic_motor_info[motorIndex].waveformCount) return E_INVALIDARG;
-    haptic_intensity[motorIndex] = std::clamp(p->intensity, 0.0f, 1.0f);
+    waveform.intensity = std::clamp(p->intensity, 0.0f, 1.0f);
+    waveform.start = now_us();
+    waveform.duration = p->duration;
+    waveform.delay = p->repeatDelay;
     // duration and repeatDelay are microseconds; playCount 0 plays until the state is set again. The poll thread sends
-    // the level and drops it when the deadline passes.
+    // the level and drops it when the deadline passes. The sums saturate: a request longer than a uint64 of
+    // microseconds (a duration of UINT64_MAX, say) ends at UINT64_MAX, which the poll thread never reaches, instead of
+    // wrapping to a deadline already past or only a moment away.
+    constexpr uint64_t kMax = UINT64_MAX;
+    const auto mul = [](uint64_t a, uint64_t b) { return b && a > kMax / b ? kMax : a * b; };
+    const auto add = [](uint64_t a, uint64_t b) { return a > kMax - b ? kMax : a + b; };
     uint64_t total = p->playCount == 0 ? 0 : p->duration;
-    if (p->playCount > 1) total = p->duration * p->playCount + p->repeatDelay * (p->playCount - 1);
-    haptic_until[motorIndex] = total ? now_us() + total : 0;
+    if (p->playCount > 1) total = add(mul(p->duration, p->playCount), mul(p->repeatDelay, p->playCount - 1));
+    waveform.end = total ? add(waveform.start, total) : 0;
     return S_OK;
 }
 
@@ -1743,6 +2183,16 @@ void ForceFeedbackEffect::orphan() {
     applied_ = 0;
 }
 
+// What SDL said about the effect, for output_state (gameinput_probe and the tests): the id it returned, whether it is
+// running, and its error text when it is not. SDL_GetError is read here, on the poll thread that made the call.
+void note_effect(Device* d, int id, bool ran) {
+    const char* error = ran ? "" : SDL_GetError();
+    std::lock_guard lock(g().mu);
+    d->sent.effect_id = id;
+    d->sent.effect_ran = ran;
+    std::snprintf(d->sent.effect_error, sizeof d->sent.effect_error, "%s", error ? error : "");
+}
+
 void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     GameInputForceFeedbackParams params;
     float gain;
@@ -1791,13 +2241,21 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     }
     if (sdl_effect_ < 0) {
         sdl_effect_ = haptics().create_effect(d->haptic, &fx);  // SDL refused: nothing to drive this effect
-        if (sdl_effect_ < 0) return;
+        if (sdl_effect_ < 0) {
+            note_effect(d, -1, false);
+            return;
+        }
     } else if (!haptics().update_effect(d->haptic, sdl_effect_, &fx)) {
+        note_effect(d, sdl_effect_, false);
         return;
     }
     // GameInput's playCount 0 means "until stopped", which is what SDL's 0 iterations means.
     const uint32_t iterations = endless ? 0 : play_count(params);
-    if (!haptics().run_effect(d->haptic, sdl_effect_, iterations)) return;
+    if (!haptics().run_effect(d->haptic, sdl_effect_, iterations)) {
+        note_effect(d, sdl_effect_, false);
+        return;
+    }
+    note_effect(d, sdl_effect_, true);
     sdl_running_ = true;
     applied_ = version;
     endless_ = endless;
@@ -2172,6 +2630,11 @@ int connected_count() {
     return static_cast<int>(g().connected.size());
 }
 
+ActiveInput active_input() {
+    const uint64_t v = g_active.load(std::memory_order_acquire);
+    return {static_cast<leonida::InputFamily>(v & 0xFF), v >> 16, ((v >> 8) & 1) != 0};
+}
+
 bool output_state(int i, OutputState* out) {
     std::lock_guard lock(g().mu);
     if (i < 0 || i >= static_cast<int>(g().connected.size()) || !out) return false;
@@ -2192,6 +2655,72 @@ const KeyBinding* keyboard_bindings(int* count) {
     if (count) *count = static_cast<int>(std::size(kKeyBindings));
     return kKeyBindings;
 }
+
+// HID 1.11 section 6.2.2: a short item is one prefix byte (bSize in bits 0-1, 3 meaning 4 bytes; bType in bits 2-3;
+// bTag in bits 4-7) and up to four data bytes, little-endian. 0xFE starts a long item (data size, tag, data).
+bool parse_report_descriptor(const uint8_t* data, size_t size, std::vector<RawReportSize>* out) {
+    if (!out || (!data && size)) return false;
+    out->clear();
+    struct Globals {
+        uint32_t report_size = 0, report_count = 0, report_id = 0;
+    };
+    Globals g;
+    std::vector<Globals> stack;
+    struct Key {
+        int kind;
+        uint32_t id;
+        uint64_t bits;
+    };
+    std::vector<Key> reports;  // first-seen order; sorted at the end
+    size_t i = 0;
+    while (i < size) {
+        const uint8_t prefix = data[i++];
+        if (prefix == 0xFE) {  // long item: bDataSize, bLongItemTag, data
+            if (i + 2 > size) return false;
+            i += 2 + data[i];
+            if (i > size) return false;
+            continue;
+        }
+        const size_t n = (prefix & 3) == 3 ? 4 : (prefix & 3);
+        if (i + n > size) return false;
+        uint32_t v = 0;
+        for (size_t k = 0; k < n; ++k) v |= static_cast<uint32_t>(data[i + k]) << (8 * k);
+        i += n;
+        const int type = (prefix >> 2) & 3, tag = prefix >> 4;
+        if (type == 1) {  // global
+            if (tag == 7) g.report_size = v;
+            else if (tag == 8) {
+                if (v == 0 || v > 255) return false;
+                g.report_id = v;
+            } else if (tag == 9) g.report_count = v;
+            else if (tag == 10) stack.push_back(g);
+            else if (tag == 11) {
+                if (stack.empty()) return false;
+                g = stack.back();
+                stack.pop_back();
+            }
+        } else if (type == 0) {  // main: Input 8, Output 9, Feature 11 (Collection 10 and End Collection 12 add nothing)
+            const int kind = tag == 8 ? 0 : tag == 9 ? 1 : tag == 11 ? 2 : -1;
+            if (kind < 0) continue;
+            const uint64_t add = static_cast<uint64_t>(g.report_size) * g.report_count;
+            Key* k = nullptr;
+            for (Key& r : reports)
+                if (r.kind == kind && r.id == g.report_id) k = &r;
+            if (!k) {
+                reports.push_back({kind, g.report_id, 0});
+                k = &reports.back();
+            }
+            k->bits += add;
+            if (k->bits > 65536ull * 8) return false;
+        }
+    }
+    for (const Key& k : reports) out->push_back({k.kind, k.id, static_cast<uint32_t>((k.bits + 7) / 8)});
+    std::sort(out->begin(), out->end(),
+              [](const RawReportSize& a, const RawReportSize& b) { return a.kind != b.kind ? a.kind < b.kind : a.id < b.id; });
+    return true;
+}
+
+void set_hid_backend(const HidBackend* backend) { g_hid = backend ? backend : &kSdlHid; }
 
 }  // namespace rt::gameinput
 

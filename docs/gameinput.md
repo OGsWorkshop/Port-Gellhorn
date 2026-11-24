@@ -8,7 +8,12 @@ the lightbar colour can be set.
 
 Without the shim the loader would bind `GameInputCreate` to the host's `GameInput.dll` if there is one
 ([#279](https://github.com/ItsNotRexed/Leonida/pull/279)). That works for Xbox pads only, and gives no DualSense
-features. The game executable is not available yet, so whether it imports GameInput this way, and under which
+features. That path is tested without the game: `gameinput_host_test` (ctest `gameinput_host`) maps a synthetic DLL
+built against the SDK's `gameinput.lib` and checks that its `GameInput.dll` import binds to the host's copy, that
+`GameInputCreate` and `GetCurrentTimestamp` work from mapped code, and that `GetCurrentReading` answers; with a pad
+attached, `GetGamepadState` must succeed on the reading. It passes on Windows 11 build 26300 (GameInput 0.2309) without
+a pad attached. The test skips only where Windows cannot load `GameInput.dll`; with the DLL present, an import that binds to nothing fails it. The game executable is not available yet,
+so whether it imports GameInput this way, and under which
 module, is unverified (see [VERIFY](#verify)).
 
 ## Building
@@ -208,8 +213,9 @@ nothing for it rather than guessing.
 The trigger motors play one waveform each: an intensity, which is the one thing SDL lets the shim send on a trigger,
 through the same output as the trigger rumble — `SDL_RumbleGamepadTriggers`, or the DualSense effect block. `duration`
 and `repeatDelay` are microseconds, `playCount` 0 plays until the state is set again, and a null `params` stops the
-motor. The trigger rumble level and the haptic intensity share that one message, the stronger of the two winning, so a
-title mixing them does not get one cancel the other.
+motor. For a waveform with a duration, each repetition plays for that duration and then leaves a quiet interval of
+`repeatDelay` before the next repetition. The poll thread samples the current phase. During a pulse, the stronger of
+the haptic intensity and ordinary trigger rumble wins. During the interval, ordinary trigger rumble continues.
 
 **This is an approximation too, and a coarser one than the rumble.** A real haptic motor has a table of waveforms, each
 with its own HID usage; SDL exposes no such table — a DualSense takes one effects block and everything else takes a
@@ -222,7 +228,9 @@ intensity 0; waveform indices other than 0 are `E_INVALIDARG`.
 Pads whose SDL gamepad reports both a gyroscope and an accelerometer (a DualSense, a Switch Pro, Steam Input pads) get
 `GameInputKindMotion` in `supportedInput` and a `motionInfo` (`GameInputMotionInfo`, Microsoft's v0 layout); `IGameInputReading::GetMotionState`
 returns a `GameInputMotionState` on their readings, and `GetCurrentReading`/`GetNextReading` answer a
-`GameInputKindMotion` query for such a pad and return `GAMEINPUT_E_READING_NOT_FOUND` for a pad without sensors. The
+`GameInputKindMotion` query for such a pad and return `GAMEINPUT_E_READING_NOT_FOUND` for a pad without sensors. A
+reading callback registered for `GameInputKindMotion` hears only such pads: like a device callback, it is limited to
+devices that support at least one of the kinds it names (Microsoft's `RegisterReadingCallback` reference). The
 sensors are enabled when the pad is opened, at SDL's requested rate, and every poll reads the latest sample.
 
 - The state carries **signed fractions of the maxima `motionInfo` reports** (1.0 = full magnitude), which is the
@@ -240,6 +248,39 @@ sensors are enabled when the pad is opened, at SDL's requested rate, and every p
   reading history cap bound the cost.
 - `gameinput_probe` prints the accel and gyro fractions when the pad has sensors (a resting pad shows ~0.5 g).
 
+## Active input
+
+The title is told that every pad is an Xbox One pad, so it cannot know what the player is holding. The shim keeps
+that record itself, for the runtime's own use, such as button prompt glyphs that follow the device in use:
+`rt::gameinput::active_input()` returns the family of the device used last, a generation that goes up by one with each
+change, and whether `LEONIDA_PROMPTS` forced it. It needs no lock and can be read from any thread, every frame.
+
+| SDL gamepad type | family |
+|---|---|
+| `PS5` (DualSense, DualSense Edge) | PlayStation 5 |
+| `PS4` (DualShock 4) | PlayStation 4 |
+| `PS3` (DualShock 3) | PlayStation 3 |
+| `NINTENDO_SWITCH_PRO`, the Joy-Con types | Nintendo |
+| the [keyboard pad](#keyboard-pad) | keyboard and mouse |
+| everything else (Xbox One/Series, Xbox 360, generic, unknown) | Xbox |
+
+SDL takes the type from the pad's vendor and product id. Only deliberate input changes the answer
+(`runtime/src/active_input.h`, tested by `active_input_test` without SDL):
+
+- an edge: a button going down (any of SDL's, the DualSense touchpad included), a trigger rising past 0.3, or a stick
+  leaving a radius of 0.35. A held button, trigger or stick, stick drift inside the radius and analog noise never
+  count. The mouse moves the keyboard pad's right stick, so a real mouse movement counts through the same rule and a
+  jitter of a count or two does not;
+- a pad's first reading after it connects is its baseline, so connecting a pad with a button held, or with a worn
+  stick resting past the radius, changes nothing;
+- after a change, the next one waits `LEONIDA_PROMPTS_SWITCH_MS` (300 ms by default). Input from another family inside
+  that time is ignored, not queued, so two devices used at once cannot make the answer flicker;
+- input from a second device of the family already in use changes nothing.
+
+Before the first deliberate input the answer is Xbox. Each change logs one line, for example
+`input in use: PlayStation 5 (DualSense Wireless Controller, button press)`. `LEONIDA_PROMPTS` forces a family (a
+line is logged when it takes effect); tracking goes on underneath, so clearing it returns at once to the device in use.
+
 ## Environment variables
 
 | variable | default | effect |
@@ -249,6 +290,8 @@ sensors are enabled when the pad is opened, at SDL's requested rate, and every p
 | `LEONIDA_DS_TRIGGER_FREQ` | `30` | vibration frequency of the `rumble` mode, 1..255 |
 | `LEONIDA_DS_LIGHTBAR` | unset | `RRGGBB` (hex) sets the DualSense/DualShock 4 lightbar when the pad connects; `off` turns it dark; unset keeps SDL's player colour |
 | `LEONIDA_RUMBLE` | `1` | `0` turns all rumble, trigger and force-feedback output off |
+| `LEONIDA_PROMPTS` | `auto` | forces the [active input](#active-input) family: `xbox`, `playstation` (or `ps5`), `ps4`, `ps3`, `nintendo` or `keyboard`; `auto` follows the devices |
+| `LEONIDA_PROMPTS_SWITCH_MS` | `300` | shortest time between two changes of the active input family, 0..2000 ms |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
 | `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
@@ -264,23 +307,75 @@ never touch SDL: they read the latest reading or leave a request, so a call cost
 button) run on that thread, as GameInput runs them on its own threads. Once the title creates a dispatcher
 (`IGameInput::CreateDispatcher`), callbacks are queued instead, the dispatcher's wait handle is signalled, and
 `IGameInputDispatcher::Dispatch` runs them on the title's thread, oldest first, within its quota: at least one queued
-event per call (a quota of 0 runs exactly one), no further event once the quota has passed, and the wait handle is
-signalled again while events remain.
+event per call (a quota of 0 runs exactly one), no further event once the quota has passed, and only the events
+queued when the call started (later ones wait for the next call, so even an unlimited quota returns). The wait
+handle is signalled again while events remain.
 
 The API surface:
 
 | interface | implemented | not implemented |
 |---|---|---|
 | `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading` (`E_NOTIMPL`, as in GameInput v0 itself; see below), `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
+| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state, raw report (pads opened through HID, see [Raw HID](#raw-hid)) | keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
+| `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState`, `CreateRawDeviceReport`, `GetRawDeviceFeature`, `SetRawDeviceFeature`, `SendRawDeviceOutput` (pads opened through HID) | `SendRawDeviceOutputWithResponse`, `ExecuteRawDeviceIoControl`, exclusive raw access, power off, input synchronization (no-ops) |
+| `IGameInputRawDeviceReport` | device, report info (kind, id, size), raw data size, get and set raw data | item values (`Get/Set/ResetItemValue`, `ResetAllItems` answer false: no item tables) |
 | `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState` | raw device I/O, power off, input synchronization (no-ops) |
-| `IGameInputDispatcher` | `Dispatch`, `OpenWaitHandle` | the quota (the queue is short) |
-| `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch` (with its quota), `OpenWaitHandle` | |
+
+`CreateAggregateDevice` takes exactly one of the keyboard, mouse, gamepad, arcade stick, flight stick or racing wheel
+kinds (none, several, or another kind is `E_INVALIDARG`) and returns one device per kind, the same object on every
+call: family `GameInputFamilyAggregate`, always connected, with that kind as its `supportedInput`, and a fixed
+`deviceId` per kind that `FindDeviceFromId` also answers. Readings asked
+through it (`GetCurrentReading`, `GetNextReading`, `GetPreviousReading`) come from every connected device of that
+kind (`GetCurrentReading` answers the most recent of them); asking it for another kind is
+`GAMEINPUT_E_READING_NOT_FOUND`. A reading or device callback registered with an aggregate device as its filter is
+refused with `E_NOTIMPL` and an invalid token.
 
 A device object stays alive for the whole process. When a pad is unplugged its status drops to
 `GameInputDeviceNoStatus` and its device callback runs; when the same pad is plugged in again (matched by SDL GUID and
 serial or device path) the title gets the same object back, connected again.
+
+## Raw HID
+
+A title can read a pad's raw HID input reports and send it output and feature reports (RT-175). The shim opens each
+pad's HID device through SDL's hidapi (`SDL_hid_*`), by the device path SDL reports for the pad. When that path is not
+a HID path, it falls back to the pad's vendor and product id, but only when exactly one game-pad collection (usage page
+1, usage 5) has them, so twins never mix. It reads the report descriptor to find every input, output and feature
+report: its id (0 when the descriptor declares none) and its payload size in bytes, without the id byte.
+
+A pad opened this way gets the following:
+
+- `GameInputKindRawDeviceReport` in `supportedInput` and `GameInputDeviceRawIoEnabled` in its status.
+- `inputReportInfo`, `outputReportInfo` and `featureReportInfo` tables with their counts. Every report has `itemCount`
+  0: the descriptor's items (usages, logical ranges, units) are not decoded.
+- Readings that carry the newest raw input report. Each poll drains the reports that arrived, the last declared one
+  wins, and a report with new bytes makes a reading of its own. Before the first report, a reading carries none.
+- These device calls, each on any `IGameInputRawDeviceReport` of the right kind whose id the pad declares:
+  - `CreateRawDeviceReport(id, kind)` makes a zeroed report.
+  - `GetRawDeviceFeature(id)` reads a feature report.
+  - `SetRawDeviceFeature` sends one.
+  - `SendRawDeviceOutput` writes an output report.
+
+  An undeclared id or kind is `E_INVALIDARG`, and a failed transfer `E_FAIL`.
+
+`SetRawData` takes a buffer of exactly the report's size and refuses any other size, so a report is never half old and
+half new. The item calls answer false. `SendRawDeviceOutputWithResponse`, `ExecuteRawDeviceIoControl` and exclusive
+access still return `E_NOTIMPL` / false.
+
+A pad without such a HID device keeps the old answers: no raw kind, no tables, `E_NOTIMPL` from the raw calls.
+
+- **Xbox pads on Windows** are read by SDL through XInput (path `XInput#n`). SDL's hidapi skips their XInput HID
+  interface (`&IG_` in the path), noting that it carries no full HID reports. So they have no raw I/O here, and the log
+  says so.
+- **SDL virtual joysticks and the keyboard pad** have no path, so no HID device either.
+- **Pads SDL reads through hidapi** can have raw I/O: DualSense, DualShock 4, Switch Pro, and most others in DirectInput
+  mode.
+
+`rt::gameinput::set_hid_backend` replaces the hidapi backend (tests). `rt::gameinput::parse_report_descriptor` is the
+descriptor walk: main items Input, Output and Feature add Report Size × Report Count bits to the current Report ID, Push
+and Pop save and restore the globals, and long items are skipped. It refuses a truncated item, Report ID 0 or above
+255, a Pop without a Push, and a report over 64 KiB.
 
 ## Reading history
 
@@ -331,7 +426,15 @@ the enums the shim uses and the structs it has to lay out. It was written agains
 GDK version, also published as the `Microsoft.GameInput` NuGet package 0.2303.22621.3038). The header is not in the
 repository. Its struct offsets were checked by compiling both side by side with `offsetof` asserts for every field the
 shim fills (`GameInputDeviceInfo` 320 bytes with `deviceFamily` at 96 and the info pointers from 160,
-`GameInputGamepadState` 28 bytes, `GameInputControllerAxisInfo` 48, and the rest in `gameinput_abi.h`).
+`GameInputGamepadState` 28 bytes, and the rest in `gameinput_abi.h`). Four structs had only their size compared, or
+were taken as empty, and were wrong: `GameInputControllerAxisInfo` (48 bytes) and `GameInputControllerButtonInfo` (32)
+have a `GameInputLabel` at offset 4, in what would otherwise be padding, so the members behind it sat four bytes early,
+and `GameInputGamepadInfo` and `GameInputUiNavigationInfo` are tables of 14 and 21 labels (56 and 84 bytes). Every
+member of the four now compares equal side by side, and `gameinput_abi.h` pins each offset. The host's GameInput 0.2309
+fills the two tables in that order: a DualSense (`054c:0ce6`) over USB has the cross, circle, square and triangle icons
+for A, B, X and Y, `Menu`, `View`, `Up`/`Down`/`Left`/`Right`, `L1`/`R1` and `L3`/`R3`, and null axis and button arrays.
+The shim gives every control the Xbox label of its position on every pad, because every pad is presented as an Xbox
+One pad; an Xbox pad's labels on the host are not measured.
 
 The force-feedback and haptic declarations (`GameInputForceFeedbackMotorInfo`, `GameInputHapticWaveformInfo`,
 `GameInputHapticFeedbackMotorInfo`, the envelope and parameter structs, `IGameInputForceFeedbackEffect`) were
@@ -341,6 +444,12 @@ rests on a transcription rather than on a side-by-side compile.
 
 ## Tests
 
+- `active_input_test` (CTest, no SDL): the [active input](#active-input) tracker's rules on synthetic samples with
+  its own clock. `gameinput_test` runs them on a DualSense, a DualShock 4 (Sony `054c:09cc`), an Xbox pad and the
+  keyboard pad: no change when pads connect (one with a button held) or a held button is let go, each family by a
+  button, the touchpad, a trigger or a stick, stick drift and a one-count mouse jitter ignored, a real mouse movement
+  counted, the 300 ms window on the real clock, and `LEONIDA_PROMPTS` forcing, changing, ignoring an unknown value
+  and clearing.
 - `gameinput_test` (CTest, no controller): turns SDL's real backends off and drives the shim through
   `rt::shims::find` with SDL virtual joysticks, an Xbox-style pad with trigger motors, a DualSense (Sony
   `054c:0ce6`) and a pad without trigger motors. It checks enumeration and device callbacks, the button, stick,
@@ -353,14 +462,38 @@ rests on a transcription rather than on a side-by-side compile.
   first twin's id equal to the single-pad id). Motion runs on a virtual pad with sensors (`nsensors` in the
   virtual-joystick description, fed with `SDL_SendJoystickVirtualSensorData`): the kind and `motionInfo` on a sensor
   pad and not on a plain one, no motion before the first sample, normalisation against the `motionInfo` maxima, the
-  accuracy values, the ±1 clamp, the ~8 ms cadence, and that a motion query on a pad without sensors is
-  `GAMEINPUT_E_READING_NOT_FOUND`. The keyboard pad is
+  accuracy values, the ±1 clamp, the ~8 ms cadence, that a motion query on a pad without sensors is
+  `GAMEINPUT_E_READING_NOT_FOUND`, and that a Motion reading callback hears only the sensor pad. The keyboard pad is
   driven through `rt::gameinput::set_keyboard_source` and `set_cursor_source` with fake keys, focus and cursor: every
   binding, two keys at once, each WASD direction, opposite keys cancelling, diagonals, the mouse moving the right
   stick, clamping and decaying to 0, the mouse-button triggers, no input out of focus, release of buttons, sticks and
   triggers on focus loss, the `always` mode, and turning it off and on again.
-- `gameinput_probe [--seconds N] [--rumble]` (by hand, with a pad connected): lists the pads, plays each motor and
-  trigger for a second with `--rumble`, then prints the live reading.
+  Raw HID (RT-175) is tested in two ways:
+  - `parse_report_descriptor` runs on synthetic descriptors: report ids, none, Push/Pop, a long item, and the refused
+    forms.
+  - A fake backend (`set_hid_backend`) stands behind a virtual pad with pid.codes test ids. The test checks the report
+    tables, the kind and status bits, a reading's raw report (newest declared id, without the id byte, an undeclared id
+    ignored), creating, sending and reading back output and feature reports with their id byte, `SetRawData`'s exact
+    size, the item calls, `E_INVALIDARG` / `E_FAIL` / `E_NOTIMPL`, and the HID device closing on unplug.
+- `gameinput_probe [--seconds N] [--rumble] [--force-feedback]` (by hand, with a pad connected): lists the pads with
+  each one's raw HID report tables (or why it has none), plays each motor and trigger for a second with `--rumble`,
+  holds a constant force at magnitude 1.0 on motor 0 for a second with `--force-feedback` (skipped, with the reason
+  printed, on a pad the shim reports no force-feedback motor for), and prints whether SDL created that effect and is
+  running it, separately from GameInput accepting it, then prints the live reading and the newest raw input report.
+
+On hardware so far, with `gameinput_probe` and SDL 3.4.20 on Windows 11: a DualSense (`054c:0ce6`) over USB. It
+connects as player 1 with trigger effects and gyro (`motors=0xf forcefeedback=0 haptic=2`). Pressed one at a time,
+each of the 14 gamepad buttons set the one bit of the name [Mapping](#mapping) gives it: Cross, Circle, Square and Triangle
+as `A`, `B`, `X` and `Y`, the d-pad, L1/R1, L3/R3, Create as `View` and Options as `Menu`. Both triggers reached
+1.00 and both sticks -1.00 and +1.00 on each axis. At rest the accelerometer read about 0.5 on one axis and the gyro
+0.0; shaking the pad by hand reached 1.00 on the accelerometer. With `--rumble` (the default `rumble` trigger mode)
+and `LEONIDA_DS_LIGHTBAR=00ff00`, the person holding the pad reported the motors, the trigger effects and the lightbar
+as working; nothing measured them, and the `resistance` mode was not tried.
+    size, the item calls, `E_INVALIDARG` / `E_FAIL` / `E_NOTIMPL`, the HID device closing on unplug, and a held
+    reading's `GetRawReport` waiting while a reconnect rebuilds the report tables.
+- `gameinput_probe [--seconds N] [--rumble]` (by hand, with a pad connected): lists the pads with each one's raw HID
+  report tables (or why it has none), plays each motor and trigger for a second with `--rumble`, then prints the live
+  reading and the newest raw input report.
 
 ## VERIFY
 
@@ -383,11 +516,15 @@ These need the game executable or a test on hardware:
 - **`UnregisterCallback` timeout** is not honoured; it waits for a callback that is running.
 - **Motion normalisation maxima** (2 g accel, 2000 deg/s gyro) are this shim's choice; SDL exposes no sensor range,
   and whether the game reads motion, and against what scale, is unknown until it runs. The accelerometer range a
-  DualSense exposes can also be wider than 2 g, so hard shakes may clamp at 1.0.
+  DualSense exposes can also be wider than 2 g, so hard shakes may clamp at 1.0: a hand shake of a real DualSense
+  did reach 1.00 on one axis.
 - **Motion members the shim does not provide** (magnetic field, orientation) are zero with
   `GameInputMotionAccuracyUnknown`; whether a title wants a synthesised quaternion there is unknown.
 - **Device family**: every pad is reported as `GameInputFamilyXboxOne`; a title that filters on family sees only
   that.
+- **Active input behind Steam Input**: when Steam turns a PlayStation pad into a virtual Xbox pad, SDL may report the
+  virtual one's type, and the active input then says Xbox; `LEONIDA_PROMPTS` is the way round it until that is
+  checked on a real setup.
 - **Identical pads at start**: twins are numbered in the order the shim opens them. For pads already connected when
   it starts, that is SDL's enumeration order, not measured on Windows for identical pads; if it varies between runs,
   so does which pad gets which id.
@@ -416,3 +553,16 @@ These need the game executable or a test on hardware:
 - **Haptic waveforms**: the single intensity waveform (usage 0x0F/0x58) is this shim's choice, not the pad's table, so
   a title that asks for a particular waveform gets intensity-only behaviour. Whether the game uses haptic motors at
   all — as opposed to `SetRumbleState` — is unknown.
+- **Raw HID on a real pad**: the synthetic tests, the XInput refusal and one DualSense over USB have run.
+  - What ran: an Xbox Series X controller over Bluetooth on Windows 11 connects and plays normally, with no raw I/O,
+    and the log names the reason.
+  - What ran: a DualSense (`054c:0ce6`) over USB on Windows 11 through `gameinput_probe`. Its descriptor gives 1
+    input report (id 1, 63 bytes), 1 output report (id 2, 47 bytes) and 20 feature reports, and the raw input report
+    changed on every reading (2,442 distinct reports in a 40 s capture). No output or feature report was sent
+    through the raw calls.
+  - Still to confirm: a DualSense over Bluetooth, a DualShock 4 or a Switch Pro through `gameinput_probe`, which
+    should print the descriptor's reports and changing raw input bytes.
+  - Size convention: report sizes exclude the id byte, and `GetRawData` returns the payload without it. What
+    Microsoft's runtime does for a device with report ids is not documented on the reference pages.
+  - Readings: a pad that streams reports makes a reading for each changed one, like the runtime's
+    `GameInputKindRawDeviceReport` stream, but whether the title asks for raw reports at all is unknown.

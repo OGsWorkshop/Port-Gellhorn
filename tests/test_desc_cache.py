@@ -171,6 +171,66 @@ def test_desc_probe_defers_index_load_to_hit_block():
     assert has_c9 and has_load and has_store, f"dl_hit missing deferred load: {hit_block}"
 
 
+def test_desc_probe_breaks_directly_with_dont_unroll():
+    # Mesa ANV 26.1.6 (Intel UHD 630, CFL GT2) miscompiles a single-exit probe loop that stops by overwriting
+    # %dl_k: it hoists the post-loop binding-table-index add above the loop into B0 (reading slot 0 / magenta).
+    # Breaking directly to %dl_end with DontUnroll keeps the loop compact while giving %dl_end a distinct exit phi.
+    asm = translate([LOAD, EXP, "s_endpgm"])
+    lines = [l.strip() for l in asm.splitlines()]
+    fn_idx = lines.index("%desc_lookup_fn = OpFunction %uint None %fn_desc_lookup")
+    end_idx = lines.index("OpFunctionEnd", fn_idx)
+    fn_lines = lines[fn_idx:end_idx]
+
+    assert "OpLoopMerge %dl_end %dl_cont DontUnroll" in fn_lines, fn_lines[:15]
+    hit_idx = fn_lines.index("%dl_hit = OpLabel")
+    next_idx = fn_lines.index("%dl_next = OpLabel")
+    hit_block = fn_lines[hit_idx:next_idx]
+    assert hit_block[-1] == "OpBranch %dl_end", hit_block
+    assert not any("OpStore %dl_k" in l for l in hit_block), hit_block
+
+    import spirv_asm
+    spv_bytes = spirv_asm.assemble(asm)
+    assert spv_bytes[:4] == b"\x03\x02\x23\x07"
+    if shutil.which("spirv-as") and shutil.which("spirv-val"):
+        with tempfile.TemporaryDirectory() as tmp:
+            sa = os.path.join(tmp, "break.spvasm")
+            sv = os.path.join(tmp, "break.spv")
+            with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                f.write(asm)
+            r1 = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", sa, "-o", sv], capture_output=True, text=True)
+            assert r1.returncode == 0, f"spirv-as failed:\n{r1.stderr}"
+            r2 = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", sv], capture_output=True, text=True)
+            assert r2.returncode == 0, f"spirv-val failed:\n{r2.stderr}"
+            sv_py = os.path.join(tmp, "break_py.spv")
+            with open(sv_py, "wb") as f:
+                f.write(spv_bytes)
+            r3 = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", sv_py], capture_output=True, text=True)
+            assert r3.returncode == 0, f"spirv-val failed on spirv_asm.py output:\n{r3.stderr}"
+
+
+def test_lookup_result_is_broadcast_before_use():
+    # Mesa ANV 26.2.7 (Alder Lake Xe-LP) segfaults compiling a sampler index that comes straight out of the probe
+    # loop when one sampler serves a float and an integer image (cs_sample_lz_int_d16, ps_ssharp). Each lookup's
+    # result goes through OpGroupNonUniformBroadcastFirst, and only the broadcast id indexes the descriptor arrays.
+    asm = translate([SAMPLE, LOAD, EXP, "s_endpgm"])
+    lines = [ln.strip() for ln in asm.splitlines()]
+    results = {ln.split()[0] for ln in lines if CALL in ln}
+    bcast = {}
+    for ln in lines:
+        if "OpGroupNonUniformBroadcastFirst" in ln:
+            bcast[ln.split()[0]] = ln.split()[-1]
+        elif "OpGroupNonUniformShuffle" in ln:
+            # a wave32 pixel shader in a 64-lane subgroup takes its own half's first lane with a shuffle (SHADER-731,
+            # #4225; docs/design.md "Execution model")
+            bcast[ln.split()[0]] = ln.split()[-2]
+    assert results and sorted(bcast.values()) == sorted(results), (results, bcast)
+    assert "OpCapability GroupNonUniform" in lines
+    assert "OpCapability GroupNonUniformBallot" in lines or "OpCapability GroupNonUniformShuffle" in lines
+    for ln in lines:
+        if ln.split()[1:2] == ["="] and "OpAccessChain" in ln and ("%images" in ln or "%samplers" in ln):
+            assert not results & set(ln.split()), ln
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

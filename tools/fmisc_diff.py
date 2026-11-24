@@ -13,8 +13,8 @@ float arithmetic (add, mul, fma, floor, the transcendentals, v_cmp_class_f32 wit
 covers the ops it does not generate.
 
 What is modelled, per instruction (OPS, --list-ops):
-  * v_fract_f32: S0 - floor(S0), at most 0x3f7fffff (a tiny negative S0 would round to 1.0); +-inf and NaN give a
-    NaN; an integer gives +0.
+  * v_fract_f32: S0 - floor(S0), at most 0x3f7fffff (a tiny negative S0 would round to 1.0); +-inf gives
+    0xffc00000, a NaN comes back unchanged (a signalling one too); an integer gives +0.
   * v_frexp_mant_f32 / v_frexp_exp_i32_f32: S0 = mant * 2^exp, mant in [0.5, 1) with S0's sign. +-0 gives +-0 and
     0; +-inf and NaN give S0 (mant) and 0 (exp).
   * v_ldexp_f32 (VOP3 only): S0 * 2^S1, S1 a signed integer; overflow is +-inf, +-inf / +-0 / NaN pass through.
@@ -33,7 +33,9 @@ Every rule was checked against an RDNA2 GPU (AMD Radeon iGPU, gfx1036, Windows d
 
 Not judged (the program is skipped with the reason, counted): a denormal operand or result (whether f32 denormals
 are flushed is the MODE question, SHADER-35), a NaN whose payload is later read as an integer (payloads are not
-modelled), the clamp of a NaN and an output modifier whose result is a zero (tools/f32_fuzz.py measures both).
+modelled), the clamp of a NaN and an output modifier whose result is a zero (tools/f32_fuzz.py measures both), and
+an output modifier on a signalling-NaN result (the translator's multiply quiets it, which a later v_cmp_class sees;
+whether the hardware does is not measured).
 
 Known divergences (KNOWN_DIVERGENCES): by default the generator leaves out the forms where the translator is known to
 differ from the hardware, so that a run shows new problems only; --known puts them back (a hardware-only run always
@@ -59,7 +61,7 @@ Usage:
     python -I tools/fmisc_diff.py --self-test
 
 Exit 0 when every program matches, 1 on a mismatch (the shortest failing program is printed after removing
-instructions that do not matter), 2 on a harness error, 77 when the requested hardware oracle is unavailable.
+instructions that do not matter), 2 on a harness error or when every program was skipped (nothing was compared), 77 when the requested hardware oracle is unavailable.
 Skips are counted with their reasons.
 """
 import argparse
@@ -177,8 +179,12 @@ def round_f32(fr, neg_zero=False):
 
 
 def fract(w):
-    if is_nan(w) or is_inf(w):
-        return QNAN
+    # Measured on gfx1036 (docs/design.md, "Float min/max/med3 with NaN, v_fract"): a NaN comes back unchanged, a
+    # signalling one too (v_cmp_class_f32 still reports class bit 0), and +-inf gives exactly 0xffc00000.
+    if is_nan(w):
+        return w
+    if is_inf(w):
+        return 0xFFC00000
     fr = to_frac(w)
     r = fr - math.floor(fr)
     if r == 0:
@@ -283,6 +289,7 @@ OPS = {
 }
 ALL_OPS = sorted(OPS) + ["class", "cmp"]   # cmp / class: a VOPC compare into a mask, then v_cndmask_b32_e64 on it
 
+VK_CONSTANTS = False   # --vk-constants: leave the seeds as literals in the vk programs
 KNOWN = False   # also generate the forms in KNOWN_DIVERGENCES (--known; always on for a hardware-only run)
 LITERALS = True
 KNOWN_DIVERGENCES = {
@@ -466,6 +473,8 @@ def fvalue(tok, st):
 
 def out_mods(w, mods):
     om = mods.get("omod")
+    if om and is_nan(w) and not w & 0x400000:
+        raise Uncertain("output modifier on a signalling NaN")
     if om and not (is_nan(w) or is_inf(w)):
         v = to_frac(w) * _OMOD[om]
         if v == 0:
@@ -557,11 +566,15 @@ def translated(lines, name="ps_fmisc"):
 HW_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0}
 
 
-def hw_kernel(lines):
-    """A raw kernel for tools/hw_oracle: the program on one lane, then v8..v11 stored at the output pointer."""
+def hw_kernel(lines, wave=32):
+    """A raw kernel for tools/hw_oracle: the program on one lane, then v8..v11 stored at the output pointer. wave 64
+    runs it in a wave64 wave with the lane masks as 64-bit pairs."""
     from hw_oracle import asm
+    if wave == 64:
+        import vk_fuzz_run
+        lines = [vk_fuzz_run.wave64_text(ln) for ln in lines]
     return asm.Kernel(list(lines) + ["v_mov_b32 v0, 0", "global_store_b128 v0, v[8:11], s[2:3]", "s_endpgm"],
-                      wave=32, threads=1, words=4, raw=True, mode=HW_MODE)
+                      wave=wave, threads=1, words=4, raw=True, mode=HW_MODE)
 
 
 # ---- comparison, shrinking, the run --------------------------------------------------------------------------
@@ -586,8 +599,12 @@ def check(lines, backends=("translator",), hw=None):
             skips.append(e)
     if "hw" in backends:
         got = hw(lines) if callable(hw) else hw
+        if got is None:
+            raise RuntimeError("no result from the hardware runner")
         if isinstance(got, str):
             skips.append(Skip(f"hardware: {got}"))
+        elif len(got) < 4:
+            raise RuntimeError(f"the hardware runner returned {len(got)} words (expected 4)")
         else:
             problems.append(_diff(lines, want, got, "hardware"))
     if skips and len(skips) == len(backends):
@@ -626,12 +643,78 @@ def shrink(lines, check_fn=check):
     return seed + body + obs
 
 
-def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None):
-    counts = {"pass": 0, "mismatch": 0, "skip": {}}
+def omod_writer(lines, k):
+    """Whether the last instruction that wrote the register observed as word k carries an output modifier."""
+    reg = lines[-N_OBS + k].split(", ")[1]
+    for line in reversed(lines[:-N_OBS]):
+        op, _, rest = line.partition(" ")
+        if rest.split(",")[0].strip() == reg and not op.startswith("v_cmp"):
+            return "mul:" in line or "div:" in line
+    return False
+
+
+def vk_verdict(lines, hw, got):
+    """(class, detail) for a program translated and run on a Vulkan GPU against the hardware's four words:
+    match (a NaN matches any NaN), denormal (the words differ and the reference declines the program for a denormal:
+    RDNA2 in the game's MODE flushes f32 denormals, the translator leaves them to the driver), omod_neg_zero (an output
+    modifier turned the hardware's -0 into +0 and the translated -0 stayed: the translator does not model it, #1281)
+    or mismatch."""
+    bad = [k for k in range(4) if hw[k] != got[k] and not (is_nan(hw[k]) and is_nan(got[k]))]
+    if not bad:
+        return "match", ""
+    try:
+        reference(lines)
+    except Skip as e:
+        if "denormal" in str(e):
+            return "denormal", str(e)
+    except RefError:
+        pass
+    if all(hw[k] == 0 and got[k] == 0x80000000 and omod_writer(lines, k) for k in bad):
+        return "omod_neg_zero", "omod made the hardware's -0 a +0"
+    i = bad[0]
+    return "mismatch", f"word {i} ({lines[-N_OBS + i].split(', ')[1]}): hardware 0x{hw[i]:08x}, translated on the GPU 0x{got[i]:08x}"
+
+
+def check_hw_rows(hw, count):
+    """Refuse a hardware batch that can't be compared: no list, the wrong number of results, or a result that is None
+    or has fewer than 4 words. A str result (why the program was skipped) is kept. Runs before both comparison paths,
+    so vk_verdict never sees a row check() would have refused."""
+    if hw is None:
+        raise RuntimeError("no result from the hardware runner")
+    if len(hw) != count:
+        raise RuntimeError(f"the hardware runner returned {len(hw)} results for {count} programs")
+    for i, row in enumerate(hw):
+        if row is None:
+            raise RuntimeError(f"no result from the hardware runner for program {i}")
+        if not isinstance(row, str) and len(row) < 4:
+            raise RuntimeError(f"the hardware runner returned {len(row)} words for program {i} (expected 4)")
+
+
+def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None, wave=32, build=None, work=None):
+    counts = {"pass": 0, "mismatch": 0, "skip": {}, "vk": {}}
     failures = []
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
-    hw = oracle.run([hw_kernel(p) for p in progs]) if "hw" in backends else [None] * programs
+    if "hw" in backends:
+        hw = oracle.run([hw_kernel(p, wave) for p in progs])
+        check_hw_rows(hw, len(progs))
+    else:
+        hw = [None] * programs
+    vk_failures = []
+    if "vk" in backends:
+        import vk_fuzz_run
+        vk = vk_fuzz_run.run_programs(progs, 4, wave, build, work, opaque=not VK_CONSTANTS)
+        for i, lines in enumerate(progs):
+            if isinstance(hw[i], str) or isinstance(vk[i], str):
+                why = ("hardware: " + hw[i]) if isinstance(hw[i], str) else vk[i]
+                counts["vk"]["skip: " + why] = counts["vk"].get("skip: " + why, 0) + 1
+                continue
+            klass, detail = vk_verdict(lines, hw[i], vk[i])
+            counts["vk"][klass] = counts["vk"].get(klass, 0) + 1
+            if klass == "mismatch":
+                vk_failures.append((i, detail, lines))
+    counts["vk_failures"] = vk_failures
+    backends = tuple(b for b in backends if b != "vk")
     for i, lines in enumerate(progs):
         try:
             problem = check(lines, backends, hw[i])
@@ -683,15 +766,28 @@ def main(argv=None):
                          "always on with --oracle hw alone)")
     ap.add_argument("--oracle", default="translator",
                     help="comma-separated comparison targets: translator (default), hw (natively on an AMD GPU; see "
-                         "tools/hw_oracle/). 'hw' alone compares the hardware with the reference only")
+                         "tools/hw_oracle/) and vk (with hw: the translated programs on a Vulkan GPU through "
+                         "vk_compute_test, judged against the hardware's words). 'hw' alone compares the hardware "
+                         "with the reference only")
     ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
+    ap.add_argument("--wave", type=int, choices=(32, 64), default=32,
+                    help="the wave size of the hardware kernels and of the vk programs (64 needs native 64-wide "
+                         "subgroups; lane 0 is judged)")
+    ap.add_argument("--build", default=os.path.join(os.path.dirname(HERE), "runtime", "build"),
+                    help="with vk: the folder with vk_compute_test")
+    ap.add_argument("--vk-constants", action="store_true",
+                    help="with vk: keep the seeds as literal v_mov_b32 constants (the driver may fold them)")
+    ap.add_argument("--work", default=None, help="with vk: a folder for the temporary files (VK_FUZZ_KEEP=1 keeps them)")
     a = ap.parse_args(argv)
     if a.programs < 1 or a.max_ops < 1:
         ap.error("--programs and --max-ops must be at least 1")
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
-    if not backends or any(t not in ("translator", "hw") for t in backends):
-        ap.error("--oracle takes translator, hw or translator,hw")
-    global KNOWN, LITERALS
+    if not backends or any(t not in ("translator", "hw", "vk") for t in backends):
+        ap.error("--oracle takes translator, hw, vk (with hw) or a comma-separated mix")
+    if "vk" in backends and "hw" not in backends:
+        ap.error("--oracle vk judges the translated programs against the hardware's words: use --oracle hw,vk")
+    global KNOWN, LITERALS, VK_CONSTANTS
+    VK_CONSTANTS = a.vk_constants
     KNOWN = a.known or backends == ("hw",)
     LITERALS = not a.no_literals
     if a.list_ops:
@@ -727,15 +823,30 @@ def main(argv=None):
             return 77
         print(f"hardware oracle: {oracle.device}")
     try:
-        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle)
+        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle, a.wave, a.build, a.work)
+        vk_bad = counts.pop("vk_failures")
         skips = sum(counts["skip"].values())
         print(f"{a.programs} programs (seed {a.seed}, {'+'.join(backends)}{', known' if KNOWN else ''}): "
               f"{counts['pass']} pass, {counts['mismatch']} mismatch, {skips} skipped")
         for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
             print(f"  skip x{n}: {reason}")
 
+        want_vk = "vk" in backends
+        if want_vk:
+            print(f"translated on the Vulkan GPU (wave{a.wave}) against the hardware: "
+                  + ", ".join(f"{k} {n}" for k, n in sorted(counts["vk"].items(), key=lambda kv: kv[0].startswith("skip"))))
+            for i, detail, lines in vk_bad[: None if a.all_failures else 3]:
+                print(f"VK MISMATCH program {i}: {detail}")
+                print("\n".join("\t" + line for line in lines))
+        backends = tuple(b for b in backends if b != "vk")
+
         def check_fn(lines):
-            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l)])[0]) if oracle else None)
+            def run_hw_one(l):
+                res = oracle.run([hw_kernel(l, a.wave)])
+                if not res:
+                    raise RuntimeError("the hardware runner returned no result for shrunk program")
+                return res[0]
+            return check(lines, backends, run_hw_one if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")
@@ -746,7 +857,17 @@ def main(argv=None):
     finally:
         if oracle:
             oracle.close()
-    return 1 if failures else 0
+    if failures or vk_bad:
+        return 1
+    if not counts["pass"]:
+        print("no program ran: every one was skipped")
+        return 2
+    if want_vk:
+        import vk_fuzz_run
+        if vk_fuzz_run.all_skipped(counts["vk"]):
+            print("no Vulkan program ran: every one was skipped")
+            return 2
+    return 0
 
 
 if __name__ == "__main__":

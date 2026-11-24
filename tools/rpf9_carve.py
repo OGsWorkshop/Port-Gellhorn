@@ -31,6 +31,8 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rsc8_audio import parse_adat_header_bytes  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
+from restofworld_model_join import ModelSystemPages  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
 # RPF9 magic as it sits on disk: the tag "RPF9" stored little-endian (docs/rpf.md, docs/bvh.md).
@@ -63,7 +65,14 @@ def entropy(sample):
 def below_normal():
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         k = ctypes.windll.kernel32
+        # GetCurrentProcess returns a pointer-sized pseudo-handle.
+        k.GetCurrentProcess.argtypes = ()
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.SetPriorityClass.restype = wintypes.BOOL
         k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)
 
 
@@ -106,7 +115,7 @@ def first_adat_bank(m, start, end):
     return None
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("archive")
     ap.add_argument("out")
@@ -116,8 +125,10 @@ def main() -> int:
                     help="end the scan at the first raw AWC (ADAT) bank, e.g. the audio config at the start of "
                          "audio.rpf")
     ap.add_argument("--index-only", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     below_normal()
+    if os.path.isdir(a.archive):
+        sys.exit(f"{a.archive}: is a directory, not an RPF9 archive")
     try:
         size = os.path.getsize(a.archive)
     except OSError as e:
@@ -126,21 +137,31 @@ def main() -> int:
         sys.exit(f"{a.archive}: empty file")
     if size < 8:
         sys.exit(f"{a.archive}: too short for an RPF9 header ({size} bytes)")
-    with open(a.archive, "rb") as fh:
-        if fh.read(4) != MAGIC:
-            sys.exit(f"{a.archive}: not an RPF9 archive (expected the magic {MAGIC.decode()} at offset 0)")
+    try:
+        with open(a.archive, "rb") as fh:
+            hdr = fh.read(8)
+    except OSError as e:
+        sys.exit(f"{a.archive}: {e.strerror or e}")
+    if hdr[:4] != MAGIC:
+        sys.exit(f"{a.archive}: not an RPF9 archive (expected the magic {MAGIC.decode()} at offset 0)")
     if a.start is not None and not 0 <= a.start < size:
         sys.exit(f"{a.archive}: --start {a.start} is outside the file (0..{size - 1})")
     if a.start is None:
-        with open(a.archive, "rb") as fh:
-            base = struct.unpack_from("<I", fh.read(8), 4)[0]
+        base = struct.unpack_from("<I", hdr, 4)[0]
         if base > size:   # base == size is an empty data area, which is fine
             sys.exit(f"{a.archive}: header data offset {base} is past the end of the file ({size} bytes)")
     else:
         base = a.start
-    os.makedirs(a.out, exist_ok=True)
-    with open(a.archive, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    if os.path.exists(a.out) and not os.path.isdir(a.out):
+        sys.exit(f"{a.out}: output path is a file, not a directory")
+    index_path = os.path.join(a.out, "index.json")
+    if same_report_path(index_path, a.archive):
+        sys.exit(f"{index_path}: output must not overwrite input archive {a.archive}")
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:
+        sys.exit(f"{a.out}: cannot create output directory: {e.strerror or e}")
+    with open(a.archive, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         pos = base
         end = min(size, pos + a.limit) if a.limit else size
         boundary = None
@@ -153,6 +174,7 @@ def main() -> int:
                 print(f"--until-adat: first AWC bank at {boundary:#x}; scanning {pos:#x}..{boundary:#x}", flush=True)
         rows, last, unread, zero = [], pos, 0, 0
         unread_ranges = []
+        system_pages = ModelSystemPages()
 
         def account(a, b):
             """Count the gap m[a:b] as zero padding, or as an unread range that is also listed."""
@@ -184,9 +206,14 @@ def main() -> int:
                 rows.append({"off": s, "stored": blen, "size": blen, "type": "bink2", "w": w, "h": h,
                              "frames": struct.unpack_from("<I", m, s + 8)[0], "pre": "", "head": m[s:s + 16].hex()})
                 if not a.index_only:
-                    with open(os.path.join(a.out, f"{s:012x}.bk2"), "wb") as f:
-                        f.write(m[s:s + blen])
+                    out_file = os.path.join(a.out, f"{s:012x}.bk2")
+                    try:
+                        with open(out_file, "wb") as f:
+                            f.write(m[s:s + blen])
+                    except OSError as e:
+                        sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
                 last = pos = s + blen
+                system_pages.reset()
                 continue
             d = zlib.decompressobj()
             try:
@@ -205,16 +232,23 @@ def main() -> int:
             except zlib.error:
                 pos = s + 1
                 continue
-            if not d.eof or len(out) < 64:
+            adjacent = s == ((last + 15) & ~15) and not any(m[last:s])
+            if not d.eof or len(out) < system_pages.minimum_size(adjacent):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
+            system_pages.accept(out, adjacent=adjacent,
+                                root_framed=(s & 0xFFF) == 0x10 and s >= 16 and m[s - 16:s] == b"\0" * 16)
             account(last, s)
             rows.append({"off": s, "stored": used, "size": len(out), "pre": m[max(0, s - 16):s].hex(),
                          "head": out[:16].hex()})
             if not a.index_only:
-                with open(os.path.join(a.out, f"{s:012x}.bin"), "wb") as f:
-                    f.write(out)
+                out_file = os.path.join(a.out, f"{s:012x}.bin")
+                try:
+                    with open(out_file, "wb") as f:
+                        f.write(out)
+                except OSError as e:
+                    sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
             last = pos = s + used
             if len(rows) % 2000 == 0:
                 done = (pos - (a.start or 0)) / max(1, end - (a.start or 0))
@@ -230,8 +264,12 @@ def main() -> int:
                "span": span}
     if a.until_adat:
         summary["first_adat_bank"] = boundary   # None: no bank in the window, the whole window was scanned
-    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "files": rows, "unread": unread_ranges}, f)
+    index_path = os.path.join(a.out, "index.json")
+    try:
+        with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"summary": summary, "files": rows, "unread": unread_ranges}, f)
+    except OSError as e:
+        sys.exit(f"{index_path}: cannot write: {e.strerror or e}")
     print(json.dumps(summary, indent=1))
     span = max(1, span)   # an empty data area (or --start at the end) has nothing to divide by
     print(f"readable: {total / span:.1%}, zero padding {zero / span:.1%}, unread {unread / span:.1%}")

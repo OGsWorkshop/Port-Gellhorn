@@ -15,6 +15,47 @@ are offset-based (`recovered/...`), not the original paths.
   `story000.rpf` and `shared_minigame000.rpf` is non-zlib. Unread bytes are recorded as ranges (the `unread`
   list in `rpf9_carve.py`'s `index.json`), never guessed.
 
+## Whole-package name coverage (reported in #1790)
+
+The recovery view names streams by offset, but some original paths can be read from the payload itself:
+mount XMLs and similar text in the data area list them in plain text, directory form included. #1790 ran one
+name-recovery walker over all 22 archives of a retail package (150.2 GiB) and reports how far that gets. These
+counts are as reported there; they were not re-run for this page.
+
+| | Count |
+|---|---:|
+| Streams | 1,489,677 |
+| Streams with a name | 177,087 (11.89%) |
+| Unique paths | 155,214 |
+| Unique identifiers | 200,184 |
+| Path mentions | 526,581 |
+
+| Stream type (walker's classes) | Named / streams | Share |
+|---|---:|---:|
+| `sgd5_shader_dxbc` | 25,043 / 25,043 | 100.00% |
+| `xml` | 191 / 332 | 57.53% |
+| `rsc50` | 123,889 / 531,370 | 23.32% |
+| `xml_chunk` | 109 / 504 | 21.63% |
+| raw | 26,766 / 690,003 | 3.88% |
+| `PSIN` | 465 / 15,380 | 3.02% |
+| `0DRP` | 624 / 227,045 | 0.27% |
+
+Three findings from the same run:
+
+- The paths come from the payload, not the TOC. One 8 KB stream in `common.head.bin` declares 473 `.bk2` paths on its
+  own.
+- Stream alignment is not universal. Inflated streams sit on 4 KiB boundaries in `data.rpf` (295 of 301 checked)
+  but not in `levels.rpf` (8 of 26), `packs.rpf` (0 of 301) or `textures.rpf` (0 of 3), so a walker that assumes
+  4 KiB steps misses most streams in three of those four. `tools/rpf9_carve.py` does not assume an alignment: it
+  continues after the bytes each stream consumed.
+- `anim.rpf` is the richest archive for names (64,785 named streams, 367,190 path mentions, almost all `.clip`).
+  `movies.rpf` produced no zlib streams, and `script.rpf` and `story000_script.rpf` no names.
+
+The 11.89% is the ceiling of this method, not a progress figure: the rest of the names are in the encrypted TOC,
+which this project does not decode. #1790 also confirms the TOC is not ECB (no duplicate 16-byte blocks in 62,487).
+The full name index is not published; the issue offers salted hashes of the paths and identifiers so that another
+run can be compared without publishing a name.
+
 ## Stream roles
 
 In the measured carve indexes, a resource's system prefix can be separated from its graphics pages without
@@ -77,6 +118,14 @@ The walker advances by `len(chunk)`, not by the 1 MiB read request. A short fina
 overshoot EOF, so `used` exceeded the real stream size and every trailing stream was skipped; the regression
 test `tests/test_rpf9_carve.py` builds a two-stream archive to keep that fixed.
 
+A gap between streams counts as zero padding when every byte in it is zero, otherwise as unread.
+`rpf9_carve.py` checks a gap in 1 MiB pieces. The other scanners that keep these counts (`rpf9_names`,
+`bvh_index`, `navmesh_index`, `navmesh_decode`, `rbf0_index`, `anim_index`, `restofworld_index`, `story_index`)
+use `tools/zero_span.py`, which compares the gap with zeros 4 MiB at a time and stops at the first window with a
+non-zero byte. They used to slice the gap out of the mapped archive, which copies all of it at once. The largest
+gap in `story000.rpf` is 8.9 GiB, so that needed 8.9 GiB of memory. `tests/test_zero_span.py` runs all nine
+scanners on a 48 MiB gap and checks that each one's Python heap peak stays under 24 MiB.
+
 The carve is read-only and works on any `.rpf`, `.ttpf` or archive-like file. It does not decrypt the TOC, use
 keys, or write anything outside the output directory.
 
@@ -108,12 +157,32 @@ both paths. It is used to check exported assets without keeping a second copy.
 of each zlib stream and indexes the measured `name.#dr`/`#ft`/`#dd` spellings with their archive offsets. It
 does not decode a resource or need the TOC; see [resource_names.md](resource_names.md).
 
+### The trailer at EOF
+
+The header's `u32 +12` is the size of a block that ends the file: the last `+12` bytes of an RPF9 are not part of
+any stored file (ASSET-318, measured on the 22 RPF9 archives of the 1.0.2.1 package, offsets and counts only).
+`+12` is a multiple of 16 in all 22 (64 to 119,520 bytes); `+8` is always larger than `+12` except in `levels.rpf`
+and `core_bvh4.rpf`, and its role is not established.
+
+| Evidence | Archives |
+|---|---|
+| The data before it ends in zeros up to a 4 KiB boundary, and exactly `+12` non-zero bytes follow to EOF | 10: `anim`, `audio`, `common`, `data`, `levels`, `movies`, `packs`, `shared_minigame000`, `story000`, `core_bvh4` |
+| Files are packed at 16-byte alignment; walking the zlib streams to the end leaves exactly `+12` bytes after the last one | 4: `core_licenses_data`, `core_restofworld`, `shared_minigame000_bvh4`, `story000_bvh4` |
+| Undecided: the last stored file is not zlib (or the walk stops at a non-zlib file), so its end is not known without the TOC | 8: `appdata0`, `navmeshes`, `script`, `shaders`, `textures`, `core_restofworld001`, `story000_script`, `story000_restofworld` |
+
+No archive contradicts the rule, but 8 don't test it. In the 14, the trailer starts with no zlib or Bink 2 header and is
+high-entropy like the TOC after the header: 7.95 to 8.00 bits per byte in the nine of 3 KiB or more, and 6.6 to 7.9
+in the five smaller ones (random 144-byte blocks average about 6.7); what they hold is not
+decoded here. `tools/bink_index.py` counts it as `rpf_trailer` instead of unread bytes, only for an `RPF9` header
+whose `+12` is a multiple of 16 and fits in the tail after the last stream; in `movies.rpf` it is the
+18,928 bytes after 3,884 zeros that [movies.md](movies.md) listed as unread.
+
 ### Viewing a header in ImHex
 
 [tools/imhex/rpf9.hexpat](../tools/imhex/rpf9.hexpat) is a pattern for the [ImHex](https://imhex.werwolv.net/) hex
-editor. It names the magic and the data offset at `+4`, shows the u32s at `+8` and `+12` unnamed, and shows the range
-from `+0x10` to the data offset (the rest of the header and the TOC) as one opaque byte array. It decodes nothing in
-that range. `python -I tests/test_imhex_patterns.py` runs it on a synthetic header when ImHex is installed.
+editor. It names the magic, the data offset at `+4` and the trailer size at `+12`, shows the u32 at `+8` unnamed,
+and shows the range from `+0x10` to the data offset (the rest of the header and the TOC) as one opaque byte array.
+It decodes nothing in that range. `python -I tests/test_imhex_patterns.py` runs it on a synthetic header when ImHex is installed.
 
 ## Limits
 

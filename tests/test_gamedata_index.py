@@ -102,6 +102,22 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("--csv and --json must use different paths", result.stderr)
 
+    def test_a_report_cannot_land_on_a_carved_stream(self):
+        # A carve folder holds one <offset>.bin/.bk2 per stream; a report written over one would eat the input.
+        self.add(b"<a/>")
+        self.finish()
+        stream = os.path.join(self.carve, f"{self.rows[0]['off']:012x}.bin")
+        with open(stream, "rb") as f:
+            before = f.read()
+        for flag in ("--json", "--csv"):
+            with self.subTest(flag=flag):
+                p = self.run_tool(self.carve, flag, stream)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("would overwrite the carved stream", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+        with open(stream, "rb") as f:
+            self.assertEqual(f.read(), before)
+
     def test_bad_targets_are_one_line(self):
         empty = os.path.join(self.root, "empty.rpf")
         open(empty, "wb").close()
@@ -170,6 +186,18 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["root"], "RootA")
         self.assertEqual(rows[0]["type"], "xml")
 
+    def test_sps1_magic_is_classified_as_other_sps1(self):
+        # +0x04 is u32 entry_count; 90 (0x5a = 'Z') reproduces the 5th byte that used to read "SPS1Z".
+        sps = bytearray(b"SPS1" + struct.pack("<I", 90) + b"\x05a.sps\x00\x02a\x00\x00" * 90)
+        self.add(bytes(sps))
+        self.finish()
+        out = os.path.join(self.root, "sps1_index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            row = json.load(f)["rows"][0]
+        self.assertEqual((row["type"], row["detail"], row["chunks"]), ("other", "SPS1", 1))
+
     def test_printable_page_directory_stream_is_not_xml(self):
         # A resource stream with the "0DRP" page marker at +16 whose first 4 KiB are over 95% printable and hold a
         # "<": data.rpf's 337 such streams were reported as incomplete XML with no root.
@@ -231,6 +259,19 @@ class GamedataIndexTest(unittest.TestCase):
                 self.assertIn("ERROR: cannot write", p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
 
+    def test_reads_carve_index_with_utf8_bom(self):
+        self.add(b'<?xml version="1.0"?><RootA/>')
+        index_path = os.path.join(self.carve, "index.json")
+        doc = {"summary": {"archive": "synthetic", "files": len(self.rows)}, "files": self.rows}
+        with open(index_path, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps(doc).encode("utf-8"))
+        out = os.path.join(self.root, "bom_out.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["summary"]["xml_documents"], 1)
+
 
 class XmlClassificationTest(unittest.TestCase):
     """Synthetic XML classification cases; no game data, no files written."""
@@ -261,6 +302,20 @@ class XmlClassificationTest(unittest.TestCase):
                 self.assertFalse(self.tool.xml_complete("Foo", data))
                 self.assertFalse(self.tool.standalone_xml(self.decl + data))
 
+    def test_root_name_requires_a_delimiter_after_the_whole_name(self):
+        for suffix in ("\u00e9", "\u6f22", "\u0301", "\u00b7", "\u00a0", "!", "=", "\x0b", "\x0c"):
+            with self.subTest(suffix=suffix):
+                data = ("<Root" + suffix + "/>").encode("utf-8")
+                self.assertEqual(self.tool.xml_root(data), "")
+                self.assertEqual(self.tool.xml_root(self.bom + self.decl + data), "")
+        self.assertEqual(self.tool.xml_root(b"<Root"), "")
+
+    def test_root_name_delimiters_preserve_supported_ascii_names(self):
+        for name in (b"Root", b"RootLonger", b"_Root.2-name:part"):
+            for ending in (b">", b"/>", b' attr="v">', b"\tattr='v'>", b"\rattr='v'>", b"\nattr='v'>"):
+                with self.subTest(name=name, ending=ending):
+                    self.assertEqual(self.tool.xml_root(b"<" + name + ending), name.decode("ascii"))
+
     def test_balanced_and_self_closing_roots_remain_complete(self):
         for data in (b"<Foo></Foo>", b"<Foo>text<Foo>inner</Foo></Foo>",
                      b"<Foo/>", b"  <Foo />\n", b"<Foo>\n</Foo>"):
@@ -282,9 +337,41 @@ class XmlClassificationTest(unittest.TestCase):
             with self.subTest(data=data):
                 self.assertFalse(self.tool.xml_complete("Foo", data))
 
+    def test_self_closing_root_is_standalone_xml(self):
+        for data in (b"<Empty/>", b'  <Empty attr="a>b" />\n',
+                     self.bom + self.decl + b"\n<!-- c --><Empty/>"):
+            with self.subTest(data=data):
+                self.assertTrue(self.tool.standalone_xml(data))
+        for bad in (b"<Empty><Child/>", b"<Empty/><Other/>", b"<Empty/> trailing"):
+            with self.subTest(bad=bad):
+                self.assertFalse(self.tool.standalone_xml(bad))
+
 
 class XmlGroupingRegressionTest(GamedataIndexTest):
     """The classification bugs must also show up in the index the tool writes."""
+
+    def test_declared_root_name_can_end_at_a_stream_boundary(self):
+        self.add(b"", [b'<?xml version="1.0"?><Root', b"><Item/></Root>"])
+        self.finish()
+        rows = T.build_rows(self.rows, T.DirectorySource(self.carve))
+        self.assertEqual([(r["root"], r["complete"], r["chunks"]) for r in rows], [("Root", True, 2)])
+
+    def test_split_non_ascii_root_is_not_reported_as_its_ascii_prefix(self):
+        tail = ("\u00e9>" + "x" * 100 + "</Root\u00e9>").encode("utf-8")
+        self.add(b"", [b'<?xml version="1.0"?><Root', tail])
+        self.finish()
+        rows = T.build_rows(self.rows, T.DirectorySource(self.carve))
+        self.assertEqual([(r["root"], r["complete"], r["chunks"]) for r in rows], [("", False, 2)])
+
+    def test_headerless_split_root_stops_before_the_next_payload(self):
+        first = b" " * (65536 - len(b"<Root")) + b"<Root"
+        second = b">" + b"x" * (65536 - len(b"></Root>")) + b"</Root>"
+        self.add(b"", [first, second])
+        self.add(b"unrelated text")
+        self.finish()
+        rows = T.build_rows(self.rows, T.DirectorySource(self.carve))
+        self.assertEqual([(r["type"], r["chunks"]) for r in rows], [("xml", 2), ("text", 1)])
+        self.assertEqual((rows[0]["root"], rows[0]["complete"]), ("Root", True))
 
     def test_bom_with_whitespace_is_grouped_as_an_xml_document(self):
         doc = b"\xef\xbb\xbf\n" + b'<?xml version="1.0"?>' + b"\n<RootBom><Item/></RootBom>"
@@ -317,6 +404,62 @@ class XmlGroupingRegressionTest(GamedataIndexTest):
         self.assertEqual(row["chunks"], 2)
         self.assertTrue(row["header"])
         self.assertFalse(row["complete"])
+
+    def test_self_closing_and_exact_64k_declarationless_xml_boundaries(self):
+        # 1) A 64 KiB binary stream followed by a self-closing XML document must not swallow the XML.
+        bin64 = bytes(range(256)) * 256
+        self.add(bin64)
+        self.add(b'<EmptyDoc attr="1"/>\n')
+        # 2) An exact 64 KiB complete declarationless XML document must not swallow the next text stream.
+        prefix, suffix = b"<Exact64>", b"</Exact64>"
+        exact64 = prefix + b"a" * (65536 - len(prefix) - len(suffix)) + suffix
+        self.add(exact64)
+        self.add(b"plain text after xml\n")
+        # 3) An incomplete 64 KiB declarationless XML stream must not swallow a following binary stream.
+        unclosed64 = b"<OpenDoc>" + b"b" * (65536 - len(b"<OpenDoc>"))
+        self.add(unclosed64)
+        self.add(bytes(range(256)) * 2)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual(
+            [(r["type"], r["root"], r["complete"], r["chunks"]) for r in rows],
+            [
+                ("binary", "", True, 1),
+                ("xml", "EmptyDoc", True, 1),
+                ("xml", "Exact64", True, 1),
+                ("text", "", True, 1),
+                ("xml", "", False, 1),
+                ("binary", "", True, 1),
+            ],
+        )
+
+    def test_declarationless_xml_keeps_utf8_continuation_stream(self):
+        # A 64 KiB continuation of non-ASCII UTF-8 text falls below printable()'s ASCII ratio
+        # and classifies as "binary", yet must stay part of the open declarationless XML document.
+        accent = "é".encode("utf-8")
+        # Split an "é" (0xC3 0xA9) across the 64 KiB chunk boundary as well.
+        head = b"<Doc>" + b" " * (65536 - len(b"<Doc>") - 1) + accent[:1]
+        middle = accent[1:] + b"<t>" + accent * 32766
+        self.assertEqual(len(head), 65536)
+        self.assertEqual(len(middle), 65536)
+        tail = b"</t></Doc>"
+        self.add(head)
+        self.add(middle)
+        self.add(tail)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual(
+            [(r["type"], r["root"], r["complete"], r["chunks"]) for r in rows],
+            [("xml", "Doc", True, 3)],
+        )
 
 
 class BuildRowsReadCountTest(unittest.TestCase):

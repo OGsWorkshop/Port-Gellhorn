@@ -55,7 +55,7 @@ MODES = {
 
 THREADS = 1024
 PER_THREAD = 8                       # inputs per thread, packed two to a dword
-PER_KERNEL = THREADS * PER_THREAD    # 8192 inputs, 4096 words: the launcher's limit
+PER_KERNEL = THREADS * PER_THREAD    # 8192 inputs, 4096 words per kernel: 8 kernels cover every input
 QNAN = 0x7E00
 TWO_PI_F32 = struct.unpack("<f", struct.pack("<f", 6.283185307179586))[0]
 
@@ -433,9 +433,15 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
-    ops = [o for o in a.ops.split(",") if o]
-    modes = [m for m in a.modes.split(",") if m]
-    waves = [int(w) for w in a.waves.split(",") if w]
+    ops = [o.strip() for o in a.ops.split(",") if o.strip()]
+    modes = [m.strip() for m in a.modes.split(",") if m.strip()]
+    try:
+        waves = [int(w.strip()) for w in a.waves.split(",") if w.strip()]
+    except ValueError:
+        ap.error("--waves must contain only 32 and/or 64")
+    for option, values in (("--ops", ops), ("--modes", modes), ("--waves", waves)):
+        if not values:
+            ap.error(f"{option} must select at least one value")
     bad = [o for o in ops if o not in OPS] + [m for m in modes if m not in MODES] + [str(w) for w in waves
                                                                                     if w not in (32, 64)]
     if bad:

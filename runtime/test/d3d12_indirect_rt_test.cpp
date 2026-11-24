@@ -307,6 +307,7 @@ int main() {
     DF(vkCmdPipelineBarrier);
     DF(vkCmdDrawIndirectCount);
     DF(vkCmdCopyImageToBuffer);
+    DF(vkGetAccelerationStructureBuildSizesKHR);
 #undef DF
 
     VkQueue vk_queue = VK_NULL_HANDLE;
@@ -681,6 +682,7 @@ int main() {
 
         ID3D12Resource* blas_buf = nullptr;
         ID3D12Resource* tlas_buf = nullptr;
+        ID3D12Resource* tlas_ptr_buf = nullptr;
         ID3D12Resource* scratch_buf = nullptr;
         ID3D12Resource* inst_buf = nullptr;
         if (FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &blas_desc,
@@ -689,6 +691,9 @@ int main() {
             FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &tlas_desc,
                                                 D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
                                                 IID_PPV_ARGS(&tlas_buf))) ||
+            FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &tlas_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&tlas_ptr_buf))) ||
             FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &scratch_desc,
                                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                 IID_PPV_ARGS(&scratch_buf))) ||
@@ -709,6 +714,28 @@ int main() {
 
         tlas_in.InstanceDescs = inst_buf->GetGPUVirtualAddress();
 
+        // The same instance desc, named through an ARRAY_OF_POINTERS list. The list holds a console VA; the KHR
+        // path must stage a copy whose entry is a Vulkan device address before building.
+        auto inst_ptr_desc = make_buf_desc(256);
+        ID3D12Resource* inst_ptr_buf = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &inst_ptr_desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&inst_ptr_buf))))
+            return fail("CreateCommittedResource(instance pointer list)");
+        const UINT64 inst_va = inst_buf->GetGPUVirtualAddress();
+        inst_ptr_buf->Map(0, nullptr, &p);
+        std::memcpy(p, &inst_va, sizeof(inst_va));
+        inst_ptr_buf->Unmap(0, nullptr);
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas_ptr_in = tlas_in;
+        tlas_ptr_in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
+        tlas_ptr_in.InstanceDescs = inst_ptr_buf->GetGPUVirtualAddress();
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlas_ptr_info{};
+        dev->GetRaytracingAccelerationStructurePrebuildInfo(&tlas_ptr_in, &tlas_ptr_info);
+        if (tlas_ptr_info.ResultDataMaxSizeInBytes != tlas_info.ResultDataMaxSizeInBytes ||
+            tlas_ptr_info.ScratchDataSizeInBytes != tlas_info.ScratchDataSizeInBytes)
+            return fail("prebuild info differs between ARRAY and ARRAY_OF_POINTERS");
+
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC blas_build{};
         blas_build.DestAccelerationStructureData = blas_buf->GetGPUVirtualAddress();
         blas_build.Inputs = blas_in;
@@ -719,6 +746,11 @@ int main() {
         tlas_build.Inputs = tlas_in;
         tlas_build.ScratchAccelerationStructureData = scratch_buf->GetGPUVirtualAddress();
 
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlas_ptr_build{};
+        tlas_ptr_build.DestAccelerationStructureData = tlas_ptr_buf->GetGPUVirtualAddress();
+        tlas_ptr_build.Inputs = tlas_ptr_in;
+        tlas_ptr_build.ScratchAccelerationStructureData = scratch_buf->GetGPUVirtualAddress();
+
         D3D12_RESOURCE_BARRIER uav_b{};
         uav_b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
 
@@ -727,6 +759,8 @@ int main() {
         cl->BuildRaytracingAccelerationStructure(&blas_build, 0, nullptr);
         cl->ResourceBarrier(1, &uav_b);
         cl->BuildRaytracingAccelerationStructure(&tlas_build, 0, nullptr);
+        cl->ResourceBarrier(1, &uav_b);
+        cl->BuildRaytracingAccelerationStructure(&tlas_ptr_build, 0, nullptr);
         cl->ResourceBarrier(1, &uav_b);
         if (FAILED(cl->Close())) return fail("RT build Close");
 
@@ -737,7 +771,219 @@ int main() {
 
         VkAccelerationStructureKHR tlas_vk =
             rt::d3d12::vulkan_acceleration_structure(dev, tlas_buf->GetGPUVirtualAddress());
-        if (!tlas_vk) return fail("vulkan_acceleration_structure(TLAS)");
+        VkAccelerationStructureKHR tlas_ptr_vk =
+            rt::d3d12::vulkan_acceleration_structure(dev, tlas_ptr_buf->GetGPUVirtualAddress());
+        if (!tlas_vk || !tlas_ptr_vk) return fail("vulkan_acceleration_structure(TLAS)");
+
+        // BLAS compaction size (inline postbuild + standalone 2-source EmitPostbuild), CLONE, COMPACT, and
+        // negative rejection checks.
+        ID3D12Fence* copy_fence = nullptr;
+        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copy_fence))))
+            return fail("CreateFence(copy_fence)");
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS blas_compact_in = blas_in;
+        blas_compact_in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blas_compact_info{};
+        dev->GetRaytracingAccelerationStructurePrebuildInfo(&blas_compact_in, &blas_compact_info);
+        if (blas_compact_info.ResultDataMaxSizeInBytes == 0 || blas_compact_info.ScratchDataSizeInBytes == 0)
+            return fail("GetRaytracingAccelerationStructurePrebuildInfo(BLAS compact)");
+
+        // origin/main's GetRaytracingAccelerationStructurePrebuildInfo does not yet forward ALLOW_COMPACTION
+        // (tracked by #8695), while BuildRaytracingAccelerationStructure does. Query the driver's build sizes
+        // with ALLOW_COMPACTION_BIT_KHR and take the max so this test is valid both before and after #8695.
+        VkAccelerationStructureBuildSizesInfoKHR compact_vk_sizes{
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+        if (vkGetAccelerationStructureBuildSizesKHR) {
+            VkAccelerationStructureGeometryKHR vk_geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+            vk_geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+            vk_geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+            vk_geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            vk_geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            vk_geom.geometry.triangles.vertexStride = 12;
+            vk_geom.geometry.triangles.maxVertex = 2;
+            vk_geom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+
+            VkAccelerationStructureBuildGeometryInfoKHR vk_bgi{
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+            vk_bgi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+            vk_bgi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                           VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
+            vk_bgi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+            vk_bgi.geometryCount = 1;
+            vk_bgi.pGeometries = &vk_geom;
+            const std::uint32_t prim_count = 1;
+            vkGetAccelerationStructureBuildSizesKHR(vk_dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                                    &vk_bgi, &prim_count, &compact_vk_sizes);
+        }
+        const UINT64 compact_blas_bytes =
+            std::max<UINT64>(blas_compact_info.ResultDataMaxSizeInBytes, compact_vk_sizes.accelerationStructureSize);
+        const UINT64 compact_scratch_bytes = std::max<UINT64>(
+            tlas_info.ScratchDataSizeInBytes,
+            std::max<UINT64>(blas_compact_info.ScratchDataSizeInBytes, compact_vk_sizes.buildScratchSize));
+
+        auto compact_scratch_desc = make_buf_desc(align256(compact_scratch_bytes) + 256u,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto blas_compact_src_desc = make_buf_desc(align256(compact_blas_bytes),
+                                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto post_desc = make_buf_desc(256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto post_rb_desc = make_buf_desc(256);
+
+        ID3D12Resource* compact_scratch = nullptr;
+        ID3D12Resource* blas_compact_src = nullptr;
+        ID3D12Resource* post_uav = nullptr;
+        ID3D12Resource* post_rb = nullptr;
+        ID3D12Resource* blas_cloned = nullptr;
+        ID3D12Resource* blas_compacted = nullptr;
+        ID3D12Resource* tlas_cloned = nullptr;
+        ID3D12Resource* tlas_compacted = nullptr;
+        ID3D12Resource* inst_cloned_buf = nullptr;
+        ID3D12Resource* inst_compacted_buf = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &compact_scratch_desc,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                IID_PPV_ARGS(&compact_scratch))) ||
+            FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &blas_compact_src_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&blas_compact_src))) ||
+            FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &post_desc,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                IID_PPV_ARGS(&post_uav))) ||
+            FAILED(dev->CreateCommittedResource(&rb_hp, D3D12_HEAP_FLAG_NONE, &post_rb_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&post_rb))) ||
+            FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &blas_compact_src_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&blas_cloned))) ||
+            FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &tlas_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&tlas_cloned))) ||
+            FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &tlas_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&tlas_compacted))) ||
+            FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &inst_desc_buf,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&inst_cloned_buf))))
+            return fail("CreateCommittedResource(compaction/clone buffers)");
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC compact_blas_build{};
+        compact_blas_build.DestAccelerationStructureData = blas_compact_src->GetGPUVirtualAddress();
+        compact_blas_build.Inputs = blas_compact_in;
+        compact_blas_build.ScratchAccelerationStructureData = compact_scratch->GetGPUVirtualAddress();
+
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC inline_pb{};
+        inline_pb.DestBuffer = post_uav->GetGPUVirtualAddress();
+        inline_pb.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
+
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC emit_pb{};
+        emit_pb.DestBuffer = post_uav->GetGPUVirtualAddress() + sizeof(UINT64);
+        emit_pb.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
+        const D3D12_GPU_VIRTUAL_ADDRESS emit_sources[2] = {blas_compact_src->GetGPUVirtualAddress(),
+                                                           blas_compact_src->GetGPUVirtualAddress()};
+
+        D3D12_RESOURCE_BARRIER uav_to_src{};
+        uav_to_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        uav_to_src.Transition.pResource = post_uav;
+        uav_to_src.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        uav_to_src.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        uav_to_src.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->BuildRaytracingAccelerationStructure(&compact_blas_build, 1, &inline_pb);
+        cl->ResourceBarrier(1, &uav_b);
+        cl->EmitRaytracingAccelerationStructurePostbuildInfo(&emit_pb, 2, emit_sources);
+        cl->ResourceBarrier(1, &uav_to_src);
+        cl->CopyBufferRegion(post_rb, 0, post_uav, 0, 3 * sizeof(UINT64));
+        if (FAILED(cl->Close())) return fail("compact postbuild Close");
+        queue->ExecuteCommandLists(1, lists);
+        if (rt::d3d12::last_execute_result(queue) != leonida::ReplayResult::success)
+            return fail("ExecuteCommandLists(compact postbuild)");
+        queue->Signal(copy_fence, 1);
+        if (!wait_fence(copy_fence, 1)) return fail("wait_fence(compact postbuild)");
+
+        UINT64 size_inline = 0, size_emit0 = 0, size_emit1 = 0;
+        post_rb->Map(0, nullptr, &p);
+        const auto* pb_vals = static_cast<const UINT64*>(p);
+        size_inline = pb_vals[0];
+        size_emit0 = pb_vals[1];
+        size_emit1 = pb_vals[2];
+        post_rb->Unmap(0, nullptr);
+        if (size_inline == 0 || size_inline > compact_blas_bytes) {
+            std::fprintf(stderr, "FAIL: inline COMPACTED_SIZE=%llu outside (0, %llu]\n",
+                         static_cast<unsigned long long>(size_inline),
+                         static_cast<unsigned long long>(compact_blas_bytes));
+            return 1;
+        }
+        if (size_emit0 != size_inline || size_emit1 != size_inline) {
+            std::fprintf(stderr, "FAIL: EmitPostbuild mismatch inline=%llu emit0=%llu emit1=%llu\n",
+                         static_cast<unsigned long long>(size_inline),
+                         static_cast<unsigned long long>(size_emit0),
+                         static_cast<unsigned long long>(size_emit1));
+            return 1;
+        }
+        std::printf("  [PASS] KHR COMPACTED_SIZE postbuild (inline=%llu, emit2=[%llu, %llu])\n",
+                    static_cast<unsigned long long>(size_inline),
+                    static_cast<unsigned long long>(size_emit0),
+                    static_cast<unsigned long long>(size_emit1));
+
+        auto blas_compacted_desc = make_buf_desc(std::max<UINT64>(align256(size_inline), 256u),
+                                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        if (FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &blas_compacted_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&blas_compacted))) ||
+            FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &inst_desc_buf,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&inst_compacted_buf))))
+            return fail("CreateCommittedResource(compacted BLAS/inst)");
+
+        inst_cloned_buf->Map(0, nullptr, &p);
+        D3D12_RAYTRACING_INSTANCE_DESC inst_cloned = inst;
+        inst_cloned.AccelerationStructure = blas_cloned->GetGPUVirtualAddress();
+        std::memcpy(p, &inst_cloned, sizeof(inst_cloned));
+        inst_cloned_buf->Unmap(0, nullptr);
+
+        inst_compacted_buf->Map(0, nullptr, &p);
+        D3D12_RAYTRACING_INSTANCE_DESC inst_compacted = inst;
+        inst_compacted.AccelerationStructure = blas_compacted->GetGPUVirtualAddress();
+        std::memcpy(p, &inst_compacted, sizeof(inst_compacted));
+        inst_compacted_buf->Unmap(0, nullptr);
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlas_cloned_build{};
+        tlas_cloned_build.DestAccelerationStructureData = tlas_cloned->GetGPUVirtualAddress();
+        tlas_cloned_build.Inputs = tlas_in;
+        tlas_cloned_build.Inputs.InstanceDescs = inst_cloned_buf->GetGPUVirtualAddress();
+        tlas_cloned_build.ScratchAccelerationStructureData = compact_scratch->GetGPUVirtualAddress();
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlas_compacted_build{};
+        tlas_compacted_build.DestAccelerationStructureData = tlas_compacted->GetGPUVirtualAddress();
+        tlas_compacted_build.Inputs = tlas_in;
+        tlas_compacted_build.Inputs.InstanceDescs = inst_compacted_buf->GetGPUVirtualAddress();
+        tlas_compacted_build.ScratchAccelerationStructureData = compact_scratch->GetGPUVirtualAddress();
+
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->CopyRaytracingAccelerationStructure(blas_cloned->GetGPUVirtualAddress(),
+                                                blas_compact_src->GetGPUVirtualAddress(),
+                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
+        cl->CopyRaytracingAccelerationStructure(blas_compacted->GetGPUVirtualAddress(),
+                                                blas_compact_src->GetGPUVirtualAddress(),
+                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
+        cl->ResourceBarrier(1, &uav_b);
+        cl->BuildRaytracingAccelerationStructure(&tlas_cloned_build, 0, nullptr);
+        cl->ResourceBarrier(1, &uav_b);
+        cl->BuildRaytracingAccelerationStructure(&tlas_compacted_build, 0, nullptr);
+        cl->ResourceBarrier(1, &uav_b);
+        if (FAILED(cl->Close())) return fail("CLONE/COMPACT build Close");
+        queue->ExecuteCommandLists(1, lists);
+        if (rt::d3d12::last_execute_result(queue) != leonida::ReplayResult::success)
+            return fail("ExecuteCommandLists(CLONE/COMPACT)");
+        queue->Signal(copy_fence, 2);
+        if (!wait_fence(copy_fence, 2)) return fail("wait_fence(CLONE/COMPACT)");
+
+        VkAccelerationStructureKHR tlas_cloned_vk =
+            rt::d3d12::vulkan_acceleration_structure(dev, tlas_cloned->GetGPUVirtualAddress());
+        VkAccelerationStructureKHR tlas_compacted_vk =
+            rt::d3d12::vulkan_acceleration_structure(dev, tlas_compacted->GetGPUVirtualAddress());
+        if (!tlas_cloned_vk || !tlas_compacted_vk) return fail("vulkan_acceleration_structure(cloned/compacted TLAS)");
 
 #if defined(LEONIDA_TEST_CS_RAYQUERY_SPV)
         std::vector<std::uint32_t> rq_words;
@@ -852,6 +1098,76 @@ int main() {
         const std::uint32_t hit = res[0];
         const std::uint32_t miss = res[1];
         out_buf->Unmap(0, nullptr);
+        if (hit != 1u || miss != 0u) {
+            std::fprintf(stderr, "FAIL: RayQueryKHR ARRAY expected hit=1 miss=0, got hit=%u miss=%u\n", hit, miss);
+            return 1;
+        }
+
+        // The second TLAS was built from an ARRAY_OF_POINTERS list. Run the same query against it: without the
+        // address translation the pointer bytes are read as an instance desc with mask 0, and the ray misses.
+        as_write.pAccelerationStructures = &tlas_ptr_vk;
+        vkUpdateDescriptorSets(vk_dev, 1, writes, 0, nullptr);
+        VkCommandBuffer cb2 = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(vk_dev, &cbai, &cb2);
+        vkBeginCommandBuffer(cb2, &bi);
+        vkCmdBindPipeline(cb2, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
+        vkCmdBindDescriptorSets(cb2, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, nullptr);
+        vkCmdDispatch(cb2, 1, 1, 1);
+        vkCmdPipelineBarrier(cb2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
+        vkEndCommandBuffer(cb2);
+        VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si2.commandBufferCount = 1;
+        si2.pCommandBuffers = &cb2;
+        vkQueueSubmit(vk_queue, 1, &si2, VK_NULL_HANDLE);
+        vkQueueWaitIdle(vk_queue);
+
+        out_buf->Map(0, nullptr, &p);
+        const auto* res2 = static_cast<const std::uint32_t*>(p);
+        const std::uint32_t hit2 = res2[0];
+        const std::uint32_t miss2 = res2[1];
+        out_buf->Unmap(0, nullptr);
+        if (hit2 != 1u || miss2 != 0u) {
+            std::fprintf(stderr,
+                         "FAIL: RayQueryKHR ARRAY_OF_POINTERS expected hit=1 miss=0, got hit=%u miss=%u\n", hit2,
+                         miss2);
+            return 1;
+        }
+        std::printf("  [PASS] BLAS + TLAS (ARRAY and ARRAY_OF_POINTERS) + RayQueryKHR (hit=%u, miss=%u)\n", hit, miss);
+
+        const auto verify_copied_tlas = [&](VkAccelerationStructureKHR copy_tlas, const char* kind) -> bool {
+            as_write.pAccelerationStructures = &copy_tlas;
+            vkUpdateDescriptorSets(vk_dev, 1, writes, 0, nullptr);
+            VkCommandBuffer copy_cb = VK_NULL_HANDLE;
+            vkAllocateCommandBuffers(vk_dev, &cbai, &copy_cb);
+            vkBeginCommandBuffer(copy_cb, &bi);
+            vkCmdBindPipeline(copy_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
+            vkCmdBindDescriptorSets(copy_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, nullptr);
+            vkCmdDispatch(copy_cb, 1, 1, 1);
+            vkCmdPipelineBarrier(copy_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb,
+                                 0, nullptr, 0, nullptr);
+            vkEndCommandBuffer(copy_cb);
+            VkSubmitInfo copy_si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            copy_si.commandBufferCount = 1;
+            copy_si.pCommandBuffers = &copy_cb;
+            vkQueueSubmit(vk_queue, 1, &copy_si, VK_NULL_HANDLE);
+            vkQueueWaitIdle(vk_queue);
+
+            out_buf->Map(0, nullptr, &p);
+            const auto* copy_res = static_cast<const std::uint32_t*>(p);
+            const std::uint32_t copy_hit = copy_res[0];
+            const std::uint32_t copy_miss = copy_res[1];
+            out_buf->Unmap(0, nullptr);
+            if (copy_hit != 1u || copy_miss != 0u) {
+                std::fprintf(stderr, "FAIL: RayQueryKHR %s expected hit=1 miss=0, got hit=%u miss=%u\n", kind,
+                             copy_hit, copy_miss);
+                return false;
+            }
+            return true;
+        };
+        if (!verify_copied_tlas(tlas_cloned_vk, "CLONE") || !verify_copied_tlas(tlas_compacted_vk, "COMPACT"))
+            return 1;
+        std::printf("  [PASS] KHR CopyRaytracingAccelerationStructure CLONE + COMPACT + RayQueryKHR (hit=1, miss=0)\n");
 
         vkDestroyCommandPool(vk_dev, pool, nullptr);
         vkDestroyPipeline(vk_dev, pso, nullptr);
@@ -859,15 +1175,140 @@ int main() {
         vkDestroyDescriptorPool(vk_dev, dpool, nullptr);
         vkDestroyDescriptorSetLayout(vk_dev, dsl, nullptr);
         out_buf->Release();
-
-        if (hit != 1u || miss != 0u) {
-            std::fprintf(stderr, "FAIL: RayQueryKHR expected hit=1 miss=0, got hit=%u miss=%u\n", hit, miss);
-            return 1;
-        }
-        std::printf("  [PASS] BLAS + TLAS BuildRaytracingAccelerationStructure + RayQueryKHR (hit=%u, miss=%u)\n", hit,
-                    miss);
 #endif
+        // Negative KHR CopyRaytracingAccelerationStructure and EmitPostbuild rejections before submission.
+        const auto expect_copy_refusal = [&](D3D12_GPU_VIRTUAL_ADDRESS dst_va, D3D12_GPU_VIRTUAL_ADDRESS src_va,
+                                             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode,
+                                             leonida::ReplayResult want, const char* what) -> bool {
+            alloc->Reset();
+            cl->Reset(alloc, nullptr);
+            cl->CopyRaytracingAccelerationStructure(dst_va, src_va, mode);
+            if (FAILED(cl->Close())) return false;
+            queue->ExecuteCommandLists(1, lists);
+            if (rt::d3d12::last_execute_result(queue) != want) {
+                std::fprintf(stderr, "FAIL: %s (expected ReplayResult %d, got %d)\n", what, static_cast<int>(want),
+                             static_cast<int>(rt::d3d12::last_execute_result(queue)));
+                return false;
+            }
+            return true;
+        };
+        if (!expect_copy_refusal(blas_cloned->GetGPUVirtualAddress(), blas_cloned->GetGPUVirtualAddress(),
+                                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE,
+                                 leonida::ReplayResult::invalid_copy, "KHR CLONE with src==dst must fail invalid_copy") ||
+            !expect_copy_refusal(blas_cloned->GetGPUVirtualAddress(), blas_cloned->GetGPUVirtualAddress(),
+                                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT,
+                                 leonida::ReplayResult::invalid_copy,
+                                 "KHR COMPACT with src==dst must fail invalid_copy") ||
+            !expect_copy_refusal(compact_scratch->GetGPUVirtualAddress(), blas_compact_src->GetGPUVirtualAddress(),
+                                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE,
+                                 leonida::ReplayResult::unresolved_resource,
+                                 "KHR CLONE to non-AS dst must fail unresolved_resource") ||
+            !expect_copy_refusal(blas_cloned->GetGPUVirtualAddress(), blas_compact_src->GetGPUVirtualAddress(),
+                                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE,
+                                 leonida::ReplayResult::unsupported, "KHR SERIALIZE mode must fail unsupported"))
+            return 1;
+
+        {
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC short_pb{};
+            short_pb.DestBuffer = post_uav->GetGPUVirtualAddress() + 248u;  // 8 bytes left, 2 sources need 16
+            short_pb.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
+            alloc->Reset();
+            cl->Reset(alloc, nullptr);
+            cl->EmitRaytracingAccelerationStructurePostbuildInfo(&short_pb, 2, emit_sources);
+            if (FAILED(cl->Close())) return fail("short postbuild Close");
+            queue->ExecuteCommandLists(1, lists);
+            if (rt::d3d12::last_execute_result(queue) != leonida::ReplayResult::invalid_copy)
+                return fail("KHR COMPACTED_SIZE short destination buffer must fail invalid_copy");
+        }
+        std::printf("  [PASS] KHR copy (src==dst, non-AS, SERIALIZE) and short postbuild refused before submission\n");
+
+        inst_compacted_buf->Release();
+        inst_cloned_buf->Release();
+        tlas_compacted->Release();
+        tlas_cloned->Release();
+        blas_compacted->Release();
+        blas_cloned->Release();
+        post_rb->Release();
+        post_uav->Release();
+        blas_compact_src->Release();
+        compact_scratch->Release();
+        copy_fence->Release();
+        // A null entry in the pointer list is refused while the list is prepared, before anything is submitted.
+        auto bad_ptr_desc = make_buf_desc(256);
+        ID3D12Resource* bad_ptr_buf = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &bad_ptr_desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&bad_ptr_buf))))
+            return fail("CreateCommittedResource(null instance pointer list)");
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bad_in = tlas_ptr_in;
+        bad_in.InstanceDescs = bad_ptr_buf->GetGPUVirtualAddress();
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bad_build{};
+        bad_build.DestAccelerationStructureData = tlas_ptr_buf->GetGPUVirtualAddress();
+        bad_build.Inputs = bad_in;
+        bad_build.ScratchAccelerationStructureData = scratch_buf->GetGPUVirtualAddress();
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->BuildRaytracingAccelerationStructure(&bad_build, 0, nullptr);
+        if (FAILED(cl->Close())) return fail("null pointer build Close");
+        queue->ExecuteCommandLists(1, lists);
+        if (rt::d3d12::last_execute_result(queue) != leonida::ReplayResult::invalid_copy)
+            return fail("null instance pointer must be refused before submission");
+        std::printf("  [PASS] ARRAY_OF_POINTERS null entry refused before submission\n");
+        bad_ptr_buf->Release();
+
+        // A pointer list placed in a DEFAULT heap is GPU-written, so its mapped arena bytes may still hold an
+        // earlier pointer when the CPU prepares a build. Seed those bytes with a valid pointer in one submission,
+        // then overwrite them on the GPU in the next and build. The shim must refuse the second list instead of
+        // translating the stale bytes into a TLAS built from the wrong instances.
+        D3D12_HEAP_DESC placed_heap_desc{};
+        placed_heap_desc.SizeInBytes = 64 * 1024;
+        placed_heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        placed_heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        ID3D12Heap* placed_heap = nullptr;
+        if (FAILED(dev->CreateHeap(&placed_heap_desc, IID_PPV_ARGS(&placed_heap))))
+            return fail("CreateHeap(DEFAULT pointer list heap)");
+        auto stale_ptr_desc = make_buf_desc(256);
+        ID3D12Resource* stale_ptr_buf = nullptr;
+        if (FAILED(dev->CreatePlacedResource(placed_heap, 0, &stale_ptr_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&stale_ptr_buf))))
+            return fail("CreatePlacedResource(DEFAULT pointer list)");
+        // The second submission's GPU overwrite. Its bytes are still the seeded pointer when prepare() runs.
+        auto zero_ptr_desc = make_buf_desc(256);
+        ID3D12Resource* zero_ptr_buf = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &zero_ptr_desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&zero_ptr_buf))))
+            return fail("CreateCommittedResource(zero pointer list)");
+
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->CopyBufferRegion(stale_ptr_buf, 0, inst_ptr_buf, 0, sizeof(UINT64));
+        if (FAILED(cl->Close())) return fail("seed placed pointer list Close");
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, 2);
+        if (!wait_fence(fence, 2)) return fail("wait_fence(seed placed pointer list)");
+
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->CopyBufferRegion(stale_ptr_buf, 0, zero_ptr_buf, 0, sizeof(UINT64));
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC stale_build{};
+        stale_build.DestAccelerationStructureData = tlas_ptr_buf->GetGPUVirtualAddress();
+        stale_build.Inputs = tlas_ptr_in;
+        stale_build.Inputs.InstanceDescs = stale_ptr_buf->GetGPUVirtualAddress();
+        stale_build.ScratchAccelerationStructureData = scratch_buf->GetGPUVirtualAddress();
+        cl->BuildRaytracingAccelerationStructure(&stale_build, 0, nullptr);
+        if (FAILED(cl->Close())) return fail("stale placed pointer build Close");
+        queue->ExecuteCommandLists(1, lists);
+        if (rt::d3d12::last_execute_result(queue) != leonida::ReplayResult::unsupported)
+            return fail("GPU-written placed pointer list must be refused as unsupported before submission");
+        std::printf("  [PASS] ARRAY_OF_POINTERS GPU-written placed pointer list unsupported before submission\n");
+        zero_ptr_buf->Release();
+        stale_ptr_buf->Release();
+        placed_heap->Release();
+
+        inst_ptr_buf->Release();
         inst_buf->Release();
+        tlas_ptr_buf->Release();
         scratch_buf->Release();
         tlas_buf->Release();
         blas_buf->Release();

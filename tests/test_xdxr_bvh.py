@@ -85,6 +85,42 @@ class Layout(unittest.TestCase):
                 self.assertLessEqual(dlo[c], lo[c])
                 self.assertGreaterEqual(dhi[c], hi[c])
 
+    def test_half_round_edges(self):
+        # runtime/src/xdxr_build.comp half_directed computes the same bits; check-build compares the GPU's BOX16
+        # words with encode_box16, which uses this function
+        cases = [
+            (0.0, False, 0x0000), (0.0, True, 0x0000), (-0.0, False, 0x8000), (-0.0, True, 0x8000),
+            (1.0, False, 0x3C00), (1.0, True, 0x3C00), (1.0001, False, 0x3C00), (1.0001, True, 0x3C01),
+            (-1.0001, False, 0xBC01), (-1.0001, True, 0xBC00),
+            (65504.0, True, 0x7BFF), (65505.0, False, 0x7BFF), (65505.0, True, 0x7C00),
+            (-65505.0, False, 0xFC00), (-65505.0, True, 0xFBFF),
+            (math.inf, False, 0x7BFF), (-math.inf, True, 0xFBFF),          # an empty box stays min > max
+            (2.0 ** -14, False, 0x0400), (2.0 ** -14, True, 0x0400),
+            (3e-5, False, 0x0000), (3e-5, True, 0x0400), (-3e-5, False, 0x8400), (-3e-5, True, 0x8000),
+            (1e-30, True, 0x0400), (-1e-30, False, 0x8400),
+        ]
+        for x, up, want in cases:
+            self.assertEqual(X.half_round(x, up), want, (x, up))
+
+    def test_half_round_never_denormal(self):
+        rng = random.Random(3)
+        for _ in range(4000):
+            x = math.copysign(2.0 ** rng.uniform(-40, -10), rng.choice((-1, 1)))
+            for up in (False, True):
+                b = X.half_round(x, up)
+                self.assertFalse(b & 0x7C00 == 0 and b & 0x3FF, f"{x} -> denormal {b:#06x}")
+                v = X._half_value(b)
+                self.assertTrue(v >= x if up else v <= x)
+
+    def test_box16_rounding_check(self):
+        data, _ = X.build_blas(X.random_scene(random.Random(4), 60), box16=True)
+        self.assertEqual(X.box16_rounding(data), [])
+        bad = bytearray(data)
+        root = X.ptr_offset(struct.unpack_from("<I", data, 48)[0])
+        w = struct.unpack_from("<I", bad, root + 16)[0]
+        struct.pack_into("<I", bad, root + 16, w ^ 1)              # one half one step off
+        self.assertTrue(X.box16_rounding(bytes(bad)))
+
     def test_parent_table(self):
         data, info = X.build_blas(X.random_scene(random.Random(2), 40))
         self.assertEqual(X.validate(data), [])
@@ -109,6 +145,35 @@ class Step(unittest.TestCase):
         self.assertAlmostEqual(bary[0][1], 0.3)
         self.assertAlmostEqual(bary[1][0], 0.3)
         self.assertAlmostEqual(bary[2][0], 0.6)
+
+    def test_triangle_barycentrics_independent_of_ray_scale_and_direction(self):
+        # Non-unit and diagonal rays (and scaled TLAS rays) have |dd[2]| != 1; i_num/t_den and j_num/t_den
+        # must still equal the true barycentrics (0.25, 0.25) and reconstruct the 3D hit point org + t * d.
+        target = [0.25, 0.25, 0.0]
+        for d in ([0.0, 0.0, 2.0], [0.0, 0.0, -2.0], [0.5, 0.5, 0.5], [-0.4, -0.3, -0.5], [1.0, 2.0, -3.0]):
+            org = [target[c] - 1.5 * d[c] for c in range(3)]
+            with self.subTest(d=d):
+                t_num, t_den, i_num, j_num = X.triangle_test(TRI, org, d)
+                self.assertNotEqual(t_num, math.inf)
+                t = t_num / t_den
+                b1, b2 = i_num / t_den, j_num / t_den
+                self.assertAlmostEqual(t, 1.5, places=12)
+                self.assertAlmostEqual(b1, 0.25, places=12)
+                self.assertAlmostEqual(b2, 0.25, places=12)
+                b0 = 1.0 - b1 - b2
+                for c in range(3):
+                    rebuilt = b0 * TRI[0][c] + b1 * TRI[1][c] + b2 * TRI[2][c]
+                    self.assertAlmostEqual(rebuilt, org[c] + t * d[c], places=12)
+
+    def test_triangle_edge_hit_with_zero_i_and_negative_major_axis_keeps_positive_j(self):
+        # Point (0.0, 0.25, 0.0) lies on edge v0-v2 (b1 == 0, b2 == 0.25). With dd[2] < 0, t_den < 0;
+        # j_num must share t_den's sign even when i_num == 0 so j_num / t_den is +0.25, not -0.25.
+        for dz in (-1.0, -2.5):
+            with self.subTest(dz=dz):
+                t_num, t_den, i_num, j_num = X.triangle_test(TRI, [0.0, 0.25, 1.0], [0.0, 0.0, dz])
+                self.assertNotEqual(t_num, math.inf)
+                self.assertAlmostEqual(i_num / t_den, 0.0, places=12)
+                self.assertAlmostEqual(j_num / t_den, 0.25, places=12)
 
     def test_tri1_reads_slots_1_3_2(self):
         quad = [[[0, 0, 0], [1, 0, 0], [1, 1, 0]], [[0, 0, 0], [1, 1, 0], [0, 1, 0]]]
@@ -276,6 +341,11 @@ class Validate(unittest.TestCase):
             struct.pack_into("<I", b, self.info["parents"] + 4 * u, 0x1234)
             self.assertTrue(any("parent table" in e for e in X.validate(bytes(b))))
 
+    def test_parent_entry_outside_buffer_is_reported(self) -> None:
+        # offsetToParents is the signed offset at +56 in the runtime header.
+        errors = self.corrupt(56, "<i", len(self.data))
+        self.assertTrue(any("parent table entry" in error and "outside the buffer" in error for error in errors))
+
     def test_dehydrated_refused(self):
         errs = self.corrupt(0, "<I", 0x81020006 | X.FLAG_DEHYDRATED)
         self.assertTrue(any("dehydrated" in e for e in errs))
@@ -411,6 +481,105 @@ class Cli(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.assertEqual(X.main(["validate", os.path.join(d, "missing.bin")]), 2)
+
+    def test_validate_rejects_a_root_with_a_parent(self) -> None:
+        data, info = X.build_blas(X.grid_mesh(3), box16=True)
+        self.assertEqual(X.validate(data), [])
+        corrupt = bytearray(data)
+        root_unit = (X.ptr_offset(info["root"]) - info["elements"]) // X.UNIT
+        struct.pack_into("<I", corrupt, info["parents"] + 4 * root_unit, info["root"])
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "root-parent.bin")
+            with open(path, "wb") as f:
+                f.write(corrupt)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(X.main(["validate", path]), 1)
+            self.assertIn("parent table entry", output.getvalue())
+            self.assertIn(f"expected {X.INVALID:#x}", output.getvalue())
+    def check_build_stderr(self, d):
+        """stderr of `check-build d`, which must be exit 2 with exactly one ERROR line (no traceback)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(X.main(["check-build", d]), 2)
+        text = err.getvalue().strip()
+        self.assertEqual(len(text.splitlines()), 1, text)
+        self.assertNotIn("Traceback", text)
+        self.assertTrue(text.startswith("ERROR: "), text)
+        return text
+
+    def test_check_build_case_without_its_bin_is_one_line(self):
+        # check-build runs on a build folder that may hold other reports: any *.json there is treated as a case,
+        # so a stray one must name itself instead of dying on the missing .bin beside it.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "stray.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "blas", "address": 0, "triangles": []}')
+            text = self.check_build_stderr(d)
+            self.assertIn("stray.json", text)
+            self.assertIn("stray.bin", text)
+
+    def test_check_build_unparseable_case_json_is_one_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "broken.bin"), "wb") as f:
+                f.write(b"")
+            with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:
+                f.write("not json at all")
+            self.assertIn("broken.json", self.check_build_stderr(d))
+
+    def test_check_build_json_without_a_kind_is_one_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "case.bin"), "wb") as f:
+                f.write(b"")
+            with open(os.path.join(d, "case.json"), "w", encoding="utf-8") as f:
+                f.write('{"address": 0, "triangles": []}')
+            self.assertIn("no 'kind' key", self.check_build_stderr(d))
+
+    def test_check_build_tlas_without_an_address_names_its_json(self):
+        # Several cases in one folder: the missing key must be reported against the file that has it.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "good.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "blas", "address": 0, "triangles": []}')
+            with open(os.path.join(d, "good.bin"), "wb") as f:
+                f.write(b"")
+            with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "tlas", "blas": [], "instances": []}')
+            with open(os.path.join(d, "broken.bin"), "wb") as f:
+                f.write(b"")
+            text = self.check_build_stderr(d)
+            self.assertIn("broken.json", text)
+            self.assertIn("no 'address' key", text)
+            self.assertNotIn("good.json", text)
+
+    def test_check_build_instance_without_a_transform_names_its_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "tlas", "address": 4096, "blas": [], "instances": [{"blas": 0, "mask": 1}]}')
+            with open(os.path.join(d, "broken.bin"), "wb") as f:
+                f.write(b"")
+            text = self.check_build_stderr(d)
+            self.assertIn("broken.json", text)
+            self.assertIn("instance 0 has no 'transform' key", text)
+
+    def test_check_build_unknown_blas_name_names_its_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "tlas", "address": 4096, "blas": ["missing_bvh"], "instances": []}')
+            with open(os.path.join(d, "broken.bin"), "wb") as f:
+                f.write(b"")
+            text = self.check_build_stderr(d)
+            self.assertIn("broken.json", text)
+            self.assertIn("BLAS 'missing_bvh' is not a case in this folder", text)
+
+    def test_check_build_tlas_without_its_instances_names_its_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "tlas", "address": 4096, "blas": []}')
+            with open(os.path.join(d, "broken.bin"), "wb") as f:
+                f.write(b"")
+            text = self.check_build_stderr(d)
+            self.assertIn("broken.json", text)
+            self.assertIn("no 'instances' key", text)
 
     def test_selftest(self):
         with contextlib.redirect_stdout(io.StringIO()):

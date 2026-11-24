@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "anim_glb.py")
@@ -90,7 +91,14 @@ def inverse_bind(q, t):
             r[2][0], r[2][1], r[2][2], 0.0, last[0], last[1], last[2], 1.0]
 
 
-def skeleton_resource(shift_bind=0.0):
+# Both bind matrices have rows 0 and 1 equal (zero determinant) and the same recovered origin (0, 0, 1),
+# so only the determinant distinguishes them from bone 0's valid bind. The first has a zero middle
+# cofactor; the second keeps it non-zero so a sign flip in that term is caught.
+SINGULAR_ZERO_COFACTOR = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
+SINGULAR_LIVE_COFACTOR = [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
+
+
+def skeleton_resource(shift_bind=0.0, singular_bind=None):
     p = Page()
     directory = drawable_header(p, "synthetic_skeleton")
     p.b[directory + 8], p.b[directory + 9] = 1, 0
@@ -99,8 +107,10 @@ def skeleton_resource(shift_bind=0.0):
     header = p.alloc(bytes(0x70))
     records = p.alloc(bytes(0x50 * n))
     world = world_transforms()
-    matrices = p.alloc(b"".join(struct.pack("<16f", *inverse_bind(q, (t[0] + shift_bind, t[1], t[2])))
-                                for q, t in world))
+    binds = [inverse_bind(q, (t[0] + shift_bind, t[1], t[2])) for q, t in world]
+    if singular_bind is not None:
+        binds[0] = singular_bind
+    matrices = p.alloc(b"".join(struct.pack("<16f", *m) for m in binds))
     parents = p.alloc(b"".join(struct.pack("<H", 0xFFFF if x is None else x) for x in PARENTS))
     for i, name in enumerate(NAMES):
         r = records + 0x50 * i
@@ -232,6 +242,14 @@ class SkeletonAndPartTest(unittest.TestCase):
         _joints, worst = anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
         self.assertGreater(worst, 0.29)
 
+    def test_a_singular_inverse_bind_is_refused_even_when_its_origin_matches(self):
+        for matrix in (SINGULAR_ZERO_COFACTOR, SINGULAR_LIVE_COFACTOR):
+            with self.subTest(matrix=matrix):
+                sys_page = skeleton_resource(singular_bind=matrix)
+                # Before the fix the origin check passed and the degenerate matrix was exported as a joint.
+                with self.assertRaisesRegex(anim_glb.ExportError, "inverse bind matrix 0"):
+                    anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
+
     def test_part_binds_model_bones_to_joints_by_hash(self):
         joints, _ = anim_glb.read_skeleton(skeleton_resource(), 0)
         # model bone 0 is SKEL_C and model bone 1 is SKEL_A: the model's list is in its own order
@@ -331,6 +349,62 @@ class ClipChannelTest(unittest.TestCase):
         self.assertNotIn(("mover", "translation"), out)
         self.assertEqual(tally["tracks_mover_skipped"], 1)
 
+    def test_single_frame_pose_window_keeps_only_that_frame(self):
+        anim_clips.decode_animation = lambda _s, _anim: (
+            {0: [(float(k), 0.0, 0.0, 1.0) for k in range(5)],
+             1: [(float(k * 10), 0.0, 0.0) for k in range(5)]},
+            5,
+        )
+        out, _ = self.channels(2 / 30, 2 / 30, 1.0)
+        self.assertEqual(out[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
+        # Off-grid start == end windows pick the nearest frame instead of falling back to frame 0.
+        out_mid, _ = self.channels(0.075, 0.075, 1.0)
+        self.assertEqual(out_mid[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
+        out_hi, _ = self.channels(0.095, 0.095, 1.0)
+        self.assertEqual(out_hi[("mover", "translation")], [(0.0, (30.0, 0.0, 0.0))])
+        # Even when start == end sits slightly before a frame within 1e-4, timestamp stays 0.0.
+        self.anim["duration"] = 4 / 32
+        t = 2 / 32 - 2**-14
+        out_tol, _ = self.channels(t, t, 1 / 1024)
+        self.assertEqual(out_tol[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
+
+    def test_select_clips_handles_non_hex_0x_names_and_bad_selectors(self):
+        d = {
+            "clips": [
+                {"kind": "clip", "name": "other.clip", "hash": 0x11111111},
+                {"kind": "clip", "name": "0x_intro.clip", "hash": 0x22222222},
+            ]
+        }
+        self.assertEqual([c["hash"] for c in anim_glb.select_clips(d, ["0x_intro"])], [0x22222222])
+        with self.assertRaisesRegex(anim_glb.ExportError, "0xbad"):
+            anim_glb.select_clips(d, ["0xbad"])
+
+
+class SamplerTimeTest(unittest.TestCase):
+    def test_fractional_time_bounds_match_the_binary_accessor(self) -> None:
+        skeleton = skeleton_resource()
+        joints, _ = anim_glb.read_skeleton(skeleton, anim_glb.drawable_at(skeleton, None))
+        keys = [(1 / 30, (0.0, 0.0, 0.0)), (2 / 30, (1.0, 0.0, 0.0))]
+        glb, _ = anim_glb.build(joints, [], [("sample", {(0, "translation"): keys})])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sampler.glb")
+            with open(path, "wb") as out:
+                out.write(glb)
+            gltf, binary = read_glb(path)
+
+        sampler = gltf["animations"][0]["samplers"][0]
+        index = sampler["input"]
+        min_time, max_time = accessor_values(gltf, binary, index)
+        self.assertEqual(gltf["accessors"][index]["min"], list(min_time))
+        self.assertEqual(gltf["accessors"][index]["max"], list(max_time))
+
+    def test_keys_that_collapse_to_one_stored_time_are_refused(self) -> None:
+        skeleton = skeleton_resource()
+        joints, _ = anim_glb.read_skeleton(skeleton, anim_glb.drawable_at(skeleton, None))
+        keys = [(1.0, (0.0, 0.0, 0.0)), (1.0 + 2 ** -25, (1.0, 0.0, 0.0))]
+        with self.assertRaisesRegex(ValueError, "key times are not increasing"):
+            anim_glb.build(joints, [], [("sample", {(0, "translation"): keys})])
+
 
 class ExportTest(unittest.TestCase):
     def setUp(self):
@@ -396,9 +470,170 @@ class ExportTest(unittest.TestCase):
             for a, b in zip(got, want):
                 self.assertAlmostEqual(a, b, places=5)
 
+    def test_dictionary_lookup_stops_before_adjacent_resource(self):
+        data = clips_fixture.two_sequence_dictionary()
+        _, selected, _ = clips_fixture.write_rpf(self.anim, [data] * 3)
+        with patch.object(anim_glb.anim_index, "classify", wraps=anim_glb.anim_index.classify) as classify:
+            system, _dictionary = anim_glb.load_dictionary(self.anim, selected)
+        self.assertEqual(system.d, data)
+        self.assertEqual([call.args[1] for call in classify.call_args_list], [selected])
+
+    def test_export_reads_page_map_on_sixth_page(self):
+        data = bytearray(clips_fixture.two_sequence_dictionary())
+        page_map = len(data)
+        data.extend(bytes(96))
+        struct.pack_into("<Q", data, 8, SYSTEM + page_map)
+        data[page_map + 8] = 6
+        cuts = [0, 256, 512, 768, 1024, page_map, len(data)]
+        pages = [data[a:b] for a, b in zip(cuts, cuts[1:])]
+        self.dict_offset = clips_fixture.write_rpf(self.anim, pages)[0]
+
+        (gltf, binary), _report = self.export()
+        (animation,) = gltf["animations"]
+        channel = next(c for c in animation["channels"]
+                       if gltf["nodes"][c["target"]["node"]]["name"] == "SKEL_A")
+        self.assertEqual(channel["target"]["path"], "rotation")
+        sampler = animation["samplers"][channel["sampler"]]
+        values = accessor_values(gltf, binary, sampler["output"])
+        self.assertEqual(len(values), clips_fixture.NF)
+        for rotation, x in zip(values, clips_fixture.X_INTS):
+            self.assertAlmostEqual(rotation[0], 0.002 * x - 0.05, places=5)
+
+    def test_missing_page_leaves_adjacent_dictionary_selectable(self):
+        data = clips_fixture.two_sequence_dictionary("incomplete")
+        first, _ = clips_fixture.split(data, len(data), move_map=False)
+        other = clips_fixture.two_sequence_dictionary("neighbor")
+        selected, neighbor = clips_fixture.write_rpf(self.anim, [first, other])
+        with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+            anim_glb.load_dictionary(self.anim, selected)
+        system, _ = anim_glb.load_dictionary(self.anim, neighbor)
+        self.assertEqual(system.d, other)
+        _, summary = anim_glb.anim_clips.scan(self.anim)
+        self.assertEqual(summary["unresolved"], {"system page not the next stream": 1})
+        self.assertEqual(summary["counts"]["dictionaries"], 1)
+
+    def test_root_like_continuation_with_incidental_name(self):
+        data = clips_fixture.two_sequence_dictionary()
+        first, _ = clips_fixture.split(data, len(data), move_map=False)
+        tail = bytearray(first)
+        tail[0x68] ^= 1  # Root prefix and valid name, but no matching dictionary hash.
+        selected, _ = clips_fixture.write_rpf(self.anim, [first, tail])
+        system, _ = anim_glb.load_dictionary(self.anim, selected)
+        self.assertEqual(system.d, first + tail)
+
+    def test_missing_pack_table_cannot_claim_a_named_neighbor(self):
+        data = clips_fixture.two_sequence_dictionary("incomplete")
+        refs = anim_clips.System(data).ptr(0x70)
+        first, _ = clips_fixture.split(data, refs, move_map=False)
+        other = clips_fixture.two_sequence_dictionary("neighbor")
+        selected, neighbor = clips_fixture.write_rpf(self.anim, [first, other])
+        with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+            anim_glb.load_dictionary(self.anim, selected)
+        self.assertEqual(anim_glb.load_dictionary(self.anim, neighbor)[0].d, other)
+        _, summary = anim_clips.scan(self.anim)
+        self.assertEqual(summary["unresolved"], {"system page not the next stream": 1})
+        self.assertEqual(summary["counts"]["dictionaries"], 1)
+
+    def test_named_pack_at_continuation_boundary(self):
+        data = bytearray(clips_fixture.two_sequence_dictionary("abc"))
+        data.extend(bytes(96))
+        s = anim_clips.System(data)
+        refs = s.ptr(0x70)
+        pack = s.ptr(refs)
+        data[pack + 8:pack + 16] = data[8:16]
+        struct.pack_into("<15sB", data, pack + 0x38, b"abc-0", 0x85)
+        # These layouts parse when the resource extent is known independently.
+        for cuts in ([pack], [pack, refs]):
+            data[s.ptr(8) + 8] = len(cuts) + 1
+            pages = [data[a:b] for a, b in zip([0, *cuts], [*cuts, len(data)])]
+            with self.subTest(ambiguous_cuts=cuts):
+                self.assertEqual(anim_clips.parse_dictionary(s)["packs"][0]["name"], "abc-0")
+                root, *_ = clips_fixture.write_rpf(self.anim, pages)
+                with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+                    anim_glb.load_dictionary(self.anim, root)
+                rows, _ = anim_clips.scan(self.anim)
+                self.assertNotIn(root, [row["offset"] for row in rows])
+
+        # Move the pack header behind its reference table. The table can then
+        # be on the first page or on an already accepted continuation.
+        copied_pack = len(data)
+        data.extend(data[pack:pack + 0x70])
+        struct.pack_into("<Q", data, refs, SYSTEM + copied_pack)
+        for cuts in ([copied_pack], [refs, copied_pack]):
+            with self.subTest(cuts=cuts):
+                data[s.ptr(8) + 8] = len(cuts) + 1
+                pages = [data[a:b] for a, b in zip([0, *cuts], [*cuts, len(data)])]
+                root, *_ = clips_fixture.write_rpf(self.anim, pages)
+                system, dictionary = anim_glb.load_dictionary(self.anim, root)
+                self.assertEqual(system.d, data)
+                self.assertEqual(dictionary["packs"][0]["name"], "abc-0")
+                _, summary = anim_clips.scan(self.anim)
+                self.assertEqual(summary["unresolved"], {})
+                self.assertEqual(summary["counts"]["dictionaries"], 1)
+
+    def test_neighbor_cannot_supply_its_own_pack_reference(self):
+        for later in (False, True):
+            with self.subTest(table_on_later_page=later):
+                owner = bytearray(clips_fixture.two_sequence_dictionary("owner"))
+                neighbor = bytearray(clips_fixture.two_sequence_dictionary("neighbor"))
+                owner[anim_clips.System(owner).ptr(8) + 8] = 3 if later else 2
+                table = len(neighbor) if later else 0x60
+                struct.pack_into("<Q", owner, 0x70, SYSTEM + len(owner) + table)
+                if later:
+                    neighbor[anim_clips.System(neighbor).ptr(8) + 8] = 2
+                    tail = bytearray(96)
+                    struct.pack_into("<QI", tail, 0, SYSTEM + len(owner), joaat32("neighbor"))
+                    pages = [neighbor, tail]
+                else:
+                    # The neighbor's own hash at +0x68 completes the false reference.
+                    struct.pack_into("<Q", neighbor, table, SYSTEM + len(owner))
+                    pages = [neighbor]
+                root, following, *_ = clips_fixture.write_rpf(self.anim, [owner, *pages])
+                with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+                    anim_glb.load_dictionary(self.anim, root)
+                self.assertEqual(anim_glb.load_dictionary(self.anim, following)[0].d, b"".join(pages))
+                rows, summary = anim_clips.scan(self.anim)
+                self.assertEqual([row["offset"] for row in rows], [following])
+                self.assertEqual(summary["unresolved"], {"system page not the next stream": 1})
+
+    def test_middle_dictionary_page_count_straddles_fifth_and_sixth_pages(self):
+        neighbor = clips_fixture.two_sequence_dictionary()
+        data = bytearray(clips_fixture.two_sequence_dictionary("middle"))
+        page_map = len(data)
+        data.extend(bytes(96))
+        struct.pack_into("<Q", data, 8, SYSTEM + page_map)
+        data[page_map + 8] = 6
+        cuts = [0, 256, 512, 768, 1024, page_map + 9, len(data)]
+        pages = [data[a:b] for a, b in zip(cuts, cuts[1:])]
+        offsets = clips_fixture.write_rpf(self.anim, [neighbor, *pages, neighbor])
+        with patch.object(anim_glb.anim_index, "classify", wraps=anim_glb.anim_index.classify) as classify:
+            system, _ = anim_glb.load_dictionary(self.anim, offsets[1])
+        self.assertEqual(system.d, data)
+        self.assertEqual([call.args[1] for call in classify.call_args_list], offsets[1:-1])
+
     def test_no_root_motion_leaves_the_mover_node_out(self):
         (gltf, _binary), _report = self.export("--no-root-motion")
         self.assertNotIn("mover", [n.get("name") for n in gltf["nodes"]])
+
+    def test_clip_selection_must_have_an_animation_export(self):
+        out = os.path.join(self.tmp.name, "out.glb")
+        report = os.path.join(self.tmp.name, "report.json")
+        common = ["--skeleton", hex(self.offsets[0]), "--report", report]
+        for selector in (["--clip", "walk"], ["--dictionary", "0"]):
+            for mode, args in (("--anim", [out, "--part", hex(self.offsets[1])]),
+                               ("--coverage", ["--coverage", "--anim", self.anim])):
+                with self.subTest(selector=selector, mode=mode):
+                    result = self.run_tool(self.packs, *args, *common, *selector)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(selector[0], result.stderr.splitlines()[-1])
+                    self.assertIn(mode, result.stderr.splitlines()[-1])
+                    self.assertFalse(os.path.exists(out))
+                    self.assertFalse(os.path.exists(report))
+
+        # The same authored part is still a valid static export without selectors.
+        result = self.run_tool(self.packs, out, "--part", hex(self.offsets[1]), *common)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("animations", read_glb(out)[0])
 
     def test_coverage_counts_bone_tracks(self):
         report = os.path.join(self.tmp.name, "coverage.json")
@@ -409,6 +644,17 @@ class ExportTest(unittest.TestCase):
             counts = json.load(f)["counts"]
         self.assertEqual((counts["dictionaries"], counts["bone_tracks"], counts["bone_tracks_in_skeleton"],
                           counts["dictionaries_all_bones_in_skeleton"]), (1, 3, 3, 1))
+
+    def test_a_jobs_count_below_one_is_refused(self):
+        # coverage() used max(1, jobs), so 0 and negatives ran one serial worker and still exited 0.
+        report = os.path.join(self.tmp.name, "coverage.json")
+        for jobs in ("0", "-4"):
+            r = self.run_tool(self.packs, "--coverage", "--skeleton", hex(self.offsets[0]), "--anim", self.anim,
+                              "--report", report, "--jobs", jobs)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--jobs", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(report), "the run still wrote a report")
 
     def test_a_skeleton_whose_binds_disagree_is_refused(self):
         write_archive(self.packs, [[skeleton_resource(shift_bind=0.3)]])
@@ -427,11 +673,85 @@ class ExportTest(unittest.TestCase):
                           "--part", hex(self.offsets[1]), "--report", self.packs)
         self.assertEqual(r.returncode, 2)
 
+    def test_report_directory_is_refused_before_writing_a_glb(self):
+        out = os.path.join(self.tmp.name, "out.glb")
+        report = os.path.join(self.tmp.name, "report")
+        os.mkdir(report)
+        r = self.run_tool(self.packs, out, "--skeleton", hex(self.offsets[0]),
+                          "--part", hex(self.offsets[1]), "--report", report)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--report is a directory", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_report_write_failure_is_one_error_line(self):
+        out = os.path.join(self.tmp.name, "out.glb")
+        report = os.path.join(self.tmp.name, "missing", "report.json")
+        r = self.run_tool(self.packs, out, "--skeleton", hex(self.offsets[0]),
+                          "--part", hex(self.offsets[1]), "--report", report)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        self.assertIn("cannot write report", r.stderr)
+        self.assertIn(report, r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_failed_report_write_preserves_existing_report(self):
+        import contextlib
+        import io
+
+        out = os.path.join(self.tmp.name, "out.glb")
+        report = os.path.join(self.tmp.name, "kept_report.json")
+        old_text = '{"previous": true}\n'
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            f.write(old_text)
+
+        real_named_temp = tempfile.NamedTemporaryFile
+        real_replace = os.replace
+
+        def failing_temp(*args, **kwargs):
+            handle = real_named_temp(*args, **kwargs)
+            if kwargs.get("prefix") == ".anim_glb-":
+                def fail_write(data):
+                    handle.file.write(data[:4])
+                    raise OSError(28, "No space left on device")
+
+                handle.write = fail_write
+            return handle
+
+        def failing_replace(src, dst, *args, **kwargs):
+            if dst == report:
+                raise PermissionError(13, "Permission denied")
+            return real_replace(src, dst, *args, **kwargs)
+
+        for label, patch_ctx in (
+            ("write", patch.object(anim_glb.tempfile, "NamedTemporaryFile", side_effect=failing_temp)),
+            ("replace", patch.object(anim_glb.os, "replace", side_effect=failing_replace)),
+        ):
+            with self.subTest(label=label), patch_ctx:
+                err, so = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(so):
+                    rc = anim_glb.main([self.packs, out, "--skeleton", hex(self.offsets[0]),
+                                        "--part", hex(self.offsets[1]), "--report", report])
+                self.assertEqual(rc, 2)
+                self.assertIn("cannot write report", err.getvalue())
+                self.assertEqual(so.getvalue(), "")
+                with open(report, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), old_text)
+                self.assertFalse([n for n in os.listdir(self.tmp.name) if n.startswith(".anim_glb-")])
+
     def test_a_bad_offset_is_one_error_line(self):
         r = self.run_tool(self.packs, os.path.join(self.tmp.name, "x.glb"), "--skeleton", "0x20", "--part", "0x20")
         self.assertEqual(r.returncode, 2)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
         self.assertTrue(r.stderr.startswith("ERROR:"), r.stderr)
+
+    def test_a_missing_archive_prints_its_path_without_repr_escaping(self):
+        missing = os.path.join(self.tmp.name, "missing", "packs.rpf")
+        r = self.run_tool(missing, os.path.join(self.tmp.name, "x.glb"),
+                          "--skeleton", "0x1000", "--part", "0x1000")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stderr.strip(), f"ERROR: {missing}: {os.strerror(2)}")
+        self.assertEqual(r.stdout, "")
 
 
 if __name__ == "__main__":

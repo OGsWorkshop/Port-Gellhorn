@@ -1,20 +1,31 @@
-// Milestone M0 (docs/d3d12_vulkan.md section 6): a window shows a stable clear colour for 60 frames, through the
+// Milestone M0 (docs/d3d12_vulkan.md section 6): a window shows clear colours for 60 frames, through the
 // Vulkan-backed device behind the Xbox-ABI proxy, with no Vulkan validation errors. Each frame resets the list,
 // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
 // The window is then resized, which recreates the swapchain and scales the blit. The presented images are copied
 // back (the presenter's capture) and must hold the clear colour at the swapchain's size. Last, the colour on screen
-// is read back with GDI on native Windows when the window is in front, the display is in SDR and GDI can read the
-// screen. Under Wine, rootless XWayland can return black for desktop reads, so the swapchain checks confirm the
-// colour there. No shaders or game data.
+// is read back with GDI on native Windows when the window is in front with no other window over its centre, the
+// display is in SDR and GDI can read the screen. Under Wine, rootless XWayland can return black for desktop reads,
+// so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
+#include "window_station.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
+#include <vulkan/vulkan_win32.h>
+
 #include <dxgi1_6.h>
 
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
 #include <functional>
 #include <string_view>
 #include <vector>
@@ -69,6 +80,50 @@ bool is_hdr_monitor(HWND window) {
     return false;
 }
 
+// The LUID of the DXGI adapter whose output shows the window's monitor, or false when it cannot be told. A Vulkan
+// swapchain made on another adapter (a render-only GPU, such as an Intel iGPU with no monitor attached while the
+// desktop runs on a discrete GPU) is not shown by the desktop compositor at all: a bare vkCreateSwapchainKHR + clear +
+// vkQueuePresentKHR program on the UHD 770 leaves the window's own white background on screen, and GDI, BitBlt with
+// CAPTUREBLT and PrintWindow all read that white, while the same program on the display GPU reads the clear colour.
+bool display_adapter_luid(HWND window, LUID* luid) {
+    const HMONITOR target = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    if (!target) return false;
+    Ref<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return false;
+    for (UINT i = 0;; ++i) {
+        Ref<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(i, &adapter.p) == DXGI_ERROR_NOT_FOUND) break;
+        if (!adapter.p) continue;
+        for (UINT j = 0;; ++j) {
+            Ref<IDXGIOutput> output;
+            if (adapter->EnumOutputs(j, &output.p) == DXGI_ERROR_NOT_FOUND) break;
+            if (!output.p) continue;
+            DXGI_OUTPUT_DESC desc{};
+            DXGI_ADAPTER_DESC1 adapter_desc{};
+            if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == target &&
+                SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+                *luid = adapter_desc.AdapterLuid;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// True when the Vulkan device is known to be a different adapter from the one driving the window's monitor.
+bool device_is_not_display_adapter(const vktest::Device& d, HWND window) {
+    LUID display{};
+    if (!display_adapter_luid(window, &display)) return false;
+    const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2"));
+    if (!properties2) return false;
+    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    properties2(d.physical, &properties);
+    if (!id.deviceLUIDValid) return false;
+    return std::memcmp(id.deviceLUID, &display, sizeof(LUID)) != 0;
+}
+
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
     return DefWindowProcW(window, message, w, l);
 }
@@ -81,13 +136,15 @@ void pump() {
     }
 }
 
-bool has_interactive_window_station() {
-    HWINSTA station = GetProcessWindowStation();
-    if (!station) return true;  // Unknown environment: let window creation report the real failure.
-    USEROBJECTFLAGS flags{};
-    DWORD bytes = 0;
-    if (!GetUserObjectInformationW(station, UOI_FLAGS, &flags, sizeof(flags), &bytes)) return true;
-    return (flags.dwFlags & WSF_VISIBLE) != 0;
+// True when the window manager reports this window as the top-level window at a screen point. Being the foreground
+// window does not make it so: an always-on-top window, or one another process showed without taking the foreground,
+// can lie over it, and a GDI read of the screen then returns that window's pixel. WindowFromPoint passes over hidden
+// and disabled windows and over windows that are transparent to hit testing (a click-through overlay,
+// WS_EX_LAYERED | WS_EX_TRANSPARENT), so an overlay of that kind drawn over the point is not noticed, and neither
+// is anything the compositor draws there itself.
+bool is_top_window_at(HWND window, POINT screen_point) {
+    const HWND hit = WindowFromPoint(screen_point);
+    return hit && GetAncestor(hit, GA_ROOT) == window;
 }
 
 void set_client_size(HWND window, int width, int height) {
@@ -111,10 +168,13 @@ PFN_vkDestroySemaphore real_destroy_semaphore = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceFormatsKHR real_surface_formats = nullptr;
 PFN_vkCreateSwapchainKHR real_create_swapchain = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR real_get_caps = nullptr;
+PFN_vkCreateWin32SurfaceKHR real_create_surface = nullptr;
 VkResult fail_next_submit = VK_SUCCESS;  // armed: the next vkQueueSubmit returns this and submits nothing
 VkResult next_present = VK_SUCCESS;      // armed: the next present that succeeds reports this instead
 int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore from now fails
 bool fail_surface_formats = false;       // armed: the next surface-format query fails before creation
+bool fail_surface_create = false;        // armed: the next vkCreateWin32SurfaceKHR fails (recreation after a loss)
+unsigned surface_creations = 0;          // vkCreateWin32SurfaceKHR successes through the double
 bool observe_next_swapchain = false;
 bool report_undefined_extent = false;    // armed: surface capabilities reports undefined extent (0xFFFFFFFF)
 bool undefined_extent_queried = false;
@@ -205,6 +265,17 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
     return real_get_device(device, name);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL create_surface(VkInstance instance, const VkWin32SurfaceCreateInfoKHR* info,
+                                              const VkAllocationCallbacks* allocator, VkSurfaceKHR* out) {
+    if (fail_surface_create) {
+        fail_surface_create = false;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    const VkResult result = real_create_surface(instance, info, allocator, out);
+    if (result == VK_SUCCESS) ++surface_creations;
+    return result;
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
     const std::string_view n = name;
     if (n == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
@@ -212,6 +283,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const
         return reinterpret_cast<PFN_vkVoidFunction>(surface_formats);
     if (n == "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
         return reinterpret_cast<PFN_vkVoidFunction>(get_surface_capabilities);
+    if (n == "vkCreateWin32SurfaceKHR") return reinterpret_cast<PFN_vkVoidFunction>(create_surface);
     return real_get_instance(instance, name);
 }
 
@@ -227,6 +299,8 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
     real_create_swapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(real_get_device(device, "vkCreateSwapchainKHR"));
     real_get_caps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
         instance_proc(instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+    real_create_surface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+        instance_proc(instance, "vkCreateWin32SurfaceKHR"));
 }
 }  // namespace driver
 
@@ -234,6 +308,22 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
 
 int main() {
     vktest::Device d;
+    // LEONIDA_CAPTURE writes every presented frame to disk. Turn it on here so the path is exercised with the rest of
+    // the presenter, and check its files against the colour this test clears to.
+    wchar_t capture_dir[MAX_PATH]{};
+    {
+        wchar_t temp[MAX_PATH]{};
+        if (GetTempPathW(MAX_PATH, temp))
+            swprintf_s(capture_dir, L"%sleonida_present_capture_%lu", temp, GetCurrentProcessId());
+        if (capture_dir[0]) {
+            CreateDirectoryW(capture_dir, nullptr);
+            // The presenter reads these with std::getenv, so they have to go into the CRT's environment too, which
+            // SetEnvironmentVariableW alone does not update.
+            _wputenv_s(L"LEONIDA_CAPTURE", capture_dir);
+            _wputenv_s(L"LEONIDA_CAPTURE_EVERY", L"1");
+            _wputenv_s(L"LEONIDA_CAPTURE_LIMIT", L"4");
+        }
+    }
     const auto device_status = d.initialize(true);
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan presentation device\n");
@@ -265,11 +355,11 @@ int main() {
         std::fprintf(stderr, "FAIL: cannot create the presentation window (Win32 error %lu)\n", GetLastError());
         return 1;
     }
-    ShowWindow(window, SW_SHOWNORMAL);
-    SetForegroundWindow(window);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
     UpdateWindow(window);
     pump();
 
+    const FLOAT alternate[4] = {1.f, 0.f, 0.f, 1.f};
     const FLOAT colour[4] = {0.2f, 0.6f, 0.9f, 1.0f};
     bool screen_checked = false;
     {
@@ -360,7 +450,9 @@ int main() {
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
             list->ResourceBarrier(1, &barrier);
-            list->ClearRenderTargetView(rtv, colour, 0, nullptr);
+            const auto next = presenter->presented() + 1;
+            const bool red = next <= 4 && next % 2 == 1;
+            list->ClearRenderTargetView(rtv, red ? alternate : colour, 0, nullptr);
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
             list->ResourceBarrier(1, &barrier);
@@ -457,6 +549,29 @@ int main() {
         driver::report_undefined_extent = false;
         EXPECT(presented_image_is_clear_colour());
 
+        // 5. A surface lost under a presented swapchain (the window's display went away): the frame is not shown,
+        //    the sticky E_FAIL of before #5689's present handling is avoided by remaking the surface for the same
+        //    window at the next present and rebuilding the swapchain on it. Until the surface can be remade, the
+        //    vkd3d precedent keeps rendering to nothing instead of failing every present.
+        unsigned surfaces_before = driver::surface_creations;
+        before = presenter->presented();
+        EXPECT(frame(0, [] { driver::next_present = VK_ERROR_SURFACE_LOST_KHR; }));
+        EXPECT(presenter->presented() == before);                      // nothing was shown
+        EXPECT(!presented_image_is_clear_colour());                    // and read_back does not hand out the frame
+        EXPECT(driver::surface_creations == surfaces_before);          // the loss is noted, not yet recreated
+        EXPECT(frame(0));                                              // the next present remakes the surface...
+        EXPECT(driver::surface_creations == surfaces_before + 1);      // ...through the factory callback...
+        EXPECT(presenter->presented() == before + 1);                  // ...and shows again
+        EXPECT(presented_image_is_clear_colour());
+        before = presenter->presented();
+        EXPECT(frame(0, [] { driver::next_present = VK_ERROR_SURFACE_LOST_KHR; }));  // lost again, and the remake
+        EXPECT(frame(0, [] { driver::fail_surface_create = true; }));  // also fails: keep rendering to nothing
+        EXPECT(presenter->presented() == before);                      // the two frames were not shown
+        EXPECT(!presented_image_is_clear_colour());
+        driver::fail_surface_create = false;
+        EXPECT(frame(0));                                              // surfaceable again: recover
+        EXPECT(presenter->presented() == before + 1);
+
         std::printf("injected: out-of-date and suboptimal presents counted apart, a failed swapchain recreation "
                     "released and retried, a failed blit submission recovered, undefined surface extent resolved "
                     "(%u real out-of-date presents)\n",
@@ -479,21 +594,101 @@ int main() {
                 GetClientRect(window, &client);
                 POINT centre{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
                 ClientToScreen(window, &centre);
-                HDC screen = GetDC(nullptr);
-                const COLORREF pixel = GetPixel(screen, centre.x, centre.y);
-                ReleaseDC(nullptr, screen);
-                if (pixel == CLR_INVALID) {
+                const auto is_clear_colour = [](COLORREF c) {
+                    return std::abs(GetRValue(c) - 51) <= 3 && std::abs(GetGValue(c) - 153) <= 3 &&
+                           std::abs(GetBValue(c) - 230) <= 3;
+                };
+                // The foreground window can still be covered at its centre, so a read counts only when this window
+                // was the top one there both before and after it. How long the compositor takes to show the last
+                // frame, or to stop showing a window that has just gone, is not known (the 200 ms above is a guess),
+                // so a pixel that is not the clear colour is read again for up to a second. Nothing is presented
+                // meanwhile: a late frame passes, a wrong colour that stays fails.
+                COLORREF pixel = CLR_INVALID, first_pixel = CLR_INVALID;
+                bool covered = false;
+                int reads = 0;
+                for (;;) {
+                    covered = !is_top_window_at(window, centre);
+                    if (covered) break;
+                    HDC screen = GetDC(nullptr);
+                    pixel = GetPixel(screen, centre.x, centre.y);
+                    ReleaseDC(nullptr, screen);
+                    covered = !is_top_window_at(window, centre);
+                    if (covered) break;
+                    if (++reads == 1) first_pixel = pixel;
+                    if (pixel == CLR_INVALID || is_clear_colour(pixel) || reads > 20) break;
+                    Sleep(50);
+                    pump();
+                }
+                if (covered) {
+                    std::printf("another window covers the window centre: on-screen colour check skipped, the "
+                                "colour was checked in the presented images\n");
+                } else if (pixel == CLR_INVALID) {
                     std::printf("GDI cannot read the screen here (GetPixel on the screen DC returns CLR_INVALID): "
                                 "on-screen colour check skipped, the colour was checked in the presented images\n");
                 } else {
                     const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
                     std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
-                    EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
-                    screen_checked = true;
+                    if (reads > 1)
+                        std::printf("read %d times, 50 ms apart; the first read was %d,%d,%d\n", reads,
+                                    GetRValue(first_pixel), GetGValue(first_pixel), GetBValue(first_pixel));
+                    if (device_is_not_display_adapter(d, window)) {
+                        // The pixel is what the desktop shows, and the desktop does not show this GPU's swapchain.
+                        std::printf("the Vulkan device is not the adapter that drives this monitor: the desktop does "
+                                    "not show its swapchain, on-screen colour check skipped, the colour was checked "
+                                    "in the presented images\n");
+                    } else {
+                        EXPECT(is_clear_colour(pixel));
+                        screen_checked = true;
+                    }
                 }
             }
         } else {
             std::printf("the window is not in front: on-screen colour check skipped\n");
+        }
+
+        // The capture files must hold the colour the presented images hold: the frame written is the swapchain image
+        // as the presentation engine got it, so a capture that reads the wrong buffer shows up here.
+        if (capture_dir[0]) {
+            char narrow[MAX_PATH * 3]{};
+            WideCharToMultiByte(CP_ACP, 0, capture_dir, -1, narrow, static_cast<int>(sizeof narrow), nullptr, nullptr);
+            char path[MAX_PATH * 3 + 32]{};
+            int exact_files = 0;
+            for (int i = 1; i <= 4; ++i) {
+                std::snprintf(path, sizeof path, "%s\\frame_%05d.ppm", narrow, i);
+                std::ifstream ppm(path, std::ios::binary);
+                std::string magic, dimensions, max_value;
+                std::getline(ppm, magic);
+                std::getline(ppm, dimensions);
+                std::getline(ppm, max_value);
+                const int expected[] = {i % 2 ? 255 : 51, i % 2 ? 0 : 153, i % 2 ? 0 : 230};
+                bool exact = magic == "P6" && dimensions == std::to_string(width) + " " + std::to_string(height) &&
+                             max_value == "255";
+                for (size_t n = 0; exact && n < size_t(width) * height * 3; ++n) {
+                    const int sample = ppm.get();
+                    exact = sample != EOF && std::abs(sample - expected[n % 3]) <= 1;
+                }
+                if (exact && ppm.get() == EOF) ++exact_files;
+                ppm.close();
+                DeleteFileA(path);
+            }
+            int lines = 0, matching = 0;
+            std::ifstream index(std::string(narrow) + "\\index.txt");
+            for (std::string line; std::getline(index, line);) {
+                const auto at = line.find("mean rgb ");
+                double r = -1, g = -1, b = -1;
+                if (at == std::string::npos || std::sscanf(line.c_str() + at, "mean rgb %lf %lf %lf", &r, &g, &b) != 3)
+                    continue;
+                ++lines;
+                const bool red = lines % 2 == 1;
+                if (line.starts_with("frame " + std::to_string(lines) + " ") &&
+                    std::fabs(r - (red ? 255 : 51)) <= 3.0 && std::fabs(g - (red ? 0 : 153)) <= 3.0 &&
+                    std::fabs(b - (red ? 0 : 230)) <= 3.0) ++matching;
+            }
+            std::printf("capture: %d correct images, %d index rows, %d matching frame colours\n", exact_files, lines, matching);
+            index.close();
+            DeleteFileA((std::string(narrow) + "\\index.txt").c_str());
+            RemoveDirectoryA(narrow);
+            EXPECT(exact_files == 4 && lines == 4 && matching == 4);
         }
 
         presenter.reset();  // before the device's queue and resources go

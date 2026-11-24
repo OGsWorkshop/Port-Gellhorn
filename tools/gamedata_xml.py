@@ -11,6 +11,8 @@ For every file it records the root element, element count, maximum depth, attrib
 ``platform:/`` references, and include-like structures. For every root it records the file count, category,
 element-name histogram, attribute histogram and reference targets. ``--check`` validates well-formedness and
 separates rootless fragments, tail-only documents and malformed documents.
+Well-formed documents use the parser's expanded root name (including its XML namespace), just as
+the element histogram does. A raw tag hint is only needed when recovering incomplete documents.
 
 Only schema names, element/attribute names and reference tokens are written. Element text, attribute values,
 ``type``/``content`` values and entry paths are not. For a carve directory a row is identified by offset; an
@@ -18,6 +20,7 @@ individual file is identified by the basename that was passed. The output is a l
 be committed or attached to an issue. Report paths are refused before the scan when they alias an input: a
 nested XML in directory mode, or a carve ``index.json`` or stream. The test fixtures are synthetic and contain
 no game data.
+Usage: `python -I tools/gamedata_xml.py --help` lists the options.
 """
 import argparse
 import csv
@@ -25,10 +28,12 @@ import io
 import json
 import os
 import re
+import stat
 import statistics
 import sys
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
+from xml.parsers.expat import errors
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -131,6 +136,7 @@ def scan_xml(data: bytes) -> dict:
     report = {
         "root": "",
         "well_formed": False,
+        "mismatched_tag": False,
         "error": "",
         "element_count": 0,
         "max_depth": 0,
@@ -193,8 +199,10 @@ def scan_xml(data: bytes) -> dict:
     except (ET.ParseError, LookupError, ValueError) as exc:
         # The parser also raises LookupError or ValueError for unsupported encoding declarations.
         report["error"] = str(exc)
+        report["mismatched_tag"] = (isinstance(exc, ET.ParseError)
+                                    and exc.code == errors.codes[errors.XML_ERROR_TAG_MISMATCH])
         # The parser stops at the error, so the comments after it would go uncounted (a truncated or tail-only
-        # document): count them in the bytes instead, still skipping comment-like text inside CDATA.
+        # document): count them in the bytes instead, respecting the surrounding markup.
         report["comments"] = raw_comment_count(data)
     if ended is not None:
         scan_refs(ended.tail, report)
@@ -202,13 +210,17 @@ def scan_xml(data: bytes) -> dict:
     return report
 
 
-CDATA = re.compile(rb"<!\[CDATA\[.*?(?:\]\]>|\Z)", re.S)
+COMMENT_MARKUP = re.compile(
+    rb"(?P<comment><!--).*?(?:-->|\Z)"
+    rb"|<!\[CDATA\[.*?(?:\]\]>|\Z)"
+    rb"|<\?.*?(?:\?>|\Z)",
+    re.S,
+)
 
 
 def raw_comment_count(data: bytes) -> int:
-    """Comment starts in a document the parser could not finish, outside CDATA sections (an unclosed one runs to
-    the end of the data)."""
-    return CDATA.sub(b"", data).count(b"<!--")
+    """Count comment starts in malformed XML, consuming comments, CDATA and PIs through their terminator or EOF."""
+    return sum(match.lastgroup == "comment" for match in COMMENT_MARKUP.finditer(data))
 
 
 def looks_truncated(data: bytes, root: str) -> bool:
@@ -230,10 +242,31 @@ def file_row(doc: dict, scan: dict) -> dict:
         header = gi.has_xml_decl(doc["data"])
     well_formed = scan["well_formed"]
     if well_formed:
+        root = scan["root"]  # the parsed name includes its namespace; a recovery hint need not
         tail_only = fragment = False
     elif doc.get("from_carve"):
         tail_only = not header
         fragment = not root or not doc.get("complete", True)
+    elif scan["mismatched_tag"]:
+        # A cut inside a comment or CDATA changes the lexical meaning of the
+        # retained tags. Accept that explanation only if restoring the opener
+        # produces a complete document; a terminator alone is not evidence.
+        repaired_root = ""
+        data = doc["data"]
+        closing_root = gi.tail_root(data)
+        if not header and closing_root:
+            body = data[3:] if data.startswith(BOM) else data
+            for opener, terminator in ((b"<!--", b"-->"), (b"<![CDATA[", b"]]>")):
+                if terminator not in body:
+                    continue
+                try:
+                    ET.fromstring(b"<" + closing_root.encode("ascii") + b">" + opener + body)
+                except (ET.ParseError, LookupError, ValueError):
+                    continue
+                repaired_root = closing_root
+                break
+        root = repaired_root or gi.xml_root(data) or scan["root"]
+        tail_only, fragment = bool(repaired_root), False
     else:
         tail_only = looks_truncated(doc["data"], root)
         fragment = not root
@@ -442,7 +475,10 @@ def carve_documents(directory: str):
 
 
 def xml_files(directory: str):
-    for base, _, names in os.walk(directory):
+    def scan_failed(exc: OSError) -> None:
+        raise exc
+
+    for base, _, names in os.walk(directory, onerror=scan_failed):
         for name in sorted(names):
             if name.lower().endswith(".xml"):
                 yield os.path.join(base, name)
@@ -467,6 +503,58 @@ def input_files(targets: list):
                 yield from xml_files(target)
         elif os.path.isfile(target):
             yield target
+
+
+def input_name_matches(name: str, target: str) -> bool:
+    """Whether a report basename could be a name the scan reads from this directory target."""
+    name = name.lower()
+    if os.path.isdir(target):
+        if os.path.isfile(os.path.join(target, "index.json")):
+            return name == "index.json" or name.endswith((".bin", ".bk2"))
+        return name.endswith(".xml")
+    return False
+
+
+def has_symlinked_input(target: str) -> bool:
+    """Whether the scan can read a symlink to the report from this target."""
+    if os.path.isdir(target):
+        if os.path.isfile(os.path.join(target, "index.json")):
+            with os.scandir(target) as entries:
+                for entry in entries:
+                    if entry.is_symlink():
+                        leaf = entry.name.lower()
+                        if leaf == "index.json" or leaf.endswith((".bin", ".bk2")):
+                            return True
+        else:
+            for base, _, names in os.walk(target):
+                for name in names:
+                    if name.lower().endswith(".xml") and os.path.islink(os.path.join(base, name)):
+                        return True
+    return False
+
+
+def report_needs_input_check(path: str, targets: list) -> bool:
+    """Whether a report path has to be compared with every scanned input.
+
+    A report that already exists as a regular file, is not a symlink and has one link is reachable
+    only through its own name. When that name cannot be an input read from a directory target, and
+    no scanned input is a symlink to it, the per-file ``same_report_path`` checks can be skipped.
+    Missing reports, links, explicit file targets and input-like names are always compared.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return True
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return True
+    name = os.path.basename(os.path.realpath(path))
+    for target in targets:
+        if os.path.isdir(target):
+            if input_name_matches(name, target) or has_symlinked_input(target):
+                return True
+        elif os.path.isfile(target):
+            return True      # an explicit file target can have any name
+    return False
 
 
 def document_mode(targets: list) -> str:
@@ -495,7 +583,8 @@ def load_documents(targets: list):
 def file_document(path: str) -> dict:
     with open(path, "rb") as f:
         data = f.read()
-    root = gi.tail_root(data) or gi.xml_root(data)
+    head, tail = gi.xml_root(data), gi.tail_root(data)
+    root = head if (head and (gi.has_xml_decl(data) or not gi.xml_complete(head, data))) else (tail or head)
     return {
         "data": data,
         "from_carve": False,
@@ -603,9 +692,10 @@ def main() -> int:
             continue
         if os.path.isdir(path):
             parser.error(f"{flag} is a directory: {path}")
-        for source in input_files(args.targets):
-            if same_report_path(path, source):
-                parser.error(f"{flag} would overwrite the input {source}")
+        if report_needs_input_check(path, args.targets):
+            for source in input_files(args.targets):
+                if same_report_path(path, source):
+                    parser.error(f"{flag} would overwrite the input {source}")
 
     rows = []
     mode = document_mode(args.targets)

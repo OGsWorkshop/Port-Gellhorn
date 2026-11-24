@@ -5,14 +5,16 @@
 // registers that T# -> image index 1 and the shader's literal S# -> sampler index 1, binds an 8x8 gradient at
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
-//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint]   (S# words as hex)
-//   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw.
+//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint|--two-mip-uint]   (S# words as hex)
+//   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw; the SINT and UINT
+//   forms bind the same image as a signed or unsigned integer view instead of the default UNORM one.
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
 //   vk_texture_test dref [out.raw]: ps_sample_c_lz against an 8x8 D32 texture at index 1 (texel x holds depth
 //   (x + 0.5) / 8) and a LESS_OR_EQUAL compare sampler at index 1; both of its results, f32 and d16, must be the
 //   1.0 or 0.0 the reference 0.5 gives against the texel each pixel reads.
 //   vk_texture_test dref_a16 [out.raw]: the same with ps_sample_c_lz_a16 (16-bit coordinates).
+//   vk_texture_test dref_c / dref_c_b [out.raw]: the same with ps_sample_c (implicit LOD) / ps_sample_c_b (LOD bias).
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
@@ -24,6 +26,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "spirv_capability.h"
 
 #include <algorithm>
 #include <cmath>
@@ -31,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -52,38 +56,68 @@ static std::vector<uint32_t> read_spv(const char* p) {
     return w;
 }
 
-// Whether the module declares capability `cap` (OpCapability comes first, right after the 5-word header).
-static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) {
-    for (size_t i = 5; i + 1 < spv.size() && spv[i] == (2u << 16 | 17u); i += 2)   // OpCapability, 2 words
-        if (spv[i + 1] == cap) return true;
-    return false;
-}
-
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
 
+static bool cube_texel_matches(const float* pixel, int tx, int ty, int face) {
+    return std::fabs(pixel[0] - tx * 32 / 255.f) < 1e-3f &&
+           std::fabs(pixel[1] - ty * 32 / 255.f) < 1e-3f &&
+           std::fabs(pixel[2] - (6 + face) * 20 / 255.f) < 1e-3f &&
+           std::fabs(pixel[3] - 1.0f) < 1e-3f;  // The cube upload stores opaque alpha.
+}
+
+static int cube_alpha_self_test() {
+    float pixel[4] = {64.0f / 255.0f, 96.0f / 255.0f, 200.0f / 255.0f, 1.0f};
+    if (!cube_texel_matches(pixel, 2, 3, 4)) {
+        std::fprintf(stderr, "cube alpha self-test: rejected the expected RGBA texel\n");
+        return 1;
+    }
+    for (const float alpha : {0.0f, std::numeric_limits<float>::quiet_NaN()}) {
+        pixel[3] = alpha;
+        if (cube_texel_matches(pixel, 2, 3, 4)) {
+            std::fprintf(stderr, "cube alpha self-test: accepted incorrect alpha %g\n", alpha);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--self-test-cube-alpha") == 0)
+        return cube_alpha_self_test();
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
-    const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
+    const bool uint_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-uint") == 0;
+    const bool two_mip = signed_mips || uint_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
     // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
     const uint32_t texture_side = two_mip ? 2 * W : TW;
     const uint32_t levels = two_mip ? 2 : 1;
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
+    // Fixed shader only: fetch (0,0) is in bounds on both the fallback and the integer image.
+    const bool fetch_uint = argc >= 2 && !std::strcmp(argv[1], "fetch-uint");
+    const bool fetch_miss = argc >= 2 && !std::strcmp(argv[1], "fetch-miss");
+    const bool fetch = fetch_uint || fetch_miss || (argc >= 2 && !std::strcmp(argv[1], "fetch-sint"));
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
-    const bool dref_a16 = argc >= 2 && !std::strcmp(argv[1], "dref_a16");
-    const bool dref = dref_a16 || (argc >= 2 && !std::strcmp(argv[1], "dref"));
+    // dref_c / dref_c_b: image_sample_c / image_sample_c_b (implicit LOD, bias), same texture and expected results.
+    const char* dref_ps = nullptr;
+    if (argc >= 2) {
+        if (!std::strcmp(argv[1], "dref")) dref_ps = "ps_sample_c_lz.spv";
+        else if (!std::strcmp(argv[1], "dref_a16")) dref_ps = "ps_sample_c_lz_a16.spv";
+        else if (!std::strcmp(argv[1], "dref_c")) dref_ps = "ps_sample_c.spv";
+        else if (!std::strcmp(argv[1], "dref_c_b")) dref_ps = "ps_sample_c_b.spv";
+    }
+    const bool dref = dref_ps != nullptr;
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-    if (argc == 9 || two_mip) {
+    if (!fetch && (argc == 9 || two_mip)) {
         vs_path = argv[1];
         fs_path = argv[2];
         out_path = argv[3];
         ptr_sgpr = std::atoi(argv[4]);
         for (int i = 0; i < 4; ++i) ssharp[i] = (uint32_t)strtoul(argv[5 + i], 0, 16);
-    } else if (argc <= 2 || ((cube || dref) && argc == 3)) {
+    } else if (argc <= 2 || ((cube || dref || fetch) && argc == 3)) {
         // Autonomous mode using synthetic hand-written shaders (no game files required)
         autonomous = true;
         auto find_spv = [](const char* name) -> std::string {
@@ -102,21 +136,21 @@ int main(int argc, char** argv) {
             return std::string("runtime/build/shaders/spirv/") + name;
         };
         vs_path = find_spv("vs_ids.spv");
-        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref_a16 ? "ps_sample_c_lz_a16.spv"
-                           : dref ? "ps_sample_c_lz.spv" : "ps_texture_sample.spv");
-        const int out_arg = cube || dref ? 2 : 1;
+        fs_path = find_spv(fetch ? "ps_table_fetch.spv" : cube ? "ps_cube_sample.spv" : dref ? dref_ps : "ps_texture_sample.spv");
+        const int out_arg = cube || dref || fetch ? 2 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
     // at 0, as the views here start at level 0: image_get_resinfo minifies a 2D array's layers from BASE_LEVEL.
     const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
-        signed_mips ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
+        (uint_mips || fetch_uint) ? VK_FORMAT_R8G8B8A8_UINT :
+        (signed_mips || fetch) ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
     uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x44440444,
                           0x55555555, 0x66666666, 0x77777777, 0x88888888};
     const uint32_t tsharp_va = 256;
@@ -144,18 +178,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "unsupported: no Vulkan physical device\n");
         return 77;  // a missing device is a skip in every texture-test mode
     }
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    VkPhysicalDeviceProperties properties{};
-    int best_rank = -1;
-    for (uint32_t i = 0; i < n; ++i) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(pds[i], &p);
-        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
-            pd = pds[i];
-            properties = p;
-            best_rank = rank;
-        }
+    // LEONIDA_VK_DEVICE picks one GPU on a machine with several, as in the other test programs.
+    std::vector<VkPhysicalDeviceProperties> candidates(n);
+    for (uint32_t i = 0; i < n; ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
+    const size_t chosen = leonida::vk_test::pick_device(candidates);
+    if (chosen >= n) {
+        leonida::vk_test::report_no_device();
+        return 1;
     }
+    VkPhysicalDevice pd = pds[chosen];
+    VkPhysicalDeviceProperties properties = candidates[chosen];
     constexpr uint32_t push_words = 36;
     // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only; the heap base is in a uniform block at set 1
     // (vk_pc_tail.h), so a 128-byte device runs these tests too.
@@ -184,7 +216,6 @@ int main(int argc, char** argv) {
     f12.pNext = &f11;
     f12.bufferDeviceAddress = VK_TRUE; f12.runtimeDescriptorArray = VK_TRUE; f12.descriptorIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2.pNext = &f12;
-    f2.features.shaderInt64 = VK_TRUE;
     // Texel offsets: the limits the shader's Offset operands must stay inside, and the two optional features.
     LI(vkEnumerateDeviceExtensionProperties); LI(vkGetPhysicalDeviceFeatures);
     VkPhysicalDeviceProperties pdp; vkGetPhysicalDeviceProperties(pd, &pdp);
@@ -192,15 +223,35 @@ int main(int argc, char** argv) {
                  pdp.limits.minTexelOffset, int(pdp.limits.maxTexelOffset),
                  pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
     VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
+    const auto fragment_code = read_spv(fs_path.c_str());
+    using leonida::vk_test::spirv_declares_capability;
+    const bool dynamic_sampled = spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4,
+        leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
+    if (dynamic_sampled && !have.shaderSampledImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderSampledImageArrayDynamicIndexing\n");
+        return 77;
+    }
+    f2.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
     f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
-    if (declares_capability(read_spv(fs_path.c_str()), 42) && !have.shaderResourceMinLod) {   // 42 = MinLod
+    // shaderInt64 only when a stage has 64-bit integers: SHADER-423's address pairs need none (TEST-468).
+    const bool int64 = leonida::vk_test::needs_shader_int64(read_spv(vs_path.c_str())) ||
+                       leonida::vk_test::needs_shader_int64(fragment_code);
+    if (int64 && !have.shaderInt64) {
+        std::printf("unsupported: shaderInt64 (a stage declares Int64)\n");
+        return 77;
+    }
+    f2.features.shaderInt64 = int64 ? VK_TRUE : VK_FALSE;
+    if (spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4, 42) &&
+        !have.shaderResourceMinLod) {   // 42 = MinLod
         std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");
         return 77;
     }
     std::vector<const char*> enable;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);
+    // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
+    if (!fma.accepts_file(vs_path.c_str()) || !fma.accepts_file(fs_path.c_str())) return 77;
     if (fma.supported()) { enable.push_back(fma.extension()); fma.link_after(&f2); }
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
@@ -211,7 +262,7 @@ int main(int argc, char** argv) {
     for (auto& x : exts) m8_on = m8_on || !std::strcmp(x.extensionName, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     if (m8_on) {
         enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
-        m8.maintenance8 = VK_TRUE; f12.pNext = &m8;
+        m8.maintenance8 = VK_TRUE; f11.pNext = &m8;
         std::fprintf(stderr, "enabled %s\n", VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     }
 #endif
@@ -274,6 +325,8 @@ int main(int argc, char** argv) {
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
     // Descriptor hash table: 16 slots.
     leonida::DescriptorTable desc_table(16);
+    // The heap already holds the original key. Change only the registered key for the miss control.
+    if (fetch_miss) tsharp[7] ^= 1;
     desc_table.insert(tsharp, 1);
     desc_table.insert(ssharp, 1);
     const auto table = desc_table.build_gpu_buffer(true);
@@ -314,6 +367,7 @@ int main(int argc, char** argv) {
                                          : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
         }
     }
+    if (fetch) texels[0] = 0x4df82282u;
     // The signed two-mip fixture uses 0 or -128 in each channel, including the alpha channel.
     if (signed_mips)
         for (auto& texel : texels) texel &= 0x80808080u;
@@ -512,6 +566,14 @@ int main(int argc, char** argv) {
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rc{}; rc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; rc.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &rc);
+    VkBufferMemoryBarrier readback{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    readback.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    readback.srcQueueFamilyIndex = readback.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    readback.buffer = rb;
+    readback.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &readback, 0, nullptr);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(q));
@@ -541,8 +603,7 @@ int main(int argc, char** argv) {
                 for (float ds : {-1e-3f, 1e-3f})
                     for (float dt : {-1e-3f, 1e-3f}) {
                         const int tx = std::min(int(TW) - 1, int(s + ds)), ty = std::min(int(TW) - 1, int(t + dt));
-                        ok |= std::fabs(p[0] - tx * 32 / 255.f) < 1e-3f && std::fabs(p[1] - ty * 32 / 255.f) < 1e-3f &&
-                              std::fabs(p[2] - (6 + face) * 20 / 255.f) < 1e-3f;
+                        ok |= cube_texel_matches(p, tx, ty, face);
                     }
                 checked++;
                 wrong += !ok;
@@ -575,7 +636,27 @@ int main(int argc, char** argv) {
         }
         std::printf("vk_texture_test dref: PASSED (%u pixels, f32 and d16 depth compares exact)\n", W * H);
     }
-    if (autonomous && !cube && !dref) {
+    if (fetch) {
+        // The PS converts each raw VGPR word as a signed integer. On a miss magenta's
+        // UNORM 1.0 channels therefore export float(0x3f800000).
+        const float fallback_one = static_cast<float>(0x3f800000);
+        const float expected[] = {
+            fetch_miss ? fallback_one : fetch_uint ? 130.f : -126.f,
+            fetch_miss ? 0.f : 34.f,
+            fetch_miss ? fallback_one : fetch_uint ? 248.f : -8.f,
+            fetch_miss ? fallback_one : 77.f
+        };
+        const auto* pixels = static_cast<const float*>(rbp);
+        for (uint32_t i = 0; i < W * H * 4; ++i) {
+            if (pixels[i] != expected[i % 4]) {
+                std::fprintf(stderr, "%s pixel %u channel %u: got %g, expected %g\n",
+                             argv[1], i / 4, i % 4, pixels[i], expected[i % 4]);
+                return 1;
+            }
+        }
+        std::printf("%s: %u exact pixels\n", argv[1], W * H);
+    }
+    if (autonomous && !cube && !dref && !fetch) {
         const float* pixels = static_cast<const float*>(rbp);
         // Sample center pixel (32, 32)
         int idx = (32 * W + 32) * 4;

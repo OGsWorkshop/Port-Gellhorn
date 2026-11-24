@@ -20,6 +20,8 @@ Dictionary sources:
 ``--conversations`` files or directories whose conversation data pairs a dialogue key with line labels
                     (``<ROOT>AU_<XXXX>\\0<LABEL>\\0``). A key with N labels yields the waves ``<key>_01`` ..
                     ``<key>_<N>``: wave ``_01`` speaks the first label, ``_02`` the second, and so on.
+                    In a carve folder a ``.bin`` stream of a whole number of 64 KiB blocks is read together with the
+                    streams that continue it (docs/page_directory.md), so a pair across that boundary still counts.
 
 Bank sources (positional; each one is reported and thresholded on its own): ``.awc`` files, directories searched
 for ``.awc`` files, or an ``audio_manifest.json`` written by ``rpf9dump audio``. Sources with the same basename
@@ -33,6 +35,7 @@ A JSON inventory from ``awc_manifest.py`` can also supply the bank names and str
 
 Standard library only. The output names game files: it is a local work product and must not be committed or
 attached to an issue. The tests use synthetic banks and words.
+Usage: `python -I tools/awc_names.py --help` lists the options.
 """
 import argparse
 import collections
@@ -40,8 +43,14 @@ import csv
 import json
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 M32 = 0xFFFFFFFF
 M29 = 0x1FFFFFFF
@@ -56,6 +65,10 @@ CONTROL_LIMIT = 0.02
 FAMILY_SIZES = range(2, 12)
 MIN_TOKEN = 5
 MAX_SCAN_BYTES = 256 << 20
+# A carved stream that inflates to a whole number of 64 KiB blocks continues in the next one (docs/page_directory.md);
+# these heads start a stream of their own instead.
+CONTINUATION_BLOCK = 65536
+NEW_STREAM_HEADS = (b"PSIN", b"RBF0", b"<?xml", b"\xef\xbb\xbf<?xml")
 
 
 # ---- joaat ----
@@ -89,12 +102,17 @@ def bank_ids(path: str) -> list:
         head = fh.read(16)
         if len(head) < 16 or head[:4] != b"ADAT":
             raise ValueError(f"{path}: not a little-endian AWC")
-        flags, n, _header_size = struct.unpack_from("<III", head, 4)
+        flags, n, header_size = struct.unpack_from("<III", head, 4)
         skip = (4 if flags & 0x400000 else 0) + (n * 2 if flags & 0x10000 else 0) \
             + ((n + 1) * 4 if flags & 0x200000 else 0)
         table_end = 16 + skip + 4 * n
-        if table_end > os.fstat(fh.fileno()).st_size:
+        file_size = os.fstat(fh.fileno()).st_size
+        if table_end > file_size:
             raise ValueError(f"{path}: stream table extends past the end of the file")
+        if header_size > file_size:
+            raise ValueError(f"{path}: declared header extends past the end of the file")
+        if header_size < 16 or table_end > header_size:
+            raise ValueError(f"{path}: stream table extends past the declared header")
         fh.seek(16 + skip)
         table = fh.read(4 * n)
     if len(table) < 4 * n:
@@ -116,8 +134,12 @@ def load_banks(source: str) -> dict:
                 grouped[label].append(int(row["stream"], 16) & M29)
             return dict(grouped)
         banks = doc.get("Banks", doc) if isinstance(doc, dict) else doc
+        if not isinstance(banks, list):
+            raise ValueError("expected a list of banks")
         out = {}
         for bank in banks:
+            if not isinstance(bank, dict):
+                raise ValueError(f"expected each bank to be an object, got {type(bank).__name__}")
             out[bank["Path"]] = [int(s["Id"], 16) & M29 for s in bank.get("Streams") or []]
         return out
     if os.path.isfile(source):
@@ -155,13 +177,17 @@ def _files(path: str):
 
 
 def read_words(path: str) -> list:
-    """Words from a text file (one per line) or a hashdict.py JSON object."""
+    """Words from a text file (one per line), a hashdict.py JSON object or a JSON list of words."""
     with open(path, "rb") as fh:
         head = fh.read(1).lstrip()
     if path.lower().endswith(".json") or head == b"{":
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        return [str(v) for v in (doc.values() if isinstance(doc, dict) else doc)]
+        if isinstance(doc, dict):
+            return [str(v) for v in doc.values()]
+        if isinstance(doc, list):
+            return [str(v) for v in doc]
+        raise ValueError(f"expected a JSON object of hash -> word or a list of words, got {type(doc).__name__}")
     with open(path, encoding="utf-8", errors="replace") as fh:
         return [line.strip() for line in fh if line.strip()]
 
@@ -170,14 +196,7 @@ def conversation_waves(paths) -> list:
     """Dialogue wave names from conversation key/label pairs: <key>_01 .. <key>_<labels>."""
     labels = collections.defaultdict(list)
     for path in paths:
-        for full in _files(path):
-            try:
-                if os.path.getsize(full) > MAX_SCAN_BYTES:
-                    continue
-                with open(full, "rb") as fh:
-                    data = fh.read()
-            except OSError:
-                continue
+        for data in _blobs(path):
             if b"AU_" not in data:
                 continue
             for key, label in CONVERSATION_PAIR.findall(data):
@@ -185,6 +204,42 @@ def conversation_waves(paths) -> list:
                 if label not in seen:
                     seen.append(label)
     return [f"{key.decode().lower()}_{n:02d}" for key, ls in labels.items() for n in range(1, len(ls) + 1)]
+
+
+def _blobs(path: str):
+    """The contents of the files under `path`, a carved stream joined with the streams that continue it.
+
+    rpf9_carve.py writes every zlib stream as its own `<offset>.bin`, and a stream that inflates to a whole number
+    of 64 KiB blocks continues in the next one: the next `.bin` of the same folder in name (offset) order, unless
+    that one starts a stream of its own. Matched apart, a pair across that boundary would be lost."""
+    parts, folder, size = [], None, 0
+    for full in _files(path):
+        try:
+            if os.path.getsize(full) > MAX_SCAN_BYTES:
+                data = None
+            else:
+                with open(full, "rb") as fh:
+                    data = fh.read()
+        except OSError:
+            data = None
+        here, carved = os.path.dirname(full), full.lower().endswith(".bin")
+        continues = (data is not None and carved and parts and here == folder
+                     and len(parts[-1]) and len(parts[-1]) % CONTINUATION_BLOCK == 0
+                     and not data.startswith(NEW_STREAM_HEADS) and size + len(data) <= MAX_SCAN_BYTES)
+        if not continues:
+            if parts:
+                yield b"".join(parts)
+            parts, size = [], 0
+        if data is None:
+            continue
+        if not carved:
+            yield data                       # not a carved stream: read on its own
+            continue
+        parts.append(data)
+        size += len(data)
+        folder = here
+    if parts:
+        yield b"".join(parts)
 
 
 class Dictionary:
@@ -217,14 +272,15 @@ def family_ok(names) -> bool:
     return len(nums) == 2 and nums[1] - nums[0] == 1
 
 
-def attack(dictionary: Dictionary, bases: list, index: Index, salt: str) -> dict:
-    """{(bank number, id): (name, rule, family size)}; ``salt`` != '' is the control run."""
-    found = {}
+def _attack_split(dictionary: Dictionary, bases: list, index: Index, salt: str) -> tuple:
+    """Separate dialogue and best family hits per (bank number, id) before control filtering."""
+    dialogue_hits = {}
     for w in dictionary.words:
         if DIALOGUE.match(w):
             name = salt + w
-            for b in index.by_id.get(joaat(name) & M29, ()):
-                found[(b, joaat(name) & M29)] = (name, "dialogue", 99)
+            h = joaat(name) & M29
+            for b in index.by_id.get(h, ()):
+                dialogue_hits[(b, h)] = (name, "dialogue", 99)
     suffix_bytes = [_enc(s) for s in SUFFIXES]
     families = collections.defaultdict(dict)     # (bank, base) -> {id: (name, verbatim)}
     by_id = index.by_id
@@ -237,11 +293,21 @@ def attack(dictionary: Dictionary, bases: list, index: Index, salt: str) -> dict
                 verbatim = (base + s) in dictionary.wordset
                 for b in banks:
                     families[(b, base)][i] = (salt + base + s, verbatim)
+    family_hits = {}
     for (b, _base), members in families.items():
         if family_ok(n for n, _v in members.values()) and any(v for _n, v in members.values()):
+            size = len(members)
             for i, (name, _v) in members.items():
-                found.setdefault((b, i), (name, "family", len(members)))
-    return found
+                prev = family_hits.get((b, i))
+                if prev is None or size > prev[2]:
+                    family_hits[(b, i)] = (name, "family", size)
+    return dialogue_hits, family_hits
+
+
+def attack(dictionary: Dictionary, bases: list, index: Index, salt: str) -> dict:
+    """{(bank number, id): (name, rule, family size)}; ``salt`` != '' is the control run."""
+    dialogue_hits, family_hits = _attack_split(dictionary, bases, index, salt)
+    return {**family_hits, **dialogue_hits}
 
 
 def _distinct(found: dict, rule: str, kmin: int = 0) -> int:
@@ -250,21 +316,28 @@ def _distinct(found: dict, rule: str, kmin: int = 0) -> int:
 
 def name_source(dictionary: Dictionary, bases: list, index: Index) -> tuple:
     """Accepted names and the per-source statistics, after the salted control picks the thresholds."""
-    real = attack(dictionary, bases, index, "")
-    control = attack(dictionary, bases, index, SALT)
-    keep_dialogue = _distinct(control, "dialogue") < CONTROL_LIMIT * max(_distinct(real, "dialogue"), 1)
+    real_dlg, real_fam = _attack_split(dictionary, bases, index, "")
+    ctrl_dlg, ctrl_fam = _attack_split(dictionary, bases, index, SALT)
+    keep_dialogue = _distinct(ctrl_dlg, "dialogue") < CONTROL_LIMIT * max(_distinct(real_dlg, "dialogue"), 1)
     kmin = None
     for k in FAMILY_SIZES:
-        r, c = _distinct(real, "family", k), _distinct(control, "family", k)
+        r, c = _distinct(real_fam, "family", k), _distinct(ctrl_fam, "family", k)
         if r and c < CONTROL_LIMIT * r:
             kmin = k
             break
 
-    def keep(v):
-        return (v[1] == "dialogue" and keep_dialogue) or (v[1] == "family" and kmin is not None and v[2] >= kmin)
+    def combine(dlg, fam):
+        accepted = {}
+        if kmin is not None:
+            for key, val in fam.items():
+                if val[2] >= kmin:
+                    accepted[key] = val
+        if keep_dialogue:
+            accepted.update(dlg)
+        return accepted
 
-    real = {k: v for k, v in real.items() if keep(v)}
-    control = {k: v for k, v in control.items() if keep(v)}
+    real = combine(real_dlg, real_fam)
+    control = combine(ctrl_dlg, ctrl_fam)
     stats = {
         "banks": len(index.labels),
         "streams": index.streams,
@@ -298,14 +371,76 @@ def source_labels(sources):
     return labels
 
 
+def positive_int(text):
+    """--min-token: a count of dictionary words a token must appear in, at least 1. 0 or a negative silently
+    turned the common-token filter off, since every token passes tokens[t] >= min_token."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def _publish_text(path, write_body, *, newline, prefix):
+    """Publish a complete regular file via a temp sibling, or write a non-regular destination directly."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline=newline) as fh:
+            write_body(fh)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline=newline, delete=False,
+        dir=parent, prefix=prefix, suffix=".tmp",
+    )
+    try:
+        with staged:
+            write_body(staged)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
+def write_json_report(path, doc):
+    def write_body(fh):
+        json.dump(doc, fh, indent=1)
+
+    _publish_text(path, write_body, newline="\n", prefix=".awc_names-")
+
+
+def write_csv_report(path, rows):
+    def write_body(fh):
+        w = csv.DictWriter(fh, fieldnames=["source", "bank", "stream_id", "name", "rule"],
+                           lineterminator="\n")
+        w.writeheader()
+        w.writerows(rows)
+
+    _publish_text(path, write_body, newline="", prefix=".awc_names-")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("banks", nargs="+", help="an .awc file, a bank directory, or JSON from awc_manifest.py or rpf9dump audio")
     ap.add_argument("--words", action="append", default=[], help="word list or hashdict.py JSON (repeatable)")
     ap.add_argument("--conversations", action="append", default=[],
                     help="file or directory with conversation key/label pairs (repeatable)")
-    ap.add_argument("--min-token", type=int, default=MIN_TOKEN,
-                    help="dictionary words a family base token must appear in (default 5)")
+    ap.add_argument("--min-token", type=positive_int, default=MIN_TOKEN,
+                    help="dictionary words a family base token must appear in (default 5, at least 1)")
     ap.add_argument("--out", help="names.csv or names.json; default is a summary only")
     a = ap.parse_args(argv)
     if not a.words and not a.conversations:
@@ -315,12 +450,23 @@ def main(argv=None) -> int:
         if not os.path.exists(path):
             print(f"awc_names: error: {path}: no such file or directory", file=sys.stderr)
             return 2
-    if a.out and os.path.exists(a.out) and any(os.path.samefile(p, a.out) for p in inputs):
-        ap.error("--out must not overwrite an input")
+    if a.out and os.path.exists(a.out):
+        protected = inputs.copy()
+        for sources, suffix in ((a.banks, ".awc"), (a.conversations, "")):
+            for source in sources:
+                if os.path.isdir(source):
+                    protected.extend(full for full in _files(source)
+                                     if full.lower().endswith(suffix) and os.path.isfile(full))
+        if any(os.path.samefile(p, a.out) for p in protected):
+            ap.error("--out must not overwrite an input")
 
     words = []
     for path in a.words:
-        words += read_words(path)
+        try:
+            words += read_words(path)
+        except (OSError, ValueError) as error:
+            print(f"awc_names: error: cannot read {path}: {error}", file=sys.stderr)
+            return 2
     waves = conversation_waves(a.conversations)
     dictionary = Dictionary(words + waves)
     bases = dictionary.bases(a.min_token)
@@ -342,20 +488,15 @@ def main(argv=None) -> int:
         for (b, i), (name, rule, _k) in sorted(found.items()):
             rows.append({"source": label, "bank": index.labels[b], "stream_id": f"{i:08x}", "name": name,
                          "rule": rule})
-        print(f"{label}: {stats['banks']} banks, {stats['streams']} streams, {stats['named']} named "
+        print(f"{label}: {stats['banks']} banks, {stats['streams']} distinct bank/ID pairs, {stats['named']} named "
               f"({stats['dialogue']} dialogue, {stats['family']} family, family size >= {stats['family_min_size']}); "
               f"control {stats['control_dialogue']} dialogue, {stats['control_family']} family", flush=True)
     if a.out:
         try:
             if a.out.lower().endswith(".json"):
-                with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
-                    json.dump({"summary": summary, "streams": rows}, fh, indent=1)
+                write_json_report(a.out, {"summary": summary, "streams": rows})
             else:
-                with open(a.out, "w", encoding="utf-8", newline="") as fh:
-                    w = csv.DictWriter(fh, fieldnames=["source", "bank", "stream_id", "name", "rule"],
-                                       lineterminator="\n")
-                    w.writeheader()
-                    w.writerows(rows)
+                write_csv_report(a.out, rows)
         except OSError as error:
             print(f"awc_names: error: cannot write {a.out}: {error}", file=sys.stderr)
             return 2

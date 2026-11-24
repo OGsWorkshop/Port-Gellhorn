@@ -36,6 +36,7 @@ prints the program. Exit code: 0 when every program that ran matches, 1 on a mis
 A wave32 program is skipped where vk_compute_test can't pin 32-lane subgroups ("compute subgroup size: 32 not
 available", e.g. Mesa llvmpipe, whose subgroups are 8 wide): its words would come from another wave size. Wave64
 programs translated with --emulate use no subgroup operations, so they are compared at any subgroup size.
+Usage: `python -I tools/lds_fuzz.py --help` lists the options.
 """
 import argparse
 import copy
@@ -85,7 +86,7 @@ WRITES = {  # name: (bytes, data bit offset)
 SHARED_ATOMICS = ("add", "sub", "min_i32", "max_i32", "min_u32", "max_u32", "and", "or", "xor")
 RTN_ATOMICS = SHARED_ATOMICS
 EXEC_KINDS = ("atomic", "atomic_rtn", "bpermute", "cmpst", "permute", "read", "read2", "swizzle", "write",
-              "write2", "wrxchg")
+              "write2", "wrxchg", "wrxchg2")
 ATOMIC_NAME = {"add": "ds_add%s_u32", "sub": "ds_sub%s_u32", "min_i32": "ds_min%s_i32", "max_i32": "ds_max%s_i32",
                "min_u32": "ds_min%s_u32", "max_u32": "ds_max%s_u32", "and": "ds_and%s_b32", "or": "ds_or%s_b32",
                "xor": "ds_xor%s_b32"}
@@ -103,8 +104,10 @@ PERTURBATIONS = {
     "b16_hi_shift_0": ("write_d16_hi", "ds_write_b16_d16_hi stores the low half"),
     "write2_swapped": ("write2", "ds_write2 stores its data registers swapped"),
     "st64_unit_4": ("read2", "the st64 forms scale their offsets by 4, not 256"),
+    "wrxchg2_swapped": ("wrxchg2", "ds_wrxchg2 stores data1 in its first element"),
     "bpermute_inactive_reads": ("bpermute", "ds_bpermute reads an inactive source lane's register, not 0"),
     "bpermute_wave64_cross": ("bpermute", "a wave64 ds_bpermute reaches all 64 lanes"),
+    "permute_wave64_cross": ("permute", "a wave64 ds_permute reaches all 64 lanes"),
     "swizzle_quad_reversed": ("swizzle", "the quad-permute selectors are taken in reverse lane order"),
     "swizzle_or_xor_swapped": ("swizzle", "the bit-mask or and xor fields are swapped"),
     "permute_no_zero": ("permute", "ds_permute_b32 leaves an unwritten lane's register alone instead of writing 0"),
@@ -298,7 +301,7 @@ class Program:
     def random_op(self):
         rng = self.rng
         kinds = ("read", "read", "write", "write", "read2", "write2", "atomic", "atomic_rtn",
-                 "wrxchg", "cmpst", "swizzle", "bpermute") + (("permute",) if self.permute else ())
+                 "wrxchg", "wrxchg2", "cmpst", "swizzle", "bpermute") + (("permute",) if self.permute else ())
         while True:
             op = self.make(rng.choice(kinds))
             if op:
@@ -349,6 +352,25 @@ class Program:
             else:
                 op["src0"], op["src1"] = rng.choice(POOL), rng.choice(POOL)
             return op
+        if kind == "wrxchg2":
+            st64 = rng.random() < 0.3
+            unit = 256 if st64 else 4
+            o0, o1 = rng.randrange(0, 4 if st64 else 64), rng.randrange(0, 4 if st64 else 64)
+            lo = min(o0, o1) * unit
+            extra = (max(o0, o1) * unit - lo,)
+            a = self.pick_addr(4, 4, distinct=True, extra=extra)
+            if not a:
+                return None
+            stride, base, _ = a
+            base = base + a[2]
+            if base - lo < 0:
+                return None
+            base -= lo
+            # the data pair is read before `vdst` is written, so `vdst` may alias it (measured on gfx1100)
+            srcs = rng.sample(POOL, 2)
+            dst = rng.randrange(POOL[0], POOL[-1])          # dst + 1 stays inside POOL
+            return {"kind": kind, "st64": st64, "o0": o0, "o1": o1, "addr": (stride, base, 0), "dst": dst,
+                    "src0": srcs[0], "src1": srcs[1], "exec": self.exec_mask()}
         if kind == "atomic":
             a = self.pick_addr(4, 4, distinct=False)
             if not a:
@@ -404,11 +426,11 @@ class Program:
     def hw_lines(self, arch, ops=None):
         """The program as a native kernel body for tools/hw_oracle: the entry EXEC is saved and restored (a partial
         wave has fewer lanes than -1), the stores go through the output pointer in s[2:3], and the ds_* mnemonics are
-        the ones the architecture names them."""
+        the ones the architecture names them, and so are the barrier and the LDS waits (GFX12, asm.sync_lines)."""
         from hw_oracle import asm
         ops = self.ops if ops is None else ops
         lines = self.body(ops, hw=True, arch=arch)
-        return [asm.ds_line(ln, arch) for ln in lines]
+        return [out for ln in lines for out in asm.sync_lines(asm.ds_line(ln, arch), arch)]
 
     def body(self, ops, hw=False, arch="gfx1150"):
         w64 = self.wave == 64
@@ -468,7 +490,7 @@ class Program:
     def asm_op(self, op, w64, full):
         k = op["kind"]
         lines = []
-        if k in ("read", "write", "atomic", "atomic_rtn", "wrxchg", "cmpst", "read2", "write2"):
+        if k in ("read", "write", "atomic", "atomic_rtn", "wrxchg", "wrxchg2", "cmpst", "read2", "write2"):
             stride, base, off = op["addr"]
             lines += self.asm_addr(stride, base)
         if k == "cmpst" and op["cmp_hit"]:
@@ -500,6 +522,10 @@ class Program:
             lines.append(f"{ATOMIC_NAME[op['op']] % '_rtn'} v{op['dst']}, v{ADDR}, v{op['src']} offset:{op['addr'][2]}")
         elif k == "wrxchg":
             lines.append(f"ds_wrxchg_rtn_b32 v{op['dst']}, v{ADDR}, v{op['src']} offset:{op['addr'][2]}")
+        elif k == "wrxchg2":
+            nm = "ds_wrxchg2st64_rtn_b32" if op["st64"] else "ds_wrxchg2_rtn_b32"
+            lines.append(f"{nm} v[{op['dst']}:{op['dst'] + 1}], v{ADDR}, v{op['src0']}, v{op['src1']} "
+                         f"offset0:{op['o0']} offset1:{op['o1']}")
         elif k == "cmpst":
             lines.append(f"ds_cmpst_rtn_b32 v{op['dst']}, v{ADDR}, v{op['src']}, v{op['src2']} offset:{op['addr'][2]}")
         elif k == "swizzle":
@@ -539,7 +565,7 @@ class Program:
         if k == "read":
             size = READS[op["name"]][0]
             return range(op["dst"], op["dst"] + (size // 4 if size >= 4 else 1))
-        if k == "read2":
+        if k in ("read2", "wrxchg2"):
             return range(op["dst"], op["dst"] + 2)
         if k in ("atomic_rtn", "wrxchg", "cmpst", "swizzle", "bpermute", "permute"):
             return (op["dst"],)
@@ -659,6 +685,24 @@ class Program:
                 ret[t] = old
             for t, v in ret.items():
                 regs[t][op["dst"]] = v
+        elif k == "wrxchg2":
+            unit = 256 if op["st64"] else 4
+            if op["st64"] and "st64_unit_4" in PERTURB:
+                unit = 4
+            stride, base, _ = op["addr"]
+            for t in range(T):
+                if not act[t]:
+                    continue
+                a = t * stride + base
+                a0, a1 = a + op["o0"] * unit, a + op["o1"] * unit
+                d0, d1 = regs[t][op["src0"]], regs[t][op["src1"]]
+                if "wrxchg2_swapped" in PERTURB:
+                    d0, d1 = d1, d0
+                old0 = rd(a0)
+                struct.pack_into("<I", lds, a0, d0)
+                old1 = rd(a1)               # after the first store, so a repeated address returns data0
+                struct.pack_into("<I", lds, a1, d1)
+                regs[t][op["dst"]], regs[t][op["dst"] + 1] = old0, old1
         elif k == "swizzle":
             src = [regs[t][op["src"]] for t in range(T)]
             for t in range(T):
@@ -690,7 +734,10 @@ class Program:
             for t in lanes:
                 if act[t]:
                     word = ((t * op["mul"] + op["add"]) * 4 + op["offset"]) >> 2
-                    sent[(t & ~31) | (word & 31)] = src[t]
+                    if self.wave == 64 and "permute_wave64_cross" in PERTURB:
+                        sent[(t & ~63) | (word & 63)] = src[t]
+                    else:
+                        sent[(t & ~31) | (word & 31)] = src[t]
             for t in range(T):
                 if act[t] and not ("permute_no_zero" in PERTURB and t not in sent):
                     regs[t][op["dst"]] = sent.get(t, 0)
@@ -835,7 +882,7 @@ def run_translator(progs, a, work, tally):
             continue
         # A wave32 program needs 32-lane subgroups. Where vk_compute_test couldn't pin them, its words come from
         # another wave size and are no evidence either way. --wave64-emulate output uses no subgroup operations.
-        lanes = unpinned_subgroup(msg) if p.wave == 32 else None
+        lanes = unpinned_subgroup(msg) if rc == 0 and p.wave == 32 else None
         if lanes:
             skipped += 1
             print(f"SKIP {p.name}: the device can't run it at {lanes} lanes "
@@ -880,13 +927,24 @@ def run_translator(progs, a, work, tally):
 
 def hw_skip_reason(p, arch):
     """Why a program cannot run natively on this GPU, or None. GFX11 renamed the ds_* loads and stores, which
-    asm.ds_line respells, and swaps ds_cmpstore's data operands (measured on gfx1150). The swap is not measured on
-    GFX12, so a program with a ds_cmpst is skipped there; everything else the generator emits is spelled the same
-    on GFX10, GFX11 and GFX12 (assembled for gfx1030, gfx1100, gfx1150 and gfx1201), so the other skips are the
-    assembler's own rejections, which the runner reports."""
+    asm.ds_line respells, and swaps ds_cmpstore's data operands (measured on gfx1150 and on gfx1201); GFX12 also
+    spells the barrier and the LDS wait differently, which asm.sync_lines respells. Everything else the generator
+    emits is spelled the same on GFX10, GFX11 and GFX12 (assembled for gfx1030, gfx1100, gfx1150 and gfx1201), so
+    the other skips are the assembler's own rejections, which the runner reports.
+
+    One behaviour differs on GFX12: a wave64 ds_bpermute_b32 or ds_permute_b32 reaches all 64 lanes there, while
+    RDNA2 (the console's generation, and what this model describes) keeps each 32-lane half separate. Measured with
+    every lane asking for lane (l + 32) mod 64, and with every lane sending to that lane: an RX 9070 XT (gfx1201)
+    returns and delivers lane l ^ 32 in both directions, a gfx1036 iGPU returns and delivers lane l, and on gfx1201
+    300 of 300 wave64 programs match --perturb bpermute_wave64_cross. So those programs can't check the RDNA2 model
+    on GFX12 and are skipped there; wave32 and every other wave64 program still run."""
     from hw_oracle import asm
-    if asm.family(arch) == "gfx12" and any(op["kind"] == "cmpst" for op in p.ops):
-        return "ds_cmpstore_rtn_b32 operand order is only measured on GFX11 (gfx1150)"
+    if asm.family(arch) == "gfx12" and p.wave == 64:
+        cross = {"bpermute": "bpermute_wave64_cross", "permute": "permute_wave64_cross"}
+        kinds = {op["kind"] for op in p.ops} & set(cross)
+        if any(k for k in kinds if cross[k] not in PERTURB):
+            return ("a wave64 ds_bpermute_b32 / ds_permute_b32 reaches all 64 lanes on GFX12 (measured on gfx1201), "
+                    "not each 32-lane half")
     return None
 
 
@@ -918,8 +976,8 @@ def run_hw(oracle, progs, a, tally, results):
         ran = oracle.run(kernels)
     except RuntimeError as e:
         if re.search(r"LDS|group segment|words", str(e)):
-            print("hardware oracle unavailable: this backend cannot run the LDS programs (no LDS support, or more "
-                  f"than 4096 words of output): {str(e)[:200]}")
+            print("hardware oracle unavailable: this backend cannot run these programs (no LDS support, or fewer "
+                  f"output words than they store): {str(e)[:200]}")
             return 77
         raise
     for p, got in zip(which, ran):
@@ -1056,7 +1114,7 @@ def main():
                     help="translate with --pc-tail-ubo and run vk_compute_test with LEONIDA_PC_TAIL_UBO=1 "
                          "(128-byte push constants; also set by LEONIDA_PC_TAIL_UBO=1)")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
-    ap.add_argument("--work", default=None, help="keep the generated .asm and SPIR-V here")
+    ap.add_argument("--work", default=None, help="keep each run's generated .asm and SPIR-V in a new subfolder here")
     ap.add_argument("--model-only", action="store_true")
     ap.add_argument("--show", default=None, metavar="SEED:INDEX[:WAVE]")
     ap.add_argument("--max-report", type=int, default=12)
@@ -1152,8 +1210,15 @@ def main():
     try:
         if "translator" in backends:
             a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
-            work = Path(a.work).resolve() if a.work else Path(tempfile.mkdtemp(prefix="lds_fuzz_"))
-            work.mkdir(parents=True, exist_ok=True)
+            try:
+                parent = Path(a.work).resolve() if a.work else None
+                if parent is not None:
+                    parent.mkdir(parents=True, exist_ok=True)
+                work = Path(tempfile.mkdtemp(prefix="lds_fuzz_", dir=parent))
+            except OSError as e:
+                print(f"ERROR: cannot create work directory: {e}", file=sys.stderr)
+                return 2
+            print(f"work dir {work}")
             rcs.append(run_translator(progs, a, work, tally))
         if oracle:
             if a.perturb:

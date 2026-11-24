@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "mission_tables.py")
@@ -205,6 +206,41 @@ class TestElement(unittest.TestCase):
         self.assertEqual(result["entities"], 1)
         self.assertEqual(result["entity_list"][0]["extra"], 0xFEEDFACE)
 
+    def test_multi_slot_record_with_invalid_first_slot_resolves_later_slots(self):
+        broken = bytearray(good_element(archetype=0xDEADBEEF))
+        struct.pack_into("<I", broken, 0x1C, 0x7FC00000)
+        blob = blob_with(
+            [(0x100, record(0x11111111, 7, 0x180, 2)),
+             (0x120, record(0x22222222, 7, 0x200, 1))],
+            [(0x180, bytes(broken)),
+             (0x1C0, good_element(archetype=0xCAFEBABE, link=0x00000002)),
+             (0x200, good_element(archetype=0x13572468, link=0x00000003))],
+        )
+        result = M.parse_blob(bytes(blob), "partial-slots.bin")
+        self.assertEqual(result["records"], 2)
+        self.assertEqual(result["entities"], 2)
+        self.assertEqual(result["skipped_slots"], 1)
+        self.assertEqual(result["unresolved_records"], 0)
+        self.assertEqual([e["archetype"] for e in result["entity_list"]], [0xCAFEBABE, 0x13572468])
+
+    def test_rejected_single_record_window_does_not_skip_overlapping_table(self):
+        # A 16-byte prefix at 0x100 combined with the first 16 bytes of a real colB=0 record at 0x110
+        # forms a 32-byte window that decodes as a single record (key=0x999999, colB=99, count=0) and
+        # is rejected by the lone-record filter. Rejecting 0x100 must advance by 4 bytes, not 32, so
+        # the real two-record table at 0x110..0x150 is still found.
+        false_prefix = struct.pack("<4I", 0x00999999, 0, 99, 0)
+        blob = blob_with(
+            [(0x100, false_prefix),
+             (0x110, record(0x11111111, 7, 0x180, 1, col_b=0)),
+             (0x130, record(0x22222222, 7, 0x1C0, 1, col_b=0))],
+            [(0x180, good_element(archetype=0xAAAA1111)),
+             (0x1C0, good_element(archetype=0xBBBB2222))],
+        )
+        result = M.parse_blob(bytes(blob), "overlap.bin")
+        self.assertEqual(result["chunks"], 1)
+        self.assertEqual(result["records"], 2)
+        self.assertEqual(result["entities"], 2)
+
 
 class TestBlockIndexed(unittest.TestCase):
     """The third resolution: kind is a 1-based block number and the u64 at +16 is a PSIN pointer."""
@@ -292,6 +328,24 @@ class TestBrokenInput(unittest.TestCase):
         self.assertEqual(result["skipped_bytes"], 20)
         self.assertEqual(result["trailing_bytes"], 20)
 
+    def test_psin_small_pre_section_does_not_scan_section_chain(self):
+        # A valid PSIN container whose first section starts at offset 16 (< RECORD_SIZE) must clamp
+        # scan_bytes to 16 rather than falling back to len(blob) and scanning inside the section chain.
+        section_body = (record(0x11111111, 7, 0x60, 1)
+                        + record(0x22222222, 7, 0x60, 1)
+                        + bytes(16)
+                        + good_element(archetype=0xCAFEBABE))
+        blob = bytearray(16 + 8 + len(section_body))
+        blob[0:4] = b"PSIN"
+        struct.pack_into(">I", blob, 4, 16)
+        blob[16:20] = b"LGID"
+        struct.pack_into(">I", blob, 20, 8 + len(section_body))
+        blob[24:] = section_body
+        result = M.parse_blob(bytes(blob), "small-pre.psin")
+        self.assertEqual(result["scan_bytes"], 16)
+        self.assertEqual(result["records"], 0)
+        self.assertEqual(result["entities"], 0)
+
     def test_offset_outside_the_file_is_a_record_but_not_an_entity(self):
         blob = blob_with(
             [(0x100, record(0x11111111, 7, 0x180, 1)),
@@ -359,6 +413,52 @@ class TestCli(unittest.TestCase):
             )
             self.assertEqual(completed.stdout.count(" records="), 2)
             self.assertIn("2 files,", completed.stdout)
+
+    def test_a_single_file_without_the_magic_is_refused(self):
+        # A lone argument is a PSIN file; a folder is where the bare carved .bin streams live. Naming a file
+        # that is neither used to end in "1 files, 0 records" and exit 0, so a wrong path looked like a run.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "not-a-container.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"\x01" * 64)
+            completed = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("not a PSIN container", completed.stderr)
+            self.assertEqual(completed.stdout, "")
+
+    def test_a_folder_still_scans_a_stream_without_the_magic(self):
+        # Negative control: the same bytes in a folder are a carved stream and are still counted.
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "bare.bin"), "wb") as handle:
+                handle.write(b"\x01" * 64)
+            completed = subprocess.run([sys.executable, "-I", TOOL, folder], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("1 files, 0 records", completed.stdout)
+            self.assertIn("skipped bytes 64", completed.stdout)
+
+
+class TestWriteJson(unittest.TestCase):
+    def test_failed_replace_preserves_previous_report_and_cleans_temp_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            report = os.path.join(folder, "report.json")
+            previous = '{"previous": true}\n'
+            with open(report, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(previous)
+            with mock.patch.object(M, "replace_retry", side_effect=PermissionError(13, "locked")):
+                with self.assertRaises(PermissionError):
+                    M.write_json(report, {"updated": True})
+            with open(report, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), previous)
+            self.assertEqual(os.listdir(folder), ["report.json"])
+
+    def test_successful_write_produces_valid_json_and_cleans_temp_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            report = os.path.join(folder, "report.json")
+            payload = {"files": [], "summary": {"files": 0, "records": 0}}
+            M.write_json(report, payload)
+            with open(report, "r", encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), payload)
+            self.assertEqual(os.listdir(folder), ["report.json"])
 
 
 if __name__ == "__main__":

@@ -29,14 +29,14 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# All check.py cases, including the four vk_store_test shaders and the three mesh fixtures, and TEST-184's
+# All check.py cases, including the six vk_store_test shaders and the three mesh fixtures, and TEST-184's
 # vk_store_test "words" fixtures and image_get_lod draws.
-TOTAL = (len(check.COMPUTE) + 6 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
+TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 6
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
-         # ps_ssharp and vs_base_ids
+         + len(check.TEXTURE_CONSTANTS) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
+         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -72,6 +72,10 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
                 return 0, ""
+            if name == "cs_fmt_d16_xyz":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "80"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<80I", *check.FMT_D16_XYZ_WORDS))
+                return 0, ""
             if name == "cs_fmt_int_narrow":
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "136"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<136I", *check.FMT_INT_NARROW_WORDS))
@@ -80,6 +84,17 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
                 Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ if name == "cs_fmt_xy_xyz" else GOOD_TBUFFER_STORE)
                 return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
+            if name == "cs_fmt_all":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), str(len(check.FMT_ALL_WORDS))))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(check.FMT_ALL_WORDS)}I", *check.FMT_ALL_WORDS))
+                return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
+            if name == "cs_heap_init":
+                # The seeded words come back only if check.py wrote the init file and sized the buffer for it.
+                path = (env or {}).get("VKC_HEAP_INIT")
+                seeded = bool(path) and Path(path).read_bytes() == check.HEAP_INIT_FILE and \
+                    env.get("VKC_OUT_WORDS") == "68"
+                words = check.HEAP_INIT_EXPECTED if seeded else [0xEEEEEEEE] * 8
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
@@ -124,14 +139,17 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = 305419896 305419896 0 4008636142 4008636142 4008636142 4008636142 4008636142\n"
             if name == "cs_cmpx_class_f32":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CMPX_CLASS_WORDS)) + "\n"
-            if name == "cs_global_neg_offset":
-                self.assertEqual(args[0], "40")
-                return 0, "out[0..7] = " + " ".join(map(str, check.GLOBAL_OFFSET[0][2])) + "\n"
+            if name in {n for n, _, _ in check.GLOBAL_OFFSET}:
+                groups, words = next((g, w) for n, g, w in check.GLOBAL_OFFSET if n == name)
+                self.assertEqual(args[0], groups)
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name in dict(check.BOUNDS):    # the SMEM / raw MUBUF rule tests: their words, then the 0xee fill
                 words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_cvt_pk_u8":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CVT_PK_U8_WORDS)) + "\n"
+            if name == "cs_pk_mul_lo_const":
+                return 0, "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = " + " ".join(map(str, (check.CS_STORE + [0] * 8)[:8])) + "\n"
             if name == "cs_smem_soffset_imm":
@@ -140,7 +158,8 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, (WAVE32_WORDS[name] + [0] * 8)[:8])) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
-            if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):   # vk_store_test checks
+            if name in ("cs_imgstore", "cs_imgload", "cs_imgload_tfe", "cs_imgload_d16", "cs_imgload_d16_tfe",
+                        "cs_sample_lz_int_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
             if name in check.STORE_WORDS:     # vk_store_test "words": the three images, judged by check.py
                 self.assertEqual(args, ("words",))
@@ -165,6 +184,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "base_ids_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
+                  patch.object(check, "table_fetch_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -298,6 +318,31 @@ class MeshWorkgroupChecks(unittest.TestCase):
         pixels[6], pixels[2] = pixels[2], pixels[6]
         self.assertIn("2/24 mismatches; first (0,1,0)", check.check_mesh_v5(b"".join(pixels)))
         self.assertIn("384 bytes", check.check_mesh_v5(b"".join(pixels[:-1])))
+
+    def test_a_previous_groups_file_cannot_pass_the_mesh_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp)
+            (spirv / "ms_v5_workgroup.spv").touch()
+            (spirv / "fs_passthru.spv").touch()
+            raw = spirv / "groups.raw"
+            raw.write_bytes(b"".join(struct.pack("<4f", 32 * g, 32 * g + 1, 32 * g + 31, 1)
+                                     for g in range(24)))
+            with patch.object(check, "run", return_value=(0, "")):
+                self.assertIn("missing readback: groups.raw", check.mesh_v5_test(tmp, spirv, raw))
+            self.assertFalse(raw.exists())
+
+    def test_readback_cleanup_failure_does_not_start_the_harness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "groups.raw"
+            raw.mkdir()
+            with patch.object(check, "run") as launch:
+                status, message = check.run_readback(raw, launch, "unused")
+                launch.assert_not_called()
+            self.assertEqual(status, 1)
+            self.assertIn("could not remove the previous readback", message)
+            self.assertTrue(raw.is_dir())
+
+
 class PixelDeviceLimits(unittest.TestCase):
     """pixel_test with a fake harness: the device's limits decide SKIP instead of a failure."""
 
@@ -331,6 +376,28 @@ class PixelDeviceLimits(unittest.TestCase):
         problem = self.run_pixel("ps_ops", 1, "FAILED vkCreateDevice -> -9\n")
         self.assertNotIsInstance(problem, check.Skip)
         self.assertIn("vk_harness failed", problem)
+
+    def test_nan_payload_exception_is_limited_to_kosmickrisp(self):
+        payloads = self.readlane_pixels((0x7fc12345, 0xffc54321, 0x3f800000, 0x3f000000))
+        canonical = self.readlane_pixels((0x7fc00000, 0x7fc00000, 0x3f800000, 0x3f000000))
+        for driver in ("driver: KosmicKrisp\n", "driver: MoltenVK\n", ""):
+            with self.subTest(driver=driver):
+                out = f"device: Apple M1 Pro (subgroup 32..32)\n{driver}ok 64x64\n"
+                self.assertEqual(self.run_pixel("ps_nan_payload", 0, out, payloads), "")
+                problem = self.run_pixel("ps_nan_payload", 0, out, canonical)
+                if driver == "driver: KosmicKrisp\n":
+                    self.assertEqual(problem, "")
+                else:
+                    self.assertIn("unexpected words", problem)
+
+    def test_kosmickrisp_still_rejects_bad_nan_and_finite_words(self):
+        out = "driver: KosmicKrisp\nok 64x64\n"
+        for words in ((0x7fc00001, 0x7fc00000, 0x3f800000, 0x3f000000),
+                      (0x7f800000, 0x7fc00000, 0x3f800000, 0x3f000000),
+                      (0x7fc00000, 0x7fc00000, 0x7fc00000, 0x3f000000)):
+            with self.subTest(words=words):
+                problem = self.run_pixel("ps_nan_payload", 0, out, self.readlane_pixels(words))
+                self.assertIn("unexpected words", problem)
 
     def test_bitmask_perm_skips_below_32_lanes(self):
         out = "device: fake (subgroup 8..8)\nok 64x64\n"
@@ -399,6 +466,17 @@ class PixelDeviceLimits(unittest.TestCase):
                 problem = self.run_pixel("ps_bitmask_perm", 0, out, data=data)
                 self.assertIsInstance(problem, check.Skip)
                 self.assertIn(f"{width} lanes", problem)
+
+    def test_bitmask_perm_narrow_run_still_judges_the_sources_that_run(self):
+        # At 16 lanes "pippi" (lane ^ 9) stays inside the running lanes, so a wrong word there is a failure.
+        out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
+        bad = b"".join(struct.pack("<4I", i % 16, i % 16, 0, 0) for i in range(64 * 64))
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=bad)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("wrong", problem)
+        # At 8 lanes every "pippi" source is lane 8 or above, so nothing can be judged and any word skips.
+        any8 = b"".join(struct.pack("<4I", i % 8, 12345, 0, 0) for i in range(64 * 64))
+        self.assertIsInstance(self.run_pixel("ps_bitmask_perm", 0, out, data=any8), check.Skip)
 
     def test_bitmask_perm_judges_variable_device_at_32_lanes(self):
         out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
@@ -859,6 +937,26 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
                 self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
 
+    def test_judged_when_32_lanes_are_observed(self):
+        # MoltenVK: no compute stage in requiredSubgroupSizeStages, but vk_compute_test's cs_wave_probe saw 32 lanes.
+        out = "device: Apple M3 Max (subgroup 4..32)\ncompute subgroup size: 32 (observed: all 64 invocations of a " \
+              "64x1x1 group, full subgroups)\n"
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name):
+                self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
+                problem = self.run_dump(name, 0, out + self.words(name, flip=True))
+                self.assertTrue(problem)
+                self.assertNotIsInstance(problem, check.Skip)
+
+    def test_failed_when_the_observed_size_is_wrong(self):
+        out = ("device: gpu (subgroup 4..32)\ncompute subgroup size: 32 observed wrong in 64 of 64 invocations; "
+               "invocation 0 has SubgroupSize 32, lane 0, subgroup 0, a ballot of 16 lanes\n")
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name):
+                problem = self.run_dump(name, 1, out)
+                self.assertNotIsInstance(problem, check.Skip)
+                self.assertIn("observed wrong", problem)
+
 
 class SamplerMipChecks(unittest.TestCase):
     """The S#/T# oracle check.py judges vk_sampler_test with, against hand-worked levels."""
@@ -907,6 +1005,80 @@ class SamplerMipChecks(unittest.TestCase):
                            for y in range(64) for x in range(64))
         self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
 
+
+class FmaFusedChecks(unittest.TestCase):
+    """cs_fma_fused: strict single-rounded words under --fma khr, fused-or-split f32 under --fma glsl (Mesa RADV)."""
+    RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
+
+    def run_fma(self, words, *, khr_index=False, fma_mode=None, env_fma=None, code=0, raw_out=None):
+        out = raw_out if raw_out is not None else "out[0..7] = " + " ".join(map(str, words)) + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            if khr_index or fma_mode:
+                meta = {"features": ["shaderFmaFloat32"]} if khr_index else {}
+                if fma_mode:
+                    meta["fma"] = fma_mode
+                Path(tmp, "index.json").write_text(
+                    json.dumps({"cs_fma_fused": meta}), encoding="utf-8")
+            with patch.dict(check.os.environ, {}, clear=False):
+                check.os.environ.pop("LEONIDA_FMA", None)
+                if env_fma:
+                    check.os.environ["LEONIDA_FMA"] = env_fma
+                with patch.object(check, "run", return_value=(code, out)) as run:
+                    res = check.fma_fused_test("tools", tmp)
+                self.assertEqual(run.call_args.kwargs["env"]["VKC_SGPRS"], check.FMA_FUSED_ENV["VKC_SGPRS"])
+        return res
+
+    def test_fused_passes_under_both_modes(self):
+        self.assertEqual(self.run_fma(check.FMA_FUSED, khr_index=False), "")
+        self.assertEqual(self.run_fma(check.FMA_FUSED, khr_index=True), "")
+
+    def test_radv_split_passes_under_glsl_and_fails_under_khr(self):
+        self.assertEqual(self.run_fma(self.RADV_SPLIT, khr_index=False), "")
+        ok, detail = check.judge_fma_fused(self.RADV_SPLIT, khr=False)
+        self.assertTrue(ok)
+        self.assertIn("5/7 split", detail)
+        problem = self.run_fma(self.RADV_SPLIT, khr_index=True)
+        self.assertIn("word 0", problem)
+        self.assertIn("OpFmaKHR", problem)
+
+    def test_fma_mode_recorded_in_index_is_honoured(self):
+        # TEST-1147: an --fma exact build has no FMAKHR capability, so without the recorded mode a fresh shell
+        # judges split words as a legal GLSL Fma result instead of a regression.
+        for mode in ("glsl", "khr", "exact"):
+            with tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "index.json").write_text(
+                    json.dumps({"cs_fma_fused": {"fma": mode}}), encoding="utf-8")
+                self.assertEqual(check.shader_fma_mode(tmp, "cs_fma_fused"), mode)
+        self.assertEqual(self.run_fma(check.FMA_FUSED, fma_mode="exact"), "")
+        problem = self.run_fma(self.RADV_SPLIT, fma_mode="exact")
+        self.assertIn("word 0", problem)
+        self.assertNotIn("LEONIDA_FMA=khr", check.judge_fma_fused(self.RADV_SPLIT, khr=True)[1])
+
+    def test_recorded_mode_overrides_stale_environment(self):
+        # When index.json records the mode it is authoritative; a leftover LEONIDA_FMA from the build shell
+        # must not switch a glsl build to strict judging (or an exact build back to lenient).
+        self.assertEqual(self.run_fma(self.RADV_SPLIT, fma_mode="glsl", env_fma="exact"), "")
+        problem = self.run_fma(self.RADV_SPLIT, fma_mode="exact", env_fma="glsl")
+        self.assertIn("word 0", problem)
+
+    def test_older_index_still_honors_exact_env(self):
+        # An index written before the fma field existed can only be judged strictly via the environment.
+        self.assertEqual(self.run_fma(check.FMA_FUSED, env_fma="exact"), "")
+        problem = self.run_fma(self.RADV_SPLIT, env_fma="exact")
+        self.assertIn("word 0", problem)
+        self.assertIn("--fma exact", problem)
+
+    def test_wrong_f16_or_garbage_f32_fails_under_both_modes(self):
+        bad_f16 = check.FMA_FUSED[:7] + [0x00007352]
+        bad_f32 = [0x12345678] + check.FMA_FUSED[1:]
+        for khr in (False, True):
+            self.assertIn("word 7", self.run_fma(bad_f16, khr_index=khr))
+            self.assertIn("word 0", self.run_fma(bad_f32, khr_index=khr))
+
+    def test_missing_shader_fma_extension_skips(self):
+        res = self.run_fma([], khr_index=True, code=77, raw_out="unsupported: cs_fma_fused.spv needs VK_KHR_shader_fma\n")
+        self.assertIsInstance(res, check.Skip)
+        self.assertIn("VK_KHR_shader_fma", res)
 
 if __name__ == "__main__":
     unittest.main()

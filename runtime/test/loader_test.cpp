@@ -8,6 +8,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -16,10 +17,12 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
+#include "free_image_base.h"
 
 namespace {
 
@@ -56,7 +59,7 @@ std::vector<uint8_t> make_image() {
     nt->FileHeader.NumberOfSections = 1;
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-    nt->OptionalHeader.ImageBase = 0x140000000;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x140000000);
     nt->OptionalHeader.AddressOfEntryPoint = 0x1000;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = 0x2000;
@@ -101,7 +104,7 @@ std::filesystem::path write_image_as(const std::vector<uint8_t>& bytes, const st
 std::vector<uint8_t> make_forwarder_image(const char* target, uint64_t image_base) {
     auto img = make_image();
     std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});  // real tables end in a zero descriptor
-    nt_of(img)->OptionalHeader.ImageBase = image_base;
+    nt_of(img)->OptionalHeader.ImageBase = leonida_test::free_image_base(image_base);
     auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
     ed->Base = 1;
     ed->NumberOfFunctions = 1;
@@ -381,6 +384,56 @@ void test_exports() {
     }
 }
 
+void test_empty_named_export() {
+    const char* what = "an empty named export stays unresolved without hiding valid exports";
+    auto img = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
+    ed->NumberOfFunctions = 3;
+    ed->NumberOfNames = 3;
+    nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = 0x1A0;
+    auto* funcs = reinterpret_cast<uint32_t*>(img.data() + 0x300);
+    funcs[1] = 0;
+    funcs[2] = 0x11C0;  // a code export outside the export directory
+    auto* names = reinterpret_cast<uint32_t*>(img.data() + 0x320);
+    names[0] = 0x1188;
+    names[1] = 0x1180;
+    names[2] = 0x1190;
+    auto* ords = reinterpret_cast<uint16_t*>(img.data() + 0x340);
+    ords[0] = 1;
+    ords[1] = 0;
+    ords[2] = 2;
+    std::memcpy(img.data() + 0x388, "empty\0", 6);
+    std::memcpy(img.data() + 0x390, "valid\0", 6);
+    auto provider = write_image_as(img, "empty_exports.dll");
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(provider);
+        for (const char* sym : {"empty", "#2"}) {
+            bool owns = false;
+            if (m.exports.count(sym) || m.forwarders.count(sym) ||
+                loader.resolve_module_export(m.base, sym, owns) || !owns)
+                return failed(what, std::string(sym) + " did not remain absent from the mapped module");
+        }
+        for (const char* sym : {"valid", "#3", "fwd", "#1"}) {
+            bool owns = false;
+            void* expected = (std::strcmp(sym, "valid") == 0 || std::strcmp(sym, "#3") == 0)
+                ? m.base + 0x11C0 : host_symbol("kernel32.dll", "GetCurrentProcessId");
+            if (!expected || loader.resolve_module_export(m.base, sym, owns) != expected || !owns)
+                return failed(what, std::string(sym) + " no longer resolves to its valid target");
+        }
+        auto importer = write_image_as(make_import_image("empty_exports.dll", "empty"), "empty_import.exe");
+        rt::Module& importing = loader.load(importer);
+        if (importing.imports.size() != 1 || importing.imports[0].binding != rt::Binding::Unimplemented)
+            return failed(what, "an import of the empty slot did not bind as unimplemented");
+        void* bound = *reinterpret_cast<void**>(importing.base + 0x1180);
+        if (!bound || bound == m.base)
+            return failed(what, "the empty import was not given a failure thunk");
+        pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 void test_imports() {
     {
         auto img = make_image();
@@ -416,6 +469,42 @@ void test_imports() {
         dir.VirtualAddress = 0x1000;
         dir.Size = sizeof(IMAGE_IMPORT_DESCRIPTOR);
         expect_rejects("an import thunk table that runs past the image", img);
+    }
+}
+
+void test_import_name_rvas() {
+    for (bool delay : {false, true}) {
+        auto img = make_import_image("testshim.dll", "F");
+        if (delay) {
+            std::fill(img.begin() + 0x200, img.begin() + 0x240, uint8_t{0});
+            auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
+            d->Attributes.AllAttributes = 1;
+            d->DllNameRVA = 0x1060;
+            d->ImportNameTableRVA = 0x1100;
+            d->ImportAddressTableRVA = 0x1180;
+            auto* nt = nt_of(img);
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {};
+            auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+            dir.VirtualAddress = 0x1000;
+            dir.Size = 2 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+        }
+        const char* valid = delay ? "a valid delay-import name RVA loads" : "a valid import name RVA loads";
+        std::string error;
+        if (load(write_image(img), error) != 0)
+            failed(valid, error);
+        else
+            pass(valid);
+
+        *reinterpret_cast<uint64_t*>(img.data() + 0x300) = (1ull << 32) | 0x1120;
+        const char* invalid = delay ? "a delay-import name RVA with high bits is rejected"
+                                    : "an import name RVA with high bits is rejected";
+        error.clear();
+        if (load(write_image(img), error) == 0)
+            failed(invalid, "the image loaded");
+        else if (error.find("an import name runs past the image") == std::string::npos)
+            failed(invalid, error);
+        else
+            pass(invalid);
     }
 }
 
@@ -469,8 +558,6 @@ void emit_store_stub(std::vector<uint8_t>& img, size_t off, uint64_t addr, uint3
     img[n++] = 0xC3;
 }
 
-constexpr uint64_t kInitBase = 0x140000000;
-
 // make_image() plus a TLS directory and an entry point, both aimed at real machine code: a stub that stores a
 // sentinel in this process, so the test can tell a callback ran rather than only that it was parsed.
 std::vector<uint8_t> make_init_image() {
@@ -478,7 +565,8 @@ std::vector<uint8_t> make_init_image() {
     auto* nt = nt_of(img);
     nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
     nt->OptionalHeader.AddressOfEntryPoint = 0x1040;
-    auto va = [](uint32_t rva) { return kInitBase + rva; };
+    const uint64_t base = nt->OptionalHeader.ImageBase;  // the TLS callback addresses below are absolute
+    auto va = [base](uint32_t rva) { return base + rva; };
     constexpr size_t text = 0x200;  // file offset of RVA 0x1000
     emit_store_stub(img, text + 0x00, reinterpret_cast<uint64_t>(&g_tls_ran), 1, 0);
     emit_store_stub(img, text + 0x40, reinterpret_cast<uint64_t>(&g_main_ran), 2, 1);
@@ -555,7 +643,7 @@ void test_initialise_rejects() {
     {
         auto img = make_init_image();
         auto* callbacks = reinterpret_cast<uint64_t*>(img.data() + 0x290);  // file offset of RVA 0x1090
-        callbacks[0] = kInitBase + 0x9000;                                  // well past SizeOfImage
+        callbacks[0] = nt_of(img)->OptionalHeader.ImageBase + 0x9000;         // well past SizeOfImage
         expect_init_rejects("a TLS callback outside the image is rejected", img);
     }
     {
@@ -596,9 +684,18 @@ bool g_use_fls = false;
 DWORD g_fls_index = FLS_OUT_OF_INDEXES;
 int g_fls_callbacks = 0;
 
+// DllMain's lpvReserved for its last DLL_PROCESS_ATTACH, and whether one was seen.
+void* g_attach_reserved = nullptr;
+bool g_attach_seen = false;
+
 void observe_notification(void* base, DWORD reason, void* reserved, bool tls) {
     g_notifications.push_back({base, reason, tls});
-    if (reserved) g_detach_state_live = false;
+    if (reason == DLL_PROCESS_ATTACH && !tls) {
+        g_attach_reserved = reserved;
+        g_attach_seen = true;
+    }
+    // ~Loader unmaps the image after the detach, which is FreeLibrary's case: lpvReserved is NULL there.
+    if (reason == DLL_PROCESS_DETACH && reserved) g_detach_state_live = false;
     if (reason != DLL_PROCESS_DETACH) return;
     for (const auto& m : g_live_modules) {
         MEMORY_BASIC_INFORMATION info{};
@@ -644,6 +741,8 @@ void reset_notifications() {
     g_fail_attach = false;
     g_use_fls = false;
     g_fls_callbacks = 0;
+    g_attach_reserved = nullptr;
+    g_attach_seen = false;
 }
 
 void expect_notifications(const char* what, const std::vector<Notification>& expected) {
@@ -753,7 +852,7 @@ void test_process_detach_without_entry() {
     reset_notifications();
     auto first = make_lifecycle_image();
     auto second = make_image();
-    nt_of(second)->OptionalHeader.ImageBase = 0x180000000;
+    nt_of(second)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x180000000);
     nt_of(second)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
     emit_jump_stub(second, 0x200, reinterpret_cast<uint64_t>(&observe_dllmain));
     void* first_base = nullptr;
@@ -773,6 +872,37 @@ void test_process_detach_without_entry() {
                          {{first_base, DLL_PROCESS_ATTACH, true}, {first_base, DLL_PROCESS_ATTACH, false},
                           {first_base, DLL_PROCESS_DETACH, true}, {first_base, DLL_PROCESS_DETACH, false}});
     reset_notifications();
+}
+
+// DllMain docs (learn.microsoft.com/windows/win32/dlls/dllmain): "If fdwReason is DLL_PROCESS_ATTACH, lpvReserved is
+// NULL for dynamic loads and non-NULL for static loads." Loader::load() from the host is the process-start graph (the
+// executable and the DLLs it imports), a run-time LoadLibrary of a bundled DLL is a dynamic load.
+void test_attach_reserved() {
+    reset_notifications();
+    try {
+        rt::Loader loader(g_dir);
+        loader.load(write_image(make_lifecycle_image()));
+        loader.initialise();
+        if (!g_attach_seen) failed("a static load's DllMain gets a non-NULL lpvReserved", "DllMain was not called");
+        else if (!g_attach_reserved) failed("a static load's DllMain gets a non-NULL lpvReserved", "lpvReserved was NULL");
+        else pass("a static load's DllMain gets a non-NULL lpvReserved");
+    } catch (const std::exception& e) {
+        failed("a static load's DllMain gets a non-NULL lpvReserved", e.what());
+    }
+
+    reset_notifications();
+    try {
+        write_image_as(make_lifecycle_image(), "attach_reserved_dynamic.dll");
+        rt::Loader loader(g_dir);
+        bool handled = false;
+        void* h = loader.load_runtime_module("attach_reserved_dynamic.dll", 0, handled);
+        if (!handled || !h) failed("a run-time load's DllMain gets a NULL lpvReserved", "the run-time load failed");
+        else if (!g_attach_seen) failed("a run-time load's DllMain gets a NULL lpvReserved", "DllMain was not called");
+        else if (g_attach_reserved) failed("a run-time load's DllMain gets a NULL lpvReserved", "lpvReserved was non-NULL");
+        else pass("a run-time load's DllMain gets a NULL lpvReserved");
+    } catch (const std::exception& e) {
+        failed("a run-time load's DllMain gets a NULL lpvReserved", e.what());
+    }
 }
 
 void test_process_detach_dependencies() {
@@ -803,6 +933,26 @@ void test_process_detach_dependencies() {
     if (g_detach_state_live) pass("all dependency mappings remain live until notifications finish");
     else failed("all dependency mappings remain live until notifications finish", "a dependency was unmapped early");
     g_live_modules.clear();
+}
+
+// A dependency whose import table is corrupt fails while the parent binds it. Neither must stay findable by name:
+// a later load or GetModuleHandle would otherwise get a mapped image whose imports were never bound.
+void test_failed_dependency_not_registered() {
+    const char* what = "a failed load leaves neither the module nor its failed dependency loaded";
+    auto dep = make_import_image("kernel32.dll", "GetCurrentProcessId");
+    reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(dep.data() + 0x200)->Name = 0x5000;  // past SizeOfImage
+    const auto dep_path = write_image_as(dep, "fail_dep.dll");
+    const auto parent_path = write_image_as(make_import_image("fail_dep.dll", "x"), "fail_parent.dll");
+    rt::Loader loader(g_dir);
+    auto throws = [&](const std::filesystem::path& p) {
+        try { loader.load(p); return false; } catch (const std::exception&) { return true; }
+    };
+    if (!throws(parent_path)) return failed(what, "the parent loaded over a corrupt dependency");
+    if (loader.find_loaded_module("fail_dep.dll") || loader.find_loaded_module("fail_parent.dll"))
+        return failed(what, "a failed module is still found by name");
+    if (!throws(dep_path)) return failed(what, "a second load of the dependency returned the half-loaded module");
+    if (!throws(parent_path)) return failed(what, "a second load of the parent returned the half-loaded module");
+    pass(what);
 }
 
 void test_forwarded_exports() {
@@ -1043,6 +1193,58 @@ void test_unwind_registration() {
 
 // An export whose address-table entry is past SizeOfImage (not a forwarder: outside the export directory) is
 // refused instead of being stored as base + rva, a pointer outside the mapping.
+// The address-to-module lookup the shim registry uses (on every C++ throw from a mapped image, and for trace and
+// stop lines) runs on whatever thread asks, while another thread may be inside load(). It used to walk the Loader's
+// module vector with no lock while load() appended to it. Without the fix this fails for certain only under
+// AddressSanitizer; here it checks that every answer given during 300 loads is right.
+void test_lookup_during_loads() {
+    const char* what = "the address lookup is right while another thread loads modules";
+    try {
+        rt::Loader loader(g_dir);
+        auto first = make_image();
+        auto* first_nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(first.data() + 0x80);
+        first_nt->OptionalHeader.ImageBase = 0x200000000ull;
+        rt::Module& anchor = loader.load(write_image(first));
+        const uint64_t inside = reinterpret_cast<uint64_t>(anchor.base) + 0x1004;
+
+        std::atomic<bool> stop{false};
+        std::atomic<unsigned> lookups{0}, wrong{0};
+        std::thread reader([&] {
+            while (!stop.load()) {
+                uint64_t base = 0;
+                if (!rt::shims::mapped_image_base(inside, base) || base != reinterpret_cast<uint64_t>(anchor.base))
+                    ++wrong;
+                if (rt::shims::module_offset(inside).find("+0x1004") == std::string::npos) ++wrong;
+                uint64_t none = 0;
+                if (rt::shims::mapped_image_base(0x10, none)) ++wrong;  // in no image
+                ++lookups;
+            }
+        });
+        unsigned loaded = 0;
+        for (unsigned i = 1; i <= 300; ++i) {
+            auto img = make_image();
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(img.data() + 0x80);
+            nt->OptionalHeader.ImageBase = 0x200000000ull + i * 0x10000ull;
+            rt::Module& m = loader.load(write_image(img));
+            uint64_t base = 0;
+            if (rt::shims::mapped_image_base(reinterpret_cast<uint64_t>(m.base) + 0x1000, base) &&
+                base == reinterpret_cast<uint64_t>(m.base))
+                ++loaded;
+        }
+        while (lookups.load() < 1000) std::this_thread::yield();
+        stop = true;
+        reader.join();
+        if (wrong.load())
+            failed(what, std::to_string(wrong.load()) + " wrong answers in " + std::to_string(lookups.load()) + " lookups");
+        else if (loaded != 300)
+            failed(what, "only " + std::to_string(loaded) + " of 300 new modules were found by address");
+        else
+            pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 void test_export_bounds() {
     auto outside = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
     nt_of(outside)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
@@ -1106,6 +1308,122 @@ std::string written_images_blocked() {
     return {};
 }
 
+// A DLL Windows' own loader accepts (LEONIDA_COMPAT_DIR loads with LoadLibraryExW, not with rt::Loader): no entry
+// point, no imports, one export "Answer" (ordinal 1) whose code returns 42.
+std::vector<uint8_t> make_os_dll(uint64_t image_base) {
+    auto img = make_image();
+    std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
+    auto* nt = nt_of(img);
+    nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL | IMAGE_FILE_LARGE_ADDRESS_AWARE;
+    auto& oh = nt->OptionalHeader;
+    oh.ImageBase = leonida_test::free_image_base(image_base);
+    oh.SectionAlignment = 0x1000;
+    oh.FileAlignment = 0x200;
+    oh.MajorOperatingSystemVersion = 6;
+    oh.MajorSubsystemVersion = 6;
+    oh.AddressOfEntryPoint = 0;
+    oh.BaseOfCode = 0x1000;
+    oh.SizeOfCode = 0x200;
+    oh.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI;
+    oh.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
+    oh.SizeOfStackReserve = oh.SizeOfHeapReserve = 0x100000;
+    oh.SizeOfStackCommit = oh.SizeOfHeapCommit = 0x1000;
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
+    ed->Base = 1;
+    ed->NumberOfFunctions = 1;
+    ed->AddressOfFunctions = 0x1100;
+    ed->NumberOfNames = 1;
+    ed->AddressOfNames = 0x1120;
+    ed->AddressOfNameOrdinals = 0x1140;
+    *reinterpret_cast<uint32_t*>(img.data() + 0x300) = 0x1180;  // code, outside the export directory
+    *reinterpret_cast<uint32_t*>(img.data() + 0x320) = 0x1160;
+    *reinterpret_cast<uint16_t*>(img.data() + 0x340) = 0;
+    std::memcpy(img.data() + 0x360, "Answer\0", 7);
+    const uint8_t code[] = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};  // mov eax, 42; ret
+    std::memcpy(img.data() + 0x380, code, sizeof(code));
+    auto& dir = oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    dir.VirtualAddress = 0x1000;
+    dir.Size = 0x170;
+    return img;
+}
+
+// An importer of `dll`!`symbol` bound under LEONIDA_COMPAT_DIR = `compat` (empty = unset). Returns its one record and
+// writes the IAT slot to `bound`.
+rt::ImportRecord bind_with_compat(const std::filesystem::path& compat, const char* dll, const char* symbol,
+                                  void*& bound) {
+    if (compat.empty()) SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", nullptr);
+    else SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", compat.c_str());
+    struct Reset {
+        ~Reset() { SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", nullptr); }
+    } reset;
+    rt::Loader loader(g_dir);
+    rt::Module& m = loader.load(write_image(make_import_image(dll, symbol)));
+    if (m.imports.size() != 1) throw std::runtime_error("expected one import record");
+    bound = *reinterpret_cast<void**>(m.base + 0x1180);
+    return m.imports[0];
+}
+
+void test_compat_modules() {
+    const std::filesystem::path compat = g_dir / "compat";
+    std::filesystem::create_directories(compat);
+    const auto dll_path = compat / "testcompat.dll";
+    write_image_as(make_os_dll(0x1A0000000), "compat/testcompat.dll");
+    write_image_as(make_os_dll(0x1B0000000), "compat/testshim.dll");  // has Answer, not the shim's F
+    try {
+        void* bound = nullptr;
+        {
+            const char* what = "without LEONIDA_COMPAT_DIR an import with no shim stays unimplemented";
+            auto r = bind_with_compat({}, "testcompat.dll", "Answer", bound);
+            if (r.binding != rt::Binding::Unimplemented) failed(what, "it was bound");
+            else pass(what);
+        }
+        {
+            const char* what = "LEONIDA_COMPAT_DIR binds an import to the drop-in DLL's export, and it runs";
+            auto r = bind_with_compat(compat, "TestCompat.dll", "Answer", bound);
+            HMODULE h = GetModuleHandleW(dll_path.c_str());
+            auto expected = h ? reinterpret_cast<void*>(GetProcAddress(h, "Answer")) : nullptr;
+            if (r.binding != rt::Binding::Host) failed(what, "the import was not bound as Host");
+            else if (!expected || bound != expected) failed(what, "the IAT does not hold the DLL's export");
+            else if (reinterpret_cast<int (*)()>(bound)() != 42) failed(what, "the export did not return 42");
+            else pass(what);
+        }
+        {
+            const char* what = "a compat DLL owns its module: a symbol it lacks is unimplemented, not shimmed";
+            auto r = bind_with_compat(compat, "testshim.dll", "F", bound);
+            if (r.binding != rt::Binding::Unimplemented) failed(what, "F was not left unimplemented");
+            else if (!bound || bound == reinterpret_cast<void*>(&test_shim_function)) failed(what, "F reached the shim");
+            else pass(what);
+        }
+        {
+            const char* what = "a DLL that is not in the compat folder still binds to its shim";
+            std::filesystem::path empty = g_dir / "compat_empty";
+            std::filesystem::create_directories(empty);
+            auto r = bind_with_compat(empty, "testshim.dll", "F", bound);
+            if (r.binding != rt::Binding::Shim || bound != reinterpret_cast<void*>(&test_shim_function))
+                failed(what, "F did not bind to the test shim");
+            else pass(what);
+        }
+        {
+            const char* what = "a compat file Windows cannot load is reported, not skipped";
+            std::filesystem::path bad = g_dir / "compat_bad";
+            std::filesystem::create_directories(bad);
+            write_image_as(std::vector<uint8_t>(64, 0x5A), "compat_bad/testcompat.dll");
+            try {
+                bind_with_compat(bad, "testcompat.dll", "Answer", bound);
+                failed(what, "the load succeeded");
+            } catch (const std::exception& e) {
+                if (std::string(e.what()).find("LEONIDA_COMPAT_DIR") == std::string::npos) failed(what, e.what());
+                else pass(what);
+            }
+        }
+    } catch (const std::exception& e) {
+        failed("LEONIDA_COMPAT_DIR", e.what());
+    }
+    // Loaders keep compat DLLs for the process lifetime; drop the references so the work folder can be removed.
+    for (const auto& p : {dll_path, compat / "testshim.dll"})
+        while (HMODULE h = GetModuleHandleW(p.c_str())) FreeLibrary(h);
+}
+
 }  // namespace
 
 int main() {
@@ -1134,19 +1452,25 @@ int main() {
         test_truncation();
         test_relocations();
         test_exports();
+        test_empty_named_export();
         test_imports();
+        test_import_name_rvas();
         test_delay_imports();
         test_initialise();
         test_initialise_rejects();
         test_process_detach();
         test_process_detach_invalid_tls();
         test_process_detach_without_entry();
+        test_attach_reserved();
         test_process_detach_dependencies();
+        test_failed_dependency_not_registered();
         test_delay_descriptor_fields();
         test_forwarded_exports();
         test_export_bounds();
         test_tls_directory_count();
         test_unwind_registration();
+        test_lookup_during_loads();
+        test_compat_modules();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());

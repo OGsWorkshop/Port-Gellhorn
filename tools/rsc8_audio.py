@@ -21,19 +21,29 @@ counts, hashes, string storage/lengths, frame counts, durations and track types 
 
 Usage:
     python -I tools/rsc8_audio.py <archive.rpf | bank.awc | clip.rsc8 | dir> [out.json|out.csv]
-        [--start N] [--limit BYTES] [--max-banks N] [--no-deep] [--summary-only] [--quiet]
+        [--start N] [--limit BYTES] [--max-banks N] [--no-deep] [--curves] [--summary-only] [--quiet]
+
+`--curves` also decodes every clip's keyframes (the blocks are the sequence layout of
+tools/anim_clips.py) and counts the outcome; it reports counts only, never a value.
+
+Every scan also reads the `0xbd` cue records of each stream; the summary's `marker_regions` block
+matches the records whose value is joaat("start") or joaat("end") into region pairs, name by name
+(pair_marker_regions(), docs/rsc8_audio.md).
 """
 import argparse
 import csv
 import json
 import math
 import os
+import statistics
 import struct
 import sys
 import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import anim_clips  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 
 RSC8_MAGIC = b"RSC8"
@@ -44,7 +54,7 @@ RSC8_FLAGS = 1
 RSC8_VIRTUAL_BASE = 0x10
 RSC8_VPTR_BASE = 0x50000000
 RSC8_VPTR_LIMIT = 0x60000000
-TRACK_SCHEMA_HASH = 0x364D3BDB
+TRACK_SCHEMA_HASH = 0x364D3BDB  # joaat("facialtranslation"): the track type of every directory entry
 
 ADAT_MAGIC = b"ADAT"
 TAG_PEAK = 0x36
@@ -57,7 +67,17 @@ TAG_SEEKTABLE = 0xA3
 TAG_LOUDNESS = 0xB2
 TAG_MARKER = 0xBD
 TAG_INDEXRUN = 0xD9  # undocumented grouped index runs into the 0x5a entries; decode_index_runs()
-MARKER_MAGIC = 0xE5C74063
+# The most common cue-name hash of a `0xbd` record, not a magic: it is the first word of 88,082 of the
+# 420,168 `0xbd` tags in `audio.rpf` (decode_marker_records()). The old name is kept for callers.
+MARKER_NAME_COMMON = 0xE5C74063
+MARKER_MAGIC = MARKER_NAME_COMMON
+MARKER_RECORD_BYTES = 16
+MAX_MARKER_BYTES = 16 * 1024 * 1024
+# A region cue stores a second name hash in its `value` word (pair_marker_regions()).
+MARKER_VALUE_START = 0x84DC271F  # joaat("start")
+MARKER_VALUE_END = 0xB0C485D7  # joaat("end")
+_REGION_VALUES = {MARKER_VALUE_START: "start", MARKER_VALUE_END: "end"}
+MAX_REGION_EXCEPTIONS_LISTED = 64
 
 ATTR_FLOAT = 0xFFFF0001
 ATTR_INT = 0xFFFF0002
@@ -75,6 +95,7 @@ MAX_ANIM_BLOCKS = 256
 MAX_TRACK_ENTRIES = 4096
 MAX_PROP_ENTRIES = 256
 SCAN_CHUNK_BYTES = 32 * 1024 * 1024
+PROGRESS_BYTES = 2 * 1024 * 1024 * 1024
 
 CSV_COLUMNS = [
     "bank_offset",
@@ -335,7 +356,75 @@ def _has_embedded_audio_container(data):
     return False
 
 
-def decode_rsc8(data, *, stream_id=None, deep=True):
+def decode_facial_curves(virt, anim, anim_desc, stats=None):
+    """Decode the keyframes of one clip: `({track index: [value tuple per frame]}, frames, tracks)`.
+
+    `virt` is the resource from `RSC8_VIRTUAL_BASE` on; `anim` and `anim_desc` come from `decode_rsc8`.
+    A packed block is one sequence of tools/anim_clips.py (0x20-byte header, version 2, 11 channel
+    types) and the track directory is its 12-byte `{id hash, track-type hash, value format}` list, so
+    the block and track decoders are that tool's. `tracks` is the directory as stored. Raises
+    `anim_clips.DecodeError` when a block does not decode. A contiguous view is decoded in place,
+    without copying the resource.
+    """
+    if isinstance(virt, memoryview):
+        virt = virt.cast("B") if virt.c_contiguous else bytes(virt)
+    system = anim_clips.System(virt)
+    at, count = anim_desc["track_ptr"] or 0, anim_desc["track_count"] or 0
+    if count and at + 12 * count > len(system.d):
+        raise anim_clips.DecodeError("track directory runs past the resource")
+    tracks = [struct.unpack_from("<III", system.d, at + 12 * i) for i in range(count)]
+    clip = {"sequences": [b["voff"] for b in anim["blocks"]], "tracks": tracks, "frames": anim["frame_count"]}
+    try:
+        values, frames = anim_clips.decode_animation(system, clip, stats)
+    except (struct.error, IndexError, OverflowError, ZeroDivisionError) as e:
+        kind = type(e).__name__ if type(e).__module__ == "builtins" else f"{type(e).__module__}.{type(e).__name__}"
+        raise anim_clips.DecodeError(f"malformed block: {kind}") from e
+    return values, frames, tracks
+
+
+def _extents_overlap(anim, anim_desc):
+    """True when two packed blocks, or a block and the track directory, share a byte."""
+    spans = [(b["voff"], b["voff"] + b["anim_size"]) for b in anim["blocks"]]
+    count = anim_desc["track_count"] or 0
+    if count:
+        spans.append((anim_desc["track_ptr"], anim_desc["track_ptr"] + 12 * count))
+    spans.sort()
+    return any(spans[i][0] < spans[i - 1][1] for i in range(1, len(spans)))
+
+
+def facial_curve_summary(virt, anim, anim_desc):
+    """Counts from decoding one clip's keyframes; no value leaves this function.
+
+    `decoded` is False with the `error` text when a block does not decode. Otherwise: `channels` by
+    channel type, the type-10 chunk boundaries and how many close, `components` as
+    `"<value format>:<components per frame>"` per track, and whether the frame count and the header's
+    quantised-bit sum agree with the decoded data.
+    """
+    stats = anim_clips.new_stats()
+    try:
+        values, frames, tracks = decode_facial_curves(virt, anim, anim_desc, stats)
+    except anim_clips.DecodeError as e:
+        return {"decoded": False, "error": str(e)[:80]}
+    components = {}
+    for index, rows in values.items():
+        key = f"{tracks[index][2]}:{len(rows[0]) if rows else 0}"
+        components[key] = components.get(key, 0) + 1
+    blocks = len(anim["blocks"])
+    return {
+        "decoded": True,
+        "error": None,
+        "frames": frames,
+        "frames_match": frames == anim["frame_count"] and stats["frames_sum_matches"] == 1,
+        "quantize_bits_match": stats["quantize_bits_match"] == blocks,
+        "tracks_with_values": len(values),
+        "channels": {k[len("channel:"):]: v for k, v in sorted(stats.items()) if k.startswith("channel:")},
+        "delta2_boundaries": stats["delta2_boundaries"],
+        "delta2_boundaries_closed": stats["delta2_boundaries_closed"],
+        "components": components,
+    }
+
+
+def decode_rsc8(data, *, stream_id=None, deep=True, curves=False):
     """Decode one `RSC8` (version 8001) facial/lip-sync animation resource.
 
     Accepts `bytes`, `bytearray`, or `memoryview`. Returns a structured dict of decoded fields
@@ -395,6 +484,7 @@ def decode_rsc8(data, *, stream_id=None, deep=True):
         "anim_desc": None,
         "properties": None,
         "tracks": None,
+        "curves": None,
         "checks": checks,
         "valid": False,
     }
@@ -663,6 +753,15 @@ def decode_rsc8(data, *, stream_id=None, deep=True):
         checks.pop("tracks_sorted", None)
         checks.pop("tracks_schema_ok", None)
     out["valid"] = all(checks[k] for k in core_checks)
+    if curves:
+        # Keyframes are decoded only from a clip whose structure checks out, so a block whose sizes disagree
+        # or that runs into another block or the track directory is counted as an error, never decoded.
+        if not out["valid"] or not out["anim"] or not out["anim_desc"]:
+            out["curves"] = {"decoded": False, "error": "structural checks failed"}
+        elif _extents_overlap(out["anim"], out["anim_desc"]):
+            out["curves"] = {"decoded": False, "error": "block or track extents overlap"}
+        else:
+            out["curves"] = facial_curve_summary(virt, out["anim"], out["anim_desc"])
     return out
 
 
@@ -772,56 +871,57 @@ MAX_INDEXRUN_GROUPS = 1 << 20
 def decode_grid20_table(blob):
     """Structurally decode the undocumented ``0x5a`` companion table.
 
-    Measured on every one of the 1,185 ``audio.rpf`` streams that carry the tag: a u32
-    ``12345678`` marker, a u32 of unknown meaning, then ``N`` 20-byte entries::
+    Measured on every one of the 1,185 ``audio.rpf`` streams that carry the tag (ASSET-256, framing
+    from @kotorvr's finding in #3232): a u32 ``12345678`` marker, ``N`` 20-byte entries, then an f32
+    trailer, so ``size == 8 + 20 * N``::
 
-        +0  f32  value
-        +4  u16  p (a multiple of 32 on every measured entry)
-        +6  u16  z (0..16 measured)
-        +8  u16  index_lo, +10 u16  index_hi
-        +12 u16  s, +14 u16  t
-        +16 u32  counter (strictly increasing across the entries)
+        +0  u32  position (a sample position at the stream's rate: strictly increasing, below the
+                 stream's 0x76 sample count)
+        +4  f32  value (3.66..146.8; (position[k+1] - position[k]) * value[k] / rate is within 1% of 1
+                 on 365,803 of the 386,048 entry pairs, so it reads as a pitch in Hz)
+        +8  u16  p (a multiple of 512 on every measured entry), +10 u16  z (0..16 measured)
+        +12 u16  index_lo, +14 u16  index_hi
+        +16 u16  s, +18 u16  t
+    trailer: f32 (2/3 on 1,182 of the 1,185 streams), returned as ``tail_f32``
 
-    Nothing is guessed about the meaning of ``value``, ``s``, ``t`` or the counter's unit; the
-    return value carries the structural facts and the invariant checks only.
+    Nothing is guessed about ``p``, ``z``, ``s``, ``t`` or the trailer; the return value carries the
+    structural facts and the invariant checks only.
     """
     out = {
         "size_ok": False,
         "magic_ok": None,
-        "unknown": None,
         "entries": None,
-        "counter_first": None,
-        "counter_last": None,
-        "counter_increasing": None,
+        "position_first": None,
+        "position_last": None,
+        "position_increasing": None,
+        "tail_f32": None,
         "p_multiple_of_32": None,
     }
     raw = bytes(blob)
     if len(raw) < 8 or len(raw) > MAX_GRID20_BYTES or (len(raw) - 8) % 20:
         return out
     out["size_ok"] = True
-    magic, unknown = struct.unpack_from("<II", raw, 0)
+    magic, = struct.unpack_from("<I", raw, 0)
     out["magic_ok"] = magic == GRID20_MAGIC
-    out["unknown"] = unknown
     n = (len(raw) - 8) // 20
     out["entries"] = n
+    out["tail_f32"], = struct.unpack_from("<f", raw, len(raw) - 4)
     prev = None
-    first = None
     p_ok = True
     increasing = True
     for i in range(n):
-        at = 8 + 20 * i
-        p, _z = struct.unpack_from("<HH", raw, at + 4)
-        counter, = struct.unpack_from("<I", raw, at + 16)
+        at = 4 + 20 * i
+        position, = struct.unpack_from("<I", raw, at)
+        p, = struct.unpack_from("<H", raw, at + 8)
         if p % 32:
             p_ok = False
-        if first is None:
-            first = counter
-        elif counter <= prev:
+        if prev is None:
+            out["position_first"] = position
+        elif position <= prev:
             increasing = False
-        prev = counter
-    out["counter_first"] = first
-    out["counter_last"] = prev
-    out["counter_increasing"] = increasing
+        prev = position
+    out["position_last"] = prev
+    out["position_increasing"] = increasing
     out["p_multiple_of_32"] = p_ok
     return out
 
@@ -893,6 +993,304 @@ def decode_index_runs(blob, grid_entries=None):
     return out
 
 
+def decode_marker_records(blob, sample_count=None):
+    """Structurally decode a ``0xbd`` (``markers``) tag: a list of 16-byte cue records.
+
+    Measured on all 420,168 ``0xbd`` tags of ``audio.rpf`` (781,350 records): the size is always a
+    multiple of 16, there is no header, and every record is::
+
+        +0  u32  name    joaat of the cue name (167 distinct values)
+        +4  u32  value   an f32 for most names, a second name hash for region cues
+        +8  u32  offset  sample position in the stream; never decreases from one record to the next
+        +12 u32  extra   0..6 measured
+
+    ``name`` and ``value`` are returned as stored. With ``sample_count`` (the stream's ``0x76`` count),
+    ``offsets_within_samples`` says whether every offset is at most that count.
+    """
+    out = {
+        "size_ok": False,
+        "records": None,
+        "names": None,
+        "first_name": None,
+        "offsets_ascending": None,
+        "offset_max": None,
+        "offsets_within_samples": None,
+        "extra_max": None,
+    }
+    raw = bytes(blob)
+    if not raw or len(raw) % MARKER_RECORD_BYTES or len(raw) > MAX_MARKER_BYTES:
+        return out
+    out["size_ok"] = True
+    n = len(raw) // MARKER_RECORD_BYTES
+    names = {}
+    ascending = True
+    prev = None
+    offset_max = 0
+    extra_max = 0
+    for i in range(n):
+        name, _value, offset, extra = struct.unpack_from("<IIII", raw, MARKER_RECORD_BYTES * i)
+        names[name] = names.get(name, 0) + 1
+        if prev is not None and offset < prev:
+            ascending = False
+        prev = offset
+        offset_max = max(offset_max, offset)
+        extra_max = max(extra_max, extra)
+    out["records"] = n
+    out["names"] = names
+    out["first_name"] = _u32(raw, 0)
+    out["offsets_ascending"] = ascending
+    out["offset_max"] = offset_max
+    out["extra_max"] = extra_max
+    if sample_count is not None:
+        out["offsets_within_samples"] = offset_max <= sample_count
+    return out
+
+
+def marker_records(blob):
+    """The ``(name, value, offset, extra)`` u32 words of every whole 16-byte record of a ``0xbd`` tag."""
+    raw = bytes(blob)
+    return list(struct.iter_unpack("<IIII", raw[: len(raw) - len(raw) % MARKER_RECORD_BYTES]))
+
+
+def pair_marker_regions(records):
+    """Match the region cues of one ``0xbd`` tag into start/end pairs, record by record (ASSET-320).
+
+    `records` is `marker_records()` output. A region record is one whose ``value`` word is
+    `MARKER_VALUE_START` or `MARKER_VALUE_END`, and a name with at least one of them is a region name of
+    this tag. Each region name's records are walked in stored order, and a pair is a ``start`` whose
+    next record of the same name is an ``end`` at the same or a later offset. Every other record of a
+    region name is one exception:
+
+    - ``start_without_end``: the next record of the name is not an ``end``, or there is none;
+    - ``end_without_start``: the record of the name before it is not a ``start``, or there is none;
+    - ``end_before_start``: an ``end`` right after a ``start`` but at a smaller offset (the pair is refused
+      and the ``start`` is counted here, not as ``start_without_end``);
+    - ``other_value``: the name also has a record whose value is neither word; it opens and closes nothing.
+
+    So per name ``starts == pairs + start_without_end + end_before_start`` and
+    ``ends == pairs + end_without_start + end_before_start``. Two regions of one name therefore never
+    nest or overlap by construction; what would be a nested region shows up as a ``start_without_end``
+    followed by a ``start`` and an ``end_without_start`` preceded by an ``end``.
+
+    Returns ``{"regions": [...], "exceptions": [...], "names": {name: counts}}`` with a region as
+    ``{"name", "start", "end", "start_index", "end_index", "extra_differs"}`` (offsets in samples,
+    indices into `records`) and an exception as ``{"kind", "name", "value", "index", "offset",
+    "before", "before_offset", "after", "after_offset"}``, where ``before`` and ``after`` say what the
+    neighbouring records of the same name are (``"start"``, ``"end"``, ``"other"``, or ``None`` when
+    the record is the name's first or last of the tag) and the two offsets are theirs.
+    """
+    out = {"regions": [], "exceptions": [], "names": {}}
+    if not any(value in _REGION_VALUES for _name, value, _offset, _extra in records):
+        return out
+    by_name = {}
+    for index, (name, value, offset, extra) in enumerate(records):
+        by_name.setdefault(name, []).append((index, value, offset, extra))
+    for name, rows in by_name.items():
+        kinds = [_REGION_VALUES.get(value, "other") for _index, value, _offset, _extra in rows]
+        if "start" not in kinds and "end" not in kinds:
+            continue
+        counts = {"starts": 0, "ends": 0, "other_value": 0, "pairs": 0,
+                  "start_without_end": 0, "end_without_start": 0, "end_before_start": 0}
+
+        def refuse(kind, k):
+            index, value, offset, _extra = rows[k]
+            counts[kind] += 1
+            out["exceptions"].append({
+                "kind": kind, "name": name, "value": value, "index": index, "offset": offset,
+                "before": kinds[k - 1] if k else None,
+                "before_offset": rows[k - 1][2] if k else None,
+                "after": kinds[k + 1] if k + 1 < len(kinds) else None,
+                "after_offset": rows[k + 1][2] if k + 1 < len(kinds) else None,
+            })
+
+        opened = None  # position in `rows` of a start that no record has followed yet
+        for k, (index, _value, offset, extra) in enumerate(rows):
+            kind = kinds[k]
+            if kind != "end" and opened is not None:
+                refuse("start_without_end", opened)
+                opened = None
+            if kind == "start":
+                counts["starts"] += 1
+                opened = k
+            elif kind == "end":
+                counts["ends"] += 1
+                if opened is None:
+                    refuse("end_without_start", k)
+                elif offset < rows[opened][2]:
+                    refuse("end_before_start", k)
+                else:
+                    start_index, _v, start, start_extra = rows[opened]
+                    counts["pairs"] += 1
+                    out["regions"].append({
+                        "name": name, "start": start, "end": offset, "start_index": start_index,
+                        "end_index": index, "extra_differs": extra != start_extra,
+                    })
+                opened = None
+            else:
+                refuse("other_value", k)
+        if opened is not None:
+            refuse("start_without_end", opened)
+        out["names"][name] = counts
+    out["regions"].sort(key=lambda r: r["start_index"])
+    out["exceptions"].sort(key=lambda e: e["index"])
+    return out
+
+
+def marker_region_overlaps(regions):
+    """How the paired regions of different names in one tag lie against each other.
+
+    Returns ``{(name, other name): [nested, crossing]}`` with the smaller hash first, counting pairs of
+    regions that share at least one sample (``[start, end)``, so a zero-length region and two regions
+    that only touch share none). ``nested`` is one region inside the other (equal bounds included),
+    ``crossing`` is each one starting or ending inside the other. `regions` come from one
+    `pair_marker_regions()` call on a tag whose offsets never decrease, where regions of one name
+    cannot overlap, so at most one region per name is open at a time.
+    """
+    out = {}
+    active = []
+    for region in sorted(regions, key=lambda r: (r["start"], r["start_index"])):
+        if region["end"] <= region["start"]:
+            continue
+        active = [a for a in active if a["end"] > region["start"]]
+        for a in active:
+            if a["name"] == region["name"]:
+                continue
+            counts = out.setdefault((min(a["name"], region["name"]), max(a["name"], region["name"])), [0, 0])
+            nested = region["end"] <= a["end"] or region["start"] == a["start"]
+            counts[0 if nested else 1] += 1
+        active.append(region)
+    return out
+
+
+def _new_region_tally():
+    """Running totals of pair_marker_regions() over the tags of a scan; marker_region_report() finishes them."""
+    return {
+        "tags": 0,  # tags with at least one start/end record
+        "tags_all_paired": 0,  # ... and no exception
+        "tags_with_sample_count": 0,  # ... on a stream that has a 0x76 sample count
+        "pairs_per_tag": [],
+        "pairs_extra_differs": 0,
+        "overlaps": {},  # marker_region_overlaps(), added up
+        "names": {},  # name -> the counts of pair_marker_regions(), "tags" and the "lengths" of its pairs
+        "exceptions_total": 0,
+        "exceptions": [],  # the first MAX_REGION_EXCEPTIONS_LISTED in scan order
+    }
+
+
+def _tally_marker_regions(tally, records, *, bank_offset=0, stream_id=None, sample_count=None):
+    """Add one valid ``0xbd`` tag's region pairing to a `_new_region_tally()`."""
+    paired = pair_marker_regions(records)
+    if not paired["names"]:
+        return
+    tally["tags"] += 1
+    tally["tags_all_paired"] += not paired["exceptions"]
+    tally["tags_with_sample_count"] += sample_count is not None
+    tally["pairs_per_tag"].append(len(paired["regions"]))
+    for name, counts in paired["names"].items():
+        into = tally["names"].setdefault(name, {"tags": 0, "lengths": []})
+        into["tags"] += 1
+        for key, count in counts.items():
+            into[key] = into.get(key, 0) + count
+    for region in paired["regions"]:
+        tally["names"][region["name"]]["lengths"].append(region["end"] - region["start"])
+        tally["pairs_extra_differs"] += region["extra_differs"]
+    _add_region_overlaps(tally["overlaps"], marker_region_overlaps(paired["regions"]))
+    tally["exceptions_total"] += len(paired["exceptions"])
+    for exc in paired["exceptions"]:
+        if len(tally["exceptions"]) >= MAX_REGION_EXCEPTIONS_LISTED:
+            break
+        tally["exceptions"].append({
+            "kind": exc["kind"],
+            "name": f"0x{exc['name']:08x}",
+            "value": f"0x{exc['value']:08x}",
+            "before": exc["before"],
+            "before_offset": exc["before_offset"],
+            "after": exc["after"],
+            "after_offset": exc["after_offset"],
+            "record": exc["index"],
+            "tag_records": len(records),
+            "offset": exc["offset"],
+            "tag_last_offset": records[-1][2],
+            "stream_samples": sample_count,
+            "bank_offset": bank_offset,
+            "stream_id": None if stream_id is None else f"0x{stream_id:08x}",
+        })
+
+
+def _add_region_overlaps(dst, src):
+    for names, (nested, crossing) in src.items():
+        into = dst.setdefault(names, [0, 0])
+        into[0] += nested
+        into[1] += crossing
+
+
+def _merge_region_tally(dst, src):
+    for key, value in src.items():
+        if key == "overlaps":
+            _add_region_overlaps(dst[key], value)
+        elif key == "names":
+            for name, counts in value.items():
+                into = dst["names"].setdefault(name, {"tags": 0, "lengths": []})
+                for field, count in counts.items():
+                    if field == "lengths":
+                        into["lengths"].extend(count)
+                    else:
+                        into[field] = into.get(field, 0) + count
+        elif key == "exceptions":
+            dst[key].extend(value[: MAX_REGION_EXCEPTIONS_LISTED - len(dst[key])])
+        elif isinstance(value, list):
+            dst[key].extend(value)
+        else:
+            dst[key] += value
+
+
+def _min_median_max(values):
+    if not values:
+        return None
+    return {"min": min(values), "median": statistics.median(values), "max": max(values)}
+
+
+def marker_region_report(tally):
+    """The `marker_regions` block of a scan summary, from a `_new_region_tally()`: counts, sample
+    offsets and 32-bit hashes only.
+
+    ``names`` maps each region name (hex) to its ``starts``, ``ends``, ``pairs``, the four exception
+    counts of pair_marker_regions() and the ``length_samples`` (min/median/max) of its pairs.
+    ``overlaps_between_names`` counts pairs of paired regions of different names in one tag that share a
+    sample (marker_region_overlaps()), in all and per pair of names. ``exceptions`` lists the first
+    `MAX_REGION_EXCEPTIONS_LISTED` in scan order with where each one sits: its record index among the
+    tag's ``tag_records``, its offset, the tag's last offset, the stream's ``0x76`` sample count when it
+    has one, and what and where the neighbouring records of the same name are (``None``: it is the
+    name's first or last record of the tag). ``exceptions_total`` counts them all.
+    """
+    names = {}
+    for name, counts in sorted(tally["names"].items(), key=lambda kv: (-kv[1]["starts"] - kv[1]["ends"], kv[0])):
+        row = {key: value for key, value in counts.items() if key != "lengths"}
+        row["length_samples"] = _min_median_max(counts["lengths"])
+        names[f"0x{name:08x}"] = row
+    return {
+        "tags": tally["tags"],
+        "tags_all_paired": tally["tags_all_paired"],
+        "tags_with_sample_count": tally["tags_with_sample_count"],
+        "starts": sum(c["starts"] for c in tally["names"].values()),
+        "ends": sum(c["ends"] for c in tally["names"].values()),
+        "pairs": sum(c["pairs"] for c in tally["names"].values()),
+        "pairs_per_tag": _min_median_max(tally["pairs_per_tag"]),
+        "pairs_extra_differs": tally["pairs_extra_differs"],
+        "overlaps_between_names": {
+            "nested": sum(n for n, _c in tally["overlaps"].values()),
+            "crossing": sum(c for _n, c in tally["overlaps"].values()),
+            "by_names": {
+                f"0x{a:08x}+0x{b:08x}": {"nested": n, "crossing": c}
+                for (a, b), (n, c) in sorted(tally["overlaps"].items())
+            },
+        },
+        "names": names,
+        "exceptions_total": tally["exceptions_total"],
+        "exceptions": list(tally["exceptions"]),
+    }
+
+
 def _decode_companion_tags(read_slice, bank_offset, tag_map):
     """Decode companion speech tags (`0x76`, `0x55`, `0x36`, `0x5a`, `0xa3`, `0xb2`, `0xbd`, `0xd9`) on a stream."""
     comp = {
@@ -906,7 +1304,7 @@ def _decode_companion_tags(read_slice, bank_offset, tag_map):
         "peak_entries": tag_map[TAG_PEAK][0][1] // 2 if TAG_PEAK in tag_map else 0,
         "seek_entries": tag_map[TAG_SEEKTABLE][0][1] // 4 if TAG_SEEKTABLE in tag_map else 0,
         "loudness_entries": tag_map[TAG_LOUDNESS][0][1] // 8 if TAG_LOUDNESS in tag_map else 0,
-        "marker_magic": None,
+        "markers": None,
     }
     if TAG_FORMAT in tag_map:
         fo, fs = tag_map[TAG_FORMAT][0]
@@ -925,10 +1323,8 @@ def _decode_companion_tags(read_slice, bank_offset, tag_map):
                     comp["audio_duration"] = round(samples / float(sr), 6)
     if TAG_MARKER in tag_map:
         mo, ms = tag_map[TAG_MARKER][0]
-        if ms >= 16:
-            mb = read_slice(bank_offset + mo, 16)
-            if len(mb) >= 16:
-                comp["marker_magic"] = _u32(mb, 0)
+        if 0 < ms <= MAX_MARKER_BYTES:
+            comp["markers"] = decode_marker_records(read_slice(bank_offset + mo, ms), comp["audio_samples"])
     grid = None
     if TAG_GRID20 in tag_map:
         go, gs = tag_map[TAG_GRID20][0]
@@ -974,6 +1370,7 @@ def _make_record(bank_offset, tag_offset, stream_id, decoded, comp):
         "track_count": tracks.get("count"),
         "track_types": tracks.get("type_counts") or {},
         "prop_count": props.get("count"),
+        "curves": decoded.get("curves"),
         "valid": decoded["valid"],
         "checks": decoded["checks"],
     }
@@ -984,18 +1381,41 @@ def _new_grid_tally():
         "grid20_streams": 0,
         "grid20_entries": 0,
         "grid20_invalid": 0,
+        # Streams with a 0x76 sample count whose last position is not below it (0 over audio.rpf, ASSET-256).
+        "grid20_position_past_samples": 0,
         "indexrun_streams": 0,
         "indexrun_groups": 0,
         "indexrun_invalid": 0,
         "indexrun_index_overruns": 0,
+        "marker_streams": 0,
+        "marker_records": 0,
+        "marker_invalid": 0,
+        "marker_first_names": {},
+        # Region cues matched into start/end pairs (ASSET-320). A running `_new_region_tally()` while banks are
+        # read and in decode_awc_bank()'s result; a scan's summary carries marker_region_report() of it.
+        "marker_regions": _new_region_tally(),
     }
 
 
-def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
-    """Decode the undocumented ``0x5a``/``0xd9`` tags on one stream into a running tally.
+def _merge_grid_tally(dst, src):
+    """Add one bank's companion-table tally to a running summary (counts add, per-name maps merge)."""
+    for key, start in _new_grid_tally().items():
+        if key == "marker_regions":
+            _merge_region_tally(dst[key], src[key])
+        elif isinstance(start, dict):
+            for name, count in src[key].items():
+                dst[key][name] = dst[key].get(name, 0) + count
+        else:
+            dst[key] += src[key]
+
+
+def _tally_undocumented_tables(read_slice, bank_base, tmap, tally, stream_id=None):
+    """Decode the ``0x5a``/``0xd9`` tables and the ``0xbd`` cue list on one stream into a running tally.
 
     A stream counts as invalid when one of the layout invariants measured over the whole ``audio.rpf``
-    population fails, so the tally doubles as a package-wide validator.
+    population fails, so the tally doubles as a package-wide validator. The region cues of a valid
+    ``0xbd`` tag are matched into start/end pairs (`marker_regions`); `stream_id` only labels the
+    exceptions listed there.
     """
     grid = None
     if TAG_GRID20 in tmap:
@@ -1006,12 +1426,17 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
         if grid is None or not (
             grid["size_ok"]
             and grid["magic_ok"]
-            and grid["counter_increasing"]
+            and grid["position_increasing"]
             and grid["p_multiple_of_32"]
         ):
             tally["grid20_invalid"] += 1
         elif grid["entries"]:
             tally["grid20_entries"] += grid["entries"]
+            if TAG_FORMAT in tmap and grid["position_last"] is not None:
+                fo, fs = tmap[TAG_FORMAT][0]
+                fb = read_slice(bank_base + fo, 4) if fs >= 4 else b""
+                if len(fb) == 4 and grid["position_last"] >= _u32(fb, 0):
+                    tally["grid20_position_past_samples"] += 1
     if TAG_INDEXRUN in tmap:
         io, isz = tmap[TAG_INDEXRUN][0]
         runs = None
@@ -1033,9 +1458,32 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
             tally["indexrun_groups"] += runs["groups"]
             if runs["indices_within_grid"] is False:
                 tally["indexrun_index_overruns"] += 1
+    if TAG_MARKER in tmap:
+        mo, ms = tmap[TAG_MARKER][0]
+        marks = blob = None
+        if 0 < ms <= MAX_MARKER_BYTES:
+            blob = read_slice(bank_base + mo, ms)
+            marks = decode_marker_records(blob)
+        tally["marker_streams"] += 1
+        if marks is None or not (marks["size_ok"] and marks["offsets_ascending"]):
+            tally["marker_invalid"] += 1
+        else:
+            tally["marker_records"] += marks["records"]
+            key = f"0x{marks['first_name']:08x}"
+            firsts = tally["marker_first_names"]
+            firsts[key] = firsts.get(key, 0) + 1
+            records = marker_records(blob)
+            if any(value in _REGION_VALUES for _name, value, _offset, _extra in records):
+                samples = None
+                if TAG_FORMAT in tmap:
+                    fo, fs = tmap[TAG_FORMAT][0]
+                    fb = read_slice(bank_base + fo, 4) if fs >= 4 else b""
+                    samples = _u32(fb, 0) if len(fb) == 4 else None
+                _tally_marker_regions(tally["marker_regions"], records, bank_offset=bank_base,
+                                      stream_id=stream_id, sample_count=samples)
 
 
-def decode_awc_bank(data, bank_offset=0, *, deep=True):
+def decode_awc_bank(data, bank_offset=0, *, deep=True, curves=False):
     """Decode all `0x5c` (`RSC8` v8001) entries in one in-memory AWC (`ADAT`) bank."""
     bank = parse_adat_header_bytes(data, 0, len(data))
     if bank is None:
@@ -1054,7 +1502,7 @@ def decode_awc_bank(data, bank_offset=0, *, deep=True):
             key = f"0x{tt:02x}"
             tag_counts[key] = tag_counts.get(key, 0) + 1
             tmap.setdefault(tt, []).append((toff, tsz))
-        _tally_undocumented_tables(read_slice, 0, tmap, tally)
+        _tally_undocumented_tables(read_slice, 0, tmap, tally, sid)
         for tt, toff, tsz in tags:
             if tt == TAG_RSC8_CLIP:
                 if tsz < 4 or tsz > MAX_RSC8_BYTES:
@@ -1064,7 +1512,7 @@ def decode_awc_bank(data, bank_offset=0, *, deep=True):
                 if len(blob) < 4 or blob[:4] != RSC8_MAGIC:
                     non_rsc8_0x5c += 1
                     continue
-                dec = decode_rsc8(blob, stream_id=sid, deep=deep)
+                dec = decode_rsc8(blob, stream_id=sid, deep=deep, curves=curves)
                 comp = _decode_companion_tags(read_slice, 0, tmap)
                 records.append(_make_record(bank_offset, bank_offset + toff, sid, dec, comp))
 
@@ -1119,7 +1567,22 @@ def _new_summary(mode, source):
         "max_tag_size": None,
         "elapsed_seconds": 0.0,
         **_new_grid_tally(),
+        "curve_clips": 0,
+        "curve_clips_decoded": 0,
+        "curve_errors": {},
+        "curve_frames_mismatch": 0,
+        "curve_quantize_bits_mismatch": 0,
+        "curve_channels": {},
+        "curve_components": {},
+        "curve_delta2_boundaries": 0,
+        "curve_delta2_boundaries_closed": 0,
     }
+
+
+def _finish_summary(summary, t0):
+    """Close a scan's summary: the running region tally becomes its report, and the clock stops."""
+    summary["marker_regions"] = marker_region_report(summary["marker_regions"])
+    summary["elapsed_seconds"] = round(time.time() - t0, 3)
 
 
 def _accumulate_record(summary, rec, *, in_adat=True, has_audio=None):
@@ -1186,6 +1649,22 @@ def _accumulate_record(summary, rec, *, in_adat=True, has_audio=None):
         ck = f"codec={rec['audio_codec']},ch={rec['audio_channels']},sr={rec['audio_sample_rate']}"
         summary["audio_codecs"][ck] = summary["audio_codecs"].get(ck, 0) + 1
 
+    cv = rec.get("curves")
+    if cv is not None:
+        summary["curve_clips"] += 1
+        if not cv["decoded"]:
+            summary["curve_errors"][cv["error"]] = summary["curve_errors"].get(cv["error"], 0) + 1
+        else:
+            summary["curve_clips_decoded"] += 1
+            summary["curve_frames_mismatch"] += not cv["frames_match"]
+            summary["curve_quantize_bits_mismatch"] += not cv["quantize_bits_match"]
+            summary["curve_delta2_boundaries"] += cv["delta2_boundaries"]
+            summary["curve_delta2_boundaries_closed"] += cv["delta2_boundaries_closed"]
+            for key in ("channels", "components"):
+                into = summary["curve_" + key]
+                for name, n in cv[key].items():
+                    into[name] = into.get(name, 0) + n
+
 
 def _bank_covering(fh, start, file_size):
     """The `ADAT` bank that starts before `start` and runs past it, or `None`.
@@ -1209,7 +1688,8 @@ def _bank_covering(fh, start, file_size):
     return None
 
 
-def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None):
+def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None,
+             curves=False):
     """Scan an RPF9 archive sequentially for `ADAT` banks and `RSC8` v8001 resources.
 
     With a window (`start`/`limit`), `adat_bytes` counts the window's bytes that belong to a bank, so it never
@@ -1242,7 +1722,7 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                 adat_ranges.append((earlier["offset"], earlier["end"]))
 
         pos = start
-        next_prog = start + 2 * 1024 * 1024 * 1024
+        next_prog = start + PROGRESS_BYTES
         while pos < scan_end:
             f.seek(pos)
             buf = f.read(min(SCAN_CHUNK_BYTES + 16, scan_end - pos))
@@ -1297,7 +1777,7 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                         tk = f"0x{tt:02x}"
                         summary["adat_tag_counts"][tk] = summary["adat_tag_counts"].get(tk, 0) + 1
                         tmap.setdefault(tt, []).append((toff, tsz))
-                    _tally_undocumented_tables(bank_read_slice, aoff, tmap, summary)
+                    _tally_undocumented_tables(bank_read_slice, aoff, tmap, summary, sid)
                     if not has_5c:
                         continue
                     for tt, toff, tsz in tags:
@@ -1310,7 +1790,7 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                                 summary["rsc8_non_rsc8_0x5c"] += 1
                                 continue
                             blob = bank_read_slice(aoff + toff, tsz)
-                            dec = decode_rsc8(blob, stream_id=sid, deep=deep)
+                            dec = decode_rsc8(blob, stream_id=sid, deep=deep, curves=curves)
                             comp = _decode_companion_tags(bank_read_slice, aoff, tmap)
                             rec = _make_record(aoff, aoff + toff, sid, dec, comp)
                             _accumulate_record(summary, rec, in_adat=True, has_audio=comp["has_audio_data"])
@@ -1354,13 +1834,13 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                 break
             if progress and pos >= next_prog:
                 progress(pos, scan_end, summary)
-                next_prog += 2 * 1024 * 1024 * 1024
+                next_prog += PROGRESS_BYTES
 
-    summary["elapsed_seconds"] = round(time.time() - t0, 3)
+    _finish_summary(summary, t0)
     return records, summary
 
 
-def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
+def scan_dir(path, *, max_banks=None, deep=True, collect_records=True, curves=False):
     """Scan a directory of `.awc` banks and/or standalone `.rsc8` files."""
     t0 = time.time()
     summary = _new_summary("directory", path)
@@ -1388,15 +1868,14 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
                     raise ValueError(f"AWC bank exceeds {MAX_AWC_FILE_BYTES} bytes")
                 with open(fp, "rb") as f:
                     raw = f.read()
-                bank_res = decode_awc_bank(raw, 0, deep=deep)
+                bank_res = decode_awc_bank(raw, 0, deep=deep, curves=curves)
                 summary["adat_banks"] += 1
                 summary["adat_streams"] += bank_res["stream_count"]
                 summary["adat_bytes"] += bank_res["bank_size"]
                 summary["rsc8_non_rsc8_0x5c"] += bank_res["non_rsc8_0x5c"]
                 for tk, tv in bank_res["tag_counts"].items():
                     summary["adat_tag_counts"][tk] = summary["adat_tag_counts"].get(tk, 0) + tv
-                for gk in _new_grid_tally():
-                    summary[gk] += bank_res[gk]
+                _merge_grid_tally(summary, bank_res)
                 for rec in bank_res["records"]:
                     _accumulate_record(summary, rec, in_adat=True, has_audio=rec.get("has_audio_data"))
                     if collect_records:
@@ -1406,7 +1885,7 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
                     raise ValueError(f"RSC8 file exceeds {MAX_RSC8_BYTES} bytes")
                 with open(fp, "rb") as f:
                     raw = f.read()
-                dec = decode_rsc8(raw, deep=deep)
+                dec = decode_rsc8(raw, deep=deep, curves=curves)
                 rec = _make_record(0, 0, None, dec, None)
                 _accumulate_record(summary, rec, in_adat=False, has_audio=None)
                 if collect_records:
@@ -1417,11 +1896,12 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
             summary["invalid_files"] += 1
             print(f"{fp}: {e}", file=sys.stderr)
 
-    summary["elapsed_seconds"] = round(time.time() - t0, 3)
+    _finish_summary(summary, t0)
     return records, summary
 
 
-def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None):
+def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None,
+                     curves=False):
     """Inspect a single `.rsc8`, `.awc`, or `.rpf` file."""
     fsize = os.path.getsize(path)
     with open(path, "rb") as f:
@@ -1432,28 +1912,27 @@ def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, co
         t0 = time.time()
         with open(path, "rb") as f:
             raw = f.read()
-        dec = decode_rsc8(raw, deep=deep)
+        dec = decode_rsc8(raw, deep=deep, curves=curves)
         rec = _make_record(0, 0, None, dec, None)
         summary = _new_summary("rsc8", path)
         _accumulate_record(summary, rec, in_adat=False, has_audio=None)
-        summary["elapsed_seconds"] = round(time.time() - t0, 3)
+        _finish_summary(summary, t0)
         return ([rec] if collect_records else []), summary
     if head == ADAT_MAGIC and start == 0 and limit is None and fsize <= MAX_AWC_FILE_BYTES:
         t0 = time.time()
         with open(path, "rb") as f:
             raw = f.read()
-        bank_res = decode_awc_bank(raw, 0, deep=deep)
+        bank_res = decode_awc_bank(raw, 0, deep=deep, curves=curves)
         summary = _new_summary("awc", path)
         summary["adat_banks"] = 1
         summary["adat_streams"] = bank_res["stream_count"]
-        for gk in _new_grid_tally():
-            summary[gk] += bank_res[gk]
+        _merge_grid_tally(summary, bank_res)
         summary["adat_bytes"] = bank_res["bank_size"]
         summary["adat_tag_counts"] = bank_res["tag_counts"]
         summary["rsc8_non_rsc8_0x5c"] = bank_res["non_rsc8_0x5c"]
         for rec in bank_res["records"]:
             _accumulate_record(summary, rec, in_adat=True, has_audio=rec.get("has_audio_data"))
-        summary["elapsed_seconds"] = round(time.time() - t0, 3)
+        _finish_summary(summary, t0)
         return (bank_res["records"] if collect_records else []), summary
     return scan_rpf(
         path,
@@ -1463,6 +1942,7 @@ def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, co
         deep=deep,
         collect_records=collect_records,
         progress=progress,
+        curves=curves,
     )
 
 
@@ -1549,8 +2029,10 @@ def main(argv=None):
     ap.add_argument("--limit", type=_parse_pos_int, default=None, help="maximum bytes to scan (single archive only)")
     ap.add_argument("--max-banks", type=_parse_pos_int, default=None, help="stop after N ADAT banks")
     ap.add_argument("--no-deep", action="store_true", help="skip per-track and property-attribute walks")
+    ap.add_argument("--curves", action="store_true",
+                    help="also decode every clip's keyframes and count the outcome (slower; counts only)")
     ap.add_argument("--summary-only", action="store_true", help="do not store per-clip records in memory/JSON")
-    ap.add_argument("--quiet", action="store_true", help="suppress progress output")
+    ap.add_argument("--quiet", action="store_true", help="suppress progress on stderr; stdout contains the JSON summary")
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.source):
@@ -1575,6 +2057,7 @@ def main(argv=None):
                 max_banks=args.max_banks,
                 deep=not args.no_deep,
                 collect_records=collect,
+                curves=args.curves,
             )
         except (OSError, ValueError) as e:
             print(f"{args.source}: {e}", file=sys.stderr)
@@ -1585,7 +2068,7 @@ def main(argv=None):
                 print(
                     f"[{min(pos, end) / max(1, end):6.1%}] banks={s['adat_banks']} "
                     f"rsc8={s['rsc8_in_adat']} valid={s['rsc8_valid']} outside={s['rsc8_outside_adat']}",
-                    flush=True,
+                    file=sys.stderr, flush=True,
                 )
         try:
             records, summary = scan_single_file(
@@ -1596,6 +2079,7 @@ def main(argv=None):
                 deep=not args.no_deep,
                 collect_records=collect,
                 progress=progress,
+                curves=args.curves,
             )
         except (OSError, ValueError) as e:
             print(f"{args.source}: {e}", file=sys.stderr)

@@ -2,12 +2,16 @@
 
     python -I tests/test_shader_ir.py
 """
+import contextlib
+import errno
 import importlib.util
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -153,6 +157,22 @@ class OperandTests(unittest.TestCase):
     def test_unknown_operand_falls_back_to_raw(self):
         self.assertEqual(shader_ir.operand("weirdthing"), {"k": "raw", "t": "weirdthing"})
 
+    def test_llvm23_lit_is_the_constant(self):
+        # LLVM 23 prints lit(V) for a literal it could also show as an inline constant (v_fma_mix* sources).
+        for text, plain in (("lit(0x42200000)", "0x42200000"), ("|lit(0x3f800000)|", "|0x3f800000|"),
+                            ("neg(lit(0x3f800000))", "neg(0x3f800000)"), ("-lit(0x3f800000)", "neg(0x3f800000)")):
+            with self.subTest(text=text):
+                self.assertEqual(shader_ir.operand(text), shader_ir.operand(plain))
+
+    def test_llvm23_lit_of_a_register_is_not_unwrapped(self):
+        # lit() wraps a constant; a register inside it is not a literal and must not parse as the register (or as a
+        # constant): it keeps the lit(...) text, which the translator refuses as before lit() was read.
+        for text in ("lit(v2)", "lit(s4)", "-lit(v2)", "lit(vcc_lo)"):
+            with self.subTest(text=text):
+                op = shader_ir.operand(text)
+                self.assertNotIn(op["k"], ("vgpr", "sgpr", "imm", "fimm"))
+                self.assertIn("lit(", op.get("t", ""))
+
 
 class SplitArgsTests(unittest.TestCase):
     def test_commas_inside_parentheses_stay_together(self):
@@ -212,6 +232,26 @@ class ParseLineTests(unittest.TestCase):
             ["quad_perm:[1,0,3,2]", "row_mask:0xf", "bank_mask:0xf"],
         )
         self.assertEqual(len(ins["args"]), 2)
+
+    def test_ds_swizzle_offset_modifier_with_spaces_stays_intact(self):
+        for mod in (
+            "offset:swizzle(QUAD_PERM, 3, 2, 1, 0)",
+            'offset:swizzle(BITMASK_PERM, "00p01")',
+            "offset:swizzle(BROADCAST, 4, 0)",
+            "offset:swizzle(SWAP, 1)",
+            "offset:swizzle(REVERSE, 4)",
+        ):
+            with self.subTest(mod=mod):
+                ins = shader_ir.parse_line(f"\tds_swizzle_b32 v0, v1 {mod} gds")
+                self.assertEqual(ins["op"], "ds_swizzle_b32")
+                self.assertEqual(ins["mods"], [mod, "gds"])
+                self.assertEqual(
+                    ins["args"],
+                    [
+                        {"k": "vgpr", "r": 0, "n": 1, "neg": False, "abs": False},
+                        {"k": "vgpr", "r": 1, "n": 1, "neg": False, "abs": False},
+                    ],
+                )
 
     def test_exp_target_is_split_from_its_operands(self):
         ins = shader_ir.parse_line("\texp mrt0 v0, v1, v2, v3")
@@ -296,6 +336,33 @@ class CliInputTest(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "shader_ir.py"), *args],
                               capture_output=True, text=True, timeout=60)
+
+    def test_census_reports_input_io_errors_without_a_partial_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "first.s")
+            second = os.path.join(tmp, "second.s")
+            for path in (first, second):
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\ts_endpgm\n")
+            parse_file = shader_ir.parse_file
+
+            def fail_second(path):
+                if path == second:
+                    raise PermissionError(errno.EACCES, "permission denied", second)
+                return parse_file(path)
+
+            for owner, attr, effect, path, diagnostic in (
+                    (shader_ir.os, "scandir", OSError(errno.EIO, "I/O error", tmp), tmp, "cannot list"),
+                    (shader_ir, "parse_file", fail_second, second, "cannot read")):
+                with self.subTest(operation=attr):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with mock.patch.object(owner, attr, side_effect=effect), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        self.assertEqual(shader_ir.main([tmp]), 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(len(stderr.getvalue().strip().splitlines()), 1)
+                    self.assertIn(diagnostic, stderr.getvalue())
+                    self.assertIn(path, stderr.getvalue())
 
     def test_bad_arguments_are_usage_errors(self):
         with tempfile.TemporaryDirectory() as tmp:

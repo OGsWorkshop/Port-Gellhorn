@@ -184,6 +184,24 @@ class TestBoxes(unittest.TestCase):
         self.assertEqual(R.half_to_float(R.half_up(1e-6)), 2 ** -14)
 
 
+class TestParentTableBounds(unittest.TestCase):
+    def test_console_offset_to_parents_zero_keeps_the_header(self):
+        # a console structure keeps offsetToParents at 0, where a node in unit 0 or 4 puts its entry over the
+        # header's flags word; only the entries from the header end on are stored (docs/bvh.md 3.1)
+        src, _, _ = build([(0, 0x01, 0, None, 0x09)], flags=BLAS_DEHYDRATED | R.FLAG_UPDATABLE)
+        src = bytearray(src)
+        struct.pack_into("<I", src, 56, 0)        # offsetToParents
+        out = R.rehydrate(bytes(src), [QUADS])
+        kept_flags = (BLAS_DEHYDRATED | R.FLAG_UPDATABLE) & ~R.FLAG_DEHYDRATED
+        self.assertEqual(struct.unpack_from("<I", out, 0)[0], kept_flags)
+        self.assertEqual(struct.unpack_from("<I", out, 16)[0], 0)
+
+    def test_stored_parent_entry_ends_at_offset_to_elements(self):
+        hdr = R.Header(header(0x300, 1, (0, 0, 0, 1, 1, 1), 0x200, ptr(0x200, R.BOX32), 0x100, 0x40))
+        self.assertEqual(hdr.stored_parent_entry(0x200, 0x300), 0x40 + 16)     # unit 4 is inside the table
+        self.assertIsNone(hdr.stored_parent_entry(0x100 + 64 * 48, 0x300))     # entry == offsetToElements
+
+
 class TestLeafFrame(unittest.TestCase):
     def test_scale_and_translation(self):
         # scale bytes 0x80, 0x81, 0x7f -> 2, 4, 1; translation on: x bounds [10, 12] -> centre 11, y and z straddle 0
@@ -236,6 +254,34 @@ class TestErrorsAndCli(unittest.TestCase):
                 self.assertEqual(R.main([paths["in.bin"], "--out", paths["out.bin"]]), 2)
                 self.assertEqual(R.main([paths["in.bin"], "--geom", paths["vb.bin"], "--out", paths["out.bin"],
                                          "--transform", "1,2,3"]), 2)
+
+    def test_out_must_not_overwrite_an_input(self):
+        src, _, _ = build([(0, 0x01, 0, None, 0x09), (0, 0x81, 0, 1, 0x09)])
+        with tempfile.TemporaryDirectory() as d:
+            paths = {k: os.path.join(d, k) for k in ("in.bin", "vb.bin", "ib.bin", "out.bin", "ref.bin")}
+            for k, data in (("in.bin", src), ("vb.bin", QUADS.vertices), ("ib.bin", QUADS.indices),
+                            ("ref.bin", R.rehydrate(src, [QUADS]))):
+                with open(paths[k], "wb") as f:
+                    f.write(data)
+            originals = {k: open(paths[k], "rb").read() for k in ("in.bin", "vb.bin", "ib.bin", "ref.bin")}
+            geo = paths["vb.bin"] + "," + paths["ib.bin"]
+            for argv, victim in (
+                    ([paths["in.bin"], "--geom", geo, "--out", paths["in.bin"]], "in.bin"),
+                    ([paths["in.bin"], "--geom", geo, "--out", paths["vb.bin"]], "vb.bin"),
+                    ([paths["in.bin"], "--geom", geo, "--out", paths["ref.bin"], "--compare", paths["ref.bin"]],
+                     "ref.bin")):
+                with self.subTest(victim=victim), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(R.main(argv), 2)
+                with open(paths[victim], "rb") as f:
+                    self.assertEqual(f.read(), originals[victim], victim)
+            alt = os.path.join(d, "IN.BIN")
+            if os.path.exists(alt):     # case-insensitive volume: IN.BIN is in.bin, so it must refuse
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(R.main([paths["in.bin"], "--geom", geo, "--out", alt]), 2)
+            text = io.StringIO()
+            with contextlib.redirect_stdout(text):
+                self.assertEqual(R.main([paths["in.bin"], "--geom", geo, "--out", paths["out.bin"]]), 0)
+            self.assertIn("rehydrated", text.getvalue())
 
 
 if __name__ == "__main__":

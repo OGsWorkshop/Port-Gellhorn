@@ -4,6 +4,7 @@
 
 Zero game data: all tests use deterministic, synthetic byte sequences constructed in-memory.
 """
+import errno
 import io
 import json
 import os
@@ -230,7 +231,7 @@ class TestDuplicateXdatPayloads(unittest.TestCase):
             with open(os.path.join(tmp, "dup.dxbc"), "wb") as f:
                 f.write(dxbc)
             p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--payload", "first"],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 0, p.stderr)
             with open(os.path.join(tmp, "fssm", "dup.fssm"), "rb") as f:
                 self.assertEqual(f.read(), first)
@@ -458,11 +459,44 @@ class TestCrcAndChecksumBounds(unittest.TestCase):
             fssm_unpack.unpack(dxbc)
 
 
+class TestMainBadOutput(unittest.TestCase):
+    def test_file_at_output_directory_is_preserved(self):
+        with tempfile.TemporaryDirectory() as src:
+            out = os.path.join(src, "fssm")
+            with open(out, "wb") as f:
+                f.write(b"keep me")
+
+            res = subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True, errors="replace")
+
+            self.assertEqual(res.returncode, 2)
+            self.assertEqual(res.stdout, "")
+            self.assertEqual(len(res.stderr.splitlines()), 1, res.stderr)
+            self.assertIn(f"cannot create output directory {out}", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertEqual(os.listdir(src), ["fssm"])
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"keep me")
+
+    def test_output_directory_creation_errors_name_the_path(self):
+        with tempfile.TemporaryDirectory() as src:
+            out = os.path.join(src, "fssm")
+            for error in (PermissionError(errno.EACCES, "Permission denied"),
+                          OSError(errno.ENOSPC, "No space left on device")):
+                with self.subTest(error=error), mock.patch.object(fssm_unpack.os, "makedirs",
+                                                                 side_effect=error) as mkdir, \
+                        mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
+                    self.assertEqual(fssm_unpack.main([src]), 2)
+                    mkdir.assert_called_once_with(out, exist_ok=True)
+                    self.assertEqual(stderr.getvalue().splitlines(),
+                                     [f"ERROR: cannot create output directory {out}: {error.strerror}"])
+                    self.assertEqual(os.listdir(src), [])
+
+
 class TestMainBadSource(unittest.TestCase):
     """A source that is missing, a file, or unlistable is one line on stderr, exit 2, and nothing is created."""
 
     def run_tool(self, src):
-        return subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True, errors="replace")
 
     def test_missing_source_is_not_created(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -497,6 +531,23 @@ class TestMainBadSource(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "fssm")))
 
 
+    def test_unreadable_shader_leaves_completion_index_unchanged(self):
+        with tempfile.TemporaryDirectory() as src:
+            shader = os.path.join(src, "input.dxbc")
+            index = os.path.join(src, "fssm_index.json")
+            with open(shader, "wb") as f:
+                f.write(b"synthetic")
+            with open(index, "wb") as f:
+                f.write(b"previous index")
+            error = PermissionError(errno.EACCES, "input is locked", shader)
+            with mock.patch.object(fssm_unpack, "open", create=True, side_effect=error), \
+                    mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
+                self.assertEqual(fssm_unpack.main([src]), 2)
+            self.assertEqual(stderr.getvalue().splitlines(), [f"ERROR: cannot read {shader}: input is locked"])
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), b"previous index")
+
+
 class TestMainDirectoryProcessing(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -514,7 +565,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         with open(index, "w", encoding="utf-8") as f:
             json.dump([{"file": "current.dxbc"}], f)
         result = subprocess.run([sys.executable, "-I", TOOL, self.src, "--carve-index", index],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, errors="replace")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(os.listdir(os.path.join(self.src, "fssm")), ["current.fssm"])
         self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.dxbc")))
@@ -527,7 +578,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
             f.write(bad_dxbc)
 
         cmd = [sys.executable, "-I", TOOL, self.src]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
         self.assertEqual(res.returncode, 1, res.stdout)
         self.assertIn("'ValueError': 1", res.stdout)
         self.assertIn("no shader in", res.stderr)
@@ -539,7 +590,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         with open(os.path.join(self.src, "good.dxbc"), "wb") as f:
             f.write(good_dxbc)
 
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("'ValueError': 1", res.stdout)
         self.assertEqual(os.listdir(fssm_dir), ["good.fssm"])
@@ -573,7 +624,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
             f.write("not a dxbc container")
         os.mkdir(os.path.join(self.src, "cache.dxbc"))
 
-        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True, errors="replace")
         self.assertEqual(res.returncode, 0, res.stderr)
 
         self.assertIn("2 FSSM blobs", res.stdout)
@@ -624,7 +675,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         with open(sentinel, "w") as f:
             f.write("keep-me")
 
-        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True, errors="replace")
         self.assertEqual(res.returncode, 0, res.stderr)
 
         with open(sentinel, encoding="utf-8") as f:

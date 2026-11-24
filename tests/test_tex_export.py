@@ -8,6 +8,8 @@ import json
 import os
 import struct
 import sys
+from collections.abc import Callable
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 
@@ -156,6 +158,25 @@ def test_dds_header_is_a_dx10_texture2d():
 
 # ---- export_one ----
 
+def test_r16_export_scores_words_across_a_byte_boundary(eq: Callable[[int], None], tmp_path: Path) -> None:
+    carve = tmp_path / "carve"
+    out = tmp_path / "out"
+    eq(2)
+    offsets, _, _ = T.detile_offsets(2, 4, 4)
+    top = np.tile(np.arange(254, 258, dtype="<u2"), 4)
+    # The smaller mip's tile also contains padding. As a 4x4 candidate, its
+    # alternating word values look smoother when the high byte is scored separately.
+    lower_and_padding = np.tile(np.array([0xFF00, 0xFF05], dtype="<u2"), 8)
+    data = b"".join(tile(values.view(np.uint8).reshape(-1, 2), offsets, 4096)
+                    for values in (lower_and_padding, top))
+    write_blob(carve, "x.rpf", 0x1000, data)
+    record = texture(56, "R16_UNORM", 4, 4, 2)
+
+    assert T.export_one(record, carve, out, {}) == "ok:last"
+    dds = (out / "x.rpf" / record["export"]["file"]).read_bytes()
+    assert dds[148:] == top.tobytes()
+
+
 def build_case(eq, tmp_path, fmt, top_first):
     """A 64x64 texture with two mips: a smooth top mip and a noise mip, in either order in the GPU blob."""
     bpe, blk = T.FMT[fmt]
@@ -270,6 +291,26 @@ def test_blob_cache_is_reused_for_the_same_blob(eq, tmp_path):
     os.remove(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"))  # a second read would fail
     t2 = texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2)
     assert T.export_one(t2, carve, str(tmp_path / "out"), cache) == "ok:first"
+
+
+def test_blob_cache_distinguishes_different_gpu_chains_at_same_offset(eq, tmp_path):
+    carve, expected = build_case(eq, tmp_path, 10, top_first=True)
+    with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
+        blob = f.read()
+    os.remove(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"))
+    cut = 12345
+    write_blob(carve, "x.rpf", 0x1000, blob[:cut])
+    write_blob(carve, "x.rpf", 0x9000, blob[cut:])
+    cache = {}
+    out = str(tmp_path / "out")
+    short = texture(10, "R16G16B16A16_FLOAT", 16, 16, mips=1, gpu=0x1000, gpu_size=cut)
+    assert T.export_one(short, carve, out, cache) == "ok:first"
+    chained = texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2, q_index=4,
+                      gpu=0x1000, gpu_size=len(blob),
+                      gpu_chain=[[0x1000, cut], [0x9000, len(blob) - cut]])
+    assert T.export_one(chained, carve, out, cache) == "ok:first"
+    with open(os.path.join(out, "x.rpf", chained["export"]["file"]), "rb") as f:
+        assert f.read()[148:] == expected
 
 
 @pytest.mark.parametrize("fmt", [9999, 6, 7, 8])  # 6-8: 12-byte R32G32B32 has no SW_4K_S equation
@@ -438,27 +479,60 @@ def test_packed_r10g10b10a2_writes_a_png(eq, tmp_path, monkeypatch, capsys):
 
 
 def test_undecodable_format_keeps_the_dds_and_counts_unsupported(eq, tmp_path, monkeypatch, capsys):
-    carve, expected = build_case(eq, tmp_path, 10, top_first=True)  # R16G16B16A16_FLOAT: dds_png has no decoder
-    t = texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2)
+    # R10G10B10A2_UNORM_SRGB: dds_png has no decoder for its DXGI code
+    carve, expected = build_case(eq, tmp_path, 25, top_first=True)
+    t = texture(25, "R10G10B10A2_UNORM_SRGB", 64, 64, mips=2)
     out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
     assert code is None  # main() returns None, so the process exits 0
-    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_R16G16B16A16_FLOAT.dds"]
-    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_R16G16B16A16_FLOAT.dds").read_bytes()[148:] == expected
+    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_R10G10B10A2_UNORM_SRGB.dds"]
+    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_R10G10B10A2_UNORM_SRGB.dds").read_bytes()[148:] == expected
     assert json.loads((out / "export_log.json").read_text(encoding="utf-8"))[0]["export"]["png"] == "unsupported"
     assert text.splitlines()[1:] == ["png: {'unsupported': 1}"]
 
 
 def test_mixed_run_counts_each_kind(eq, tmp_path, monkeypatch, capsys):
     carve, _ = build_case(eq, tmp_path, 28, top_first=True)
-    eq(8)
     with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
-        write_blob(carve, "x.rpf", 0x2000, f.read() * 2)  # enough bytes for the 8 bpe texture too
+        write_blob(carve, "x.rpf", 0x2000, f.read())  # same 4 bpe size, so the equation is already in place
     textures = [texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2),
-                texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2, gpu=0x2000),
+                texture(25, "R10G10B10A2_UNORM_SRGB", 64, 64, mips=2, gpu=0x2000),
                 texture(9999, "X", 4, 4, 1, gpu=0x3000)]
     out, code, text = png_main(tmp_path, monkeypatch, capsys, textures, carve, "--png")
     assert text.splitlines()[1] == "png: {'written': 1, 'unsupported': 1}"
     assert len([f for f in tree(out) if f.endswith(".png")]) == 1
+
+
+
+@pytest.mark.parametrize("fmt,name,codes,rgba", [
+    # 1, 0.5 -> red 255, 128 (green and blue 0, alpha 255)
+    (54, "R16_FLOAT", [0x3C00, 0x3800], [255, 0, 0, 255, 128, 0, 0, 255]),
+    # (+inf, NaN, -1, 0.5) and (0.25, 2, 0, 1): +inf and 2 saturate, NaN and negatives give 0
+    (10, "R16G16B16A16_FLOAT", [0x7C00, 0x7E00, 0xBC00, 0x3800, 0x3400, 0x4000, 0x0000, 0x3C00],
+     [255, 0, 0, 128, 64, 255, 0, 255]),
+])
+def test_half_float_png_export(eq, tmp_path, monkeypatch, capsys, fmt, name, codes, rgba):
+    eq(T.FMT[fmt][0])
+    texels = struct.pack(f"<{len(codes)}H", *codes)
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, texels.ljust(4096, b"\0"))
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [texture(fmt, name, 2, 1, 1)], carve, "--png")
+    assert code is None
+    assert text.splitlines()[1] == "png: {'written': 1}"
+    assert next(out.rglob("*.dds")).read_bytes()[148:] == texels
+    assert read_png(next(out.rglob("*.png"))) == (2, 1, bytes(rgba))
+
+
+def test_r32_float_png_export(eq, tmp_path, monkeypatch, capsys):
+    # dds_png reads R32_FLOAT as linear red: 1.0 and 0.5 -> red 255, 128 (green and blue 0, alpha 255)
+    eq(4)
+    texels = struct.pack("<II", 0x3F800000, 0x3F000000)
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, texels.ljust(4096, b"\0"))
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [texture(41, "R32_FLOAT", 2, 1, 1)], carve, "--png")
+    assert code is None
+    assert text.splitlines()[1] == "png: {'written': 1}"
+    assert next(out.rglob("*.dds")).read_bytes()[148:] == texels
+    assert read_png(next(out.rglob("*.png"))) == (2, 1, bytes((255, 0, 0, 255, 128, 0, 0, 255)))
 
 
 def test_png_module_is_not_imported_without_the_flag(eq, tmp_path, monkeypatch, capsys):
@@ -505,6 +579,37 @@ def test_stale_export_entry_is_not_counted(eq, tmp_path, monkeypatch, capsys):
     assert text.splitlines()[0].startswith("1 textures: {'error:FileNotFoundError': 1}")
     assert text.splitlines()[1] == "png: {}"
 
+def test_texture_io_error_fails_the_run_but_preserves_successes(eq, tmp_path, monkeypatch, capsys):
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    good = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+    missing = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2, gpu=0x5000)
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps([good, missing]), encoding="utf-8")
+    out = tmp_path / "out"
+    _argv(monkeypatch, index, carve, out)
+    assert T.main() == 1
+    captured = capsys.readouterr()
+    assert "1 texture(s) could not be read or written" in captured.err
+    assert "000000005000.bin" in captured.err
+    assert "error:FileNotFoundError" in captured.out
+    exported, failed = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
+    assert (out / "x.rpf" / exported["export"]["file"]).is_file()
+    assert "export" not in failed
+
+
+def test_main_reports_export_log_write_failure(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    (out / "export_log.json").mkdir(parents=True)
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() == 1
+    captured = capsys.readouterr()
+    assert "ERROR: cannot write" in captured.err
+    assert "export_log.json" in captured.err
+    assert not captured.out
+
+
 # ---- bad index / --out guards (#1607's class in main) ----
 
 def _argv(monkeypatch, index, carve, out, *extra):
@@ -532,6 +637,16 @@ def test_main_reports_an_index_row_without_keys(tmp_path, monkeypatch, capsys):
     assert "ERROR: cannot read " in err, err
     assert "row has no 'archive'" in err, err
     assert "Traceback" not in err
+
+
+def test_main_reads_an_index_saved_with_a_utf8_bom(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("\ufeff[]", encoding="utf-8")   # Notepad and PowerShell's ">" write a BOM
+    out = tmp_path / "out"
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() is None       # read as an empty texture list; nothing to export
+    assert (out / "export_log.json").read_text(encoding="utf-8") == "[]"
+    assert capsys.readouterr().err == ""
 
 
 def test_main_rejects_an_out_that_is_a_file(tmp_path, monkeypatch, capsys):
@@ -580,3 +695,22 @@ def test_main_still_accepts_an_empty_list(tmp_path, monkeypatch, capsys):
     _argv(monkeypatch, index, tmp_path, out)
     assert T.main() in (None, 0)   # main() has no explicit return; sys.exit(None) is exit 0
     assert (out / "export_log.json").is_file()
+
+
+def test_main_refuses_to_overwrite_input_index_as_export_log(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "out"
+    out.mkdir()
+    index = out / "export_log.json"
+    original = '[{"archive": "a", "gpu": 0}, {"archive": "b", "gpu": 1}]\n'
+    index.write_text(original, encoding="utf-8", newline="\n")
+    _argv(monkeypatch, index, tmp_path, out, "--limit", "1")
+    assert T.main() == 2
+    err = capsys.readouterr().err
+    assert "ERROR:" in err and "must not overwrite" in err, err
+    assert index.read_text(encoding="utf-8") == original
+    if os.name == "nt":
+        _argv(monkeypatch, out / "EXPORT_LOG.JSON", tmp_path, out, "--limit", "1")
+        assert T.main() == 2
+        err = capsys.readouterr().err
+        assert "ERROR:" in err and "must not overwrite" in err, err
+        assert index.read_text(encoding="utf-8") == original

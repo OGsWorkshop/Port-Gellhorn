@@ -5,16 +5,21 @@
 Fixtures are hand-written documents: nested elements, attributes, macro and platform references,
 an include-like manifest, a tail-only fragment and a malformed document. No game data is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "gamedata_xml.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import gamedata_xml as g  # noqa: E402
 
 ALPHA = (
     b'\xef\xbb\xbf<?xml version="1.0" encoding="utf-8"?>\n'
@@ -139,6 +144,23 @@ class GamedataXmlTest(unittest.TestCase):
         for value in ("fixture.bk2", "synthetic note", "synthetic_set", "0 1", "fixture.xml"):
             self.assertNotIn(value, blob)
 
+    def test_well_formed_roots_group_by_namespace_not_prefix(self):
+        bare = self.write("bare.xml", b"<CTuningFile/>")
+        default = self.write("default.xml", b'<CTuningFile xmlns="urn:example"/>')
+        prefix = self.write("prefix.xml", b'<t:CTuningFile xmlns:t="urn:example"/>')
+        out = os.path.join(self.root, "catalog.json")
+        p = self.run_tool(bare, default, prefix, "--json", out, "--check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            report = json.load(f)
+        qualified = "{urn:example}CTuningFile"
+        self.assertEqual(set(report["roots"]), {"CTuningFile", qualified})
+        self.assertEqual(report["roots"][qualified]["files"], 2)
+        self.assertEqual(report["roots"][qualified]["element_names"], {qualified: 2})
+        self.assertEqual(report["roots"][qualified]["category"], "uncatalogued")
+        self.assertEqual(report["roots"]["CTuningFile"]["files"], 1)
+        self.assertEqual(report["summary"]["catalog_roots"], 1)
+
     def test_counts_tail_references_across_parser_buffer_boundary(self):
         start = b"<root><child>"
         close = b"</child>"
@@ -176,6 +198,50 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertIn("1 malformed", p.stdout)
         self.assertIn("line 1", p.stdout)
 
+        # An end-truncated file that starts at <COther> and cuts off right after a closed child </x>
+        # must keep root "COther" and report malformed (not tail_only under bogus root "x").
+        cut = self.write("cut.xml", b"<COther><x>1</x>")
+        out = os.path.join(self.root, "cut.json")
+        p = self.run_tool(cut, "--check", "--json", out)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            row = json.load(f)["rows"][0]
+        self.assertEqual(row["root"], "COther")
+        self.assertFalse(row["tail_only"])
+        self.assertFalse(row["truncated"])
+        self.assertTrue(row["malformed"])
+
+    def test_check_crossed_tags(self):
+        cases = (
+            (b"<R><x></R></x>", "R"),
+            (b'<?xml version="1.0"?><R><x></R></x>', "R"),
+            (b'<n:R xmlns:n="urn:test"><!-- </n:R> --><x><![CDATA[</x>]]></n:R></x>', "n:R"),
+        )
+        for payload, root in cases:
+            with self.subTest(payload=payload):
+                doc = self.write("crossed.xml", payload)
+                p = self.run_tool(doc, "--check")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("malformed " + root + " @", p.stdout)
+                self.assertIn("0 truncated at the start", p.stdout)
+
+    def test_check_crossed_text_in_missing_comment_or_cdata_prefix(self):
+        for opener, suffix in ((b"<!-- ", b" -->"), (b"<![CDATA[", b"]]>")):
+            payload = b"<A><B></A></B>" + suffix + b"</R>"
+            with self.subTest(opener=opener):
+                # Establish that these are tails of a well-formed document.
+                import xml.etree.ElementTree as ET
+                ET.fromstring(b"<R>" + opener + payload)
+                doc = self.write("lexical_tail.xml", payload)
+                p = self.run_tool(doc, "--check")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("1 truncated at the start", p.stdout)
+                self.assertIn("truncated R @", p.stdout)
+                # A stray terminator must not hide malformed text after it.
+                broken = self.write("lexical_broken.xml", payload[:-4] + b"<C><D></C></D></R>")
+                p = self.run_tool(broken, "--check")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+
     def test_check_reports_unknown_encoding_as_malformed(self):
         unknown = self.write("unknown.xml", b'<?xml version="1.0" encoding="not-a-charset"?><root/>')
         valid = self.write("valid.xml", b"<root/>")
@@ -187,11 +253,13 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertIn("not-a-charset", p.stdout)
 
     def test_comments_in_a_document_that_does_not_parse_are_counted(self):
-        # A truncated or tail-only document stops the parser at the error; its comments still count, and
-        # comment-like text in CDATA (closed or cut off) still doesn't.
+        # The fallback must respect the context of each delimiter after the parser stops.
         cases = {"open.xml": (b"<a><!--x--><!--y-->", 2),
                  "tail.xml": (b"</b><!--x--></a><!--y-->", 2),
-                 "cdata.xml": (b"<a><!--x--><![CDATA[<!--no-->]]><b><![CDATA[<!--cut", 1)}
+                 "cdata.xml": (b"<a><!--x--><![CDATA[<!--no-->]]><b><![CDATA[<!--cut", 1),
+                 "cdata-in-comment.xml": (b"<a></b><!--literal <![CDATA[--><!--later-->", 2),
+                 "comment-in-pi.xml": (b"<a></b><?step literal <!-- ?> <!--later-->", 1),
+                 "unfinished-comment.xml": (b"<a><!--unfinished <![CDATA[", 1)}
         for name, (body, want) in cases.items():
             with self.subTest(name=name):
                 doc = self.write(name, body)
@@ -288,6 +356,36 @@ class GamedataXmlTest(unittest.TestCase):
                 self.assertFalse(row["fragment"])
         self.assertEqual(report["summary"]["tail_only"], 0)
         self.assertEqual(report["summary"]["fragments"], 0)
+
+    def test_a_folder_that_cannot_be_listed_fails_the_scan(self):
+        def fake_walk(root, onerror=None):
+            self.assertIsNotNone(onerror, "os.walk needs onerror, or an unlistable folder is skipped")
+            onerror(PermissionError(13, "permission denied", os.path.join(root, "blocked")))
+            return iter(())
+
+        err = io.StringIO()
+        with mock.patch.object(g.os, "walk", side_effect=fake_walk), \
+                mock.patch.object(sys, "argv", ["gamedata_xml.py", self.root]), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = g.main()
+        self.assertEqual(rc, 2)
+        self.assertIn("permission denied", err.getvalue())
+
+    @unittest.skipUnless(os.name == "posix" and getattr(os, "geteuid", lambda: 0)() != 0,
+                         "needs a POSIX filesystem and a non-root user to make a folder unlistable")
+    def test_a_real_unlistable_folder_fails_the_scan(self):
+        blocked = os.path.join(self.root, "blocked")
+        os.makedirs(blocked)
+        os.chmod(blocked, 0)
+        err = io.StringIO()
+        try:
+            with mock.patch.object(sys, "argv", ["gamedata_xml.py", self.root]), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = g.main()
+        finally:
+            os.chmod(blocked, 0o755)
+        self.assertEqual(rc, 2)
+        self.assertIn("blocked", err.getvalue())
 
     def test_unwritable_csv_or_json_is_one_error_line(self):
         doc = self.write("alpha.xml", ALPHA)

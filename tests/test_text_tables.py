@@ -4,6 +4,7 @@
 """
 import contextlib
 import csv
+import errno
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -62,6 +64,48 @@ def make_resource(strings, pad=0):
     return bytes(head + desc + bytes(pad) + index + hashes + blob)
 
 
+def make_chunked_resource(chunks, between=(), gap=b"GAP-BETWEEN-CHUNKS\0"):
+    """A string table whose blob is split into chunks, as tables with more than 1 MiB of text are.
+
+    ``chunks`` is a list of {label: text}, one per chunk. The descriptor lists one tag-0x10 entry per chunk, with the
+    ``between`` (tag, bytes) entries after the first one. ``gap`` sits between the chunks so they are not contiguous.
+    An index entry's second word is ``offset << 20 | 4 | chunk``. Bytes that are not an entry end the descriptor.
+    """
+    labels, refs, blobs = [], [], []
+    for k, strings in enumerate(chunks):
+        blob = bytearray()
+        for label, text in strings.items():
+            labels.append(label)
+            refs.append(len(blob) << 20 | 4 | k)
+            blob += text.encode("utf-8") + b"\0"
+        blobs.append(bytes(blob))
+    head = bytearray(0x10) + b"0DRP" + bytes(0x0C)
+    desc_at = len(head)
+    desc_len = 0x28 + 16 * (len(chunks) + len(between)) + 16
+    index_at = desc_at + desc_len
+    hash_at = index_at + 16 * len(labels)
+    blob_at, at = [], hash_at + 16 * len(labels)
+    for blob in blobs:
+        blob_at.append(at)
+        at += len(blob) + len(gap)
+    entries = [(0x10, len(blobs[0]), blob_at[0])] + [(tag, size, 0) for tag, size in between]
+    entries += [(0x10, len(blob), off) for blob, off in zip(blobs[1:], blob_at[1:])]
+    desc = (ptr(index_at) + struct.pack("<II", 0, 0x10) + ptr(0) + b"\x01\x01\x00\x00"
+            + struct.pack("<I", 16 * len(labels)) + ptr(hash_at))
+    desc += b"".join(struct.pack("<II", tag, size) + ptr(off) for tag, size, off in entries)
+    desc += struct.pack("<IIII", 0x10, 0x10, 0x10, 0x10)      # not an entry: its pointer word is not 0x5xxxxxxx
+    assert len(desc) == desc_len
+    index = b"".join(struct.pack("<QQ", 0, ref) for ref in refs)
+    hashes = bytearray()
+    for i, label in enumerate(labels):
+        entry = bytearray(16)
+        struct.pack_into("<II", entry, 0, T.joaat(label), 0)
+        entry[8] = 1
+        entry[11:14] = i.to_bytes(3, "little")
+        hashes += entry
+    return bytes(head + desc + index + hashes + b"".join(blob + gap for blob in blobs))
+
+
 def write(path, data):
     with open(path, "wb") as fh:
         fh.write(data)
@@ -87,6 +131,28 @@ class TestTables(unittest.TestCase):
         at = res.index(b"\x01\x01\x00\x00") + 4
         struct.pack_into("<I", res, at, len(res) * 2)      # hash table larger than the resource
         self.assertEqual(list(T.string_tables(bytes(res))), [])
+
+    def test_blob_chunks_named_by_the_index_entry(self):
+        chunks = [{"ZZ_FIRST": "first chunk text"}, {"ZZ_SECOND": "second chunk"}, {"ZZ_THIRD": "third", "ZZ_LAST": "x"}]
+        tables = list(T.string_tables(make_chunked_resource(chunks)))
+        self.assertEqual(tables, [{T.joaat(k): v for c in chunks for k, v in c.items()}])
+
+    def test_other_descriptor_entries_between_chunks_are_skipped(self):
+        chunks = [{"ZZ_FIRST": "first chunk text"}, {"ZZ_SECOND": "second chunk"}]
+        res = make_chunked_resource(chunks, between=[(0x956A9DF5, 0x20), (0x10075946, 0x40)])
+        self.assertEqual(list(T.string_tables(res)), [{T.joaat(k): v for c in chunks for k, v in c.items()}])
+
+    def test_one_chunk_reads_as_before(self):
+        res = make_chunked_resource([EN])
+        self.assertEqual(list(T.string_tables(res)), [{T.joaat(k): v for k, v in EN.items()}])
+        first_blob_entry = 0x20 + 0x28
+        self.assertEqual(len(T.blob_chunks(res, first_blob_entry)), 1)   # the bytes after the entry end the run
+
+    def test_index_entry_naming_a_missing_chunk_is_skipped(self):
+        res = bytearray(make_chunked_resource([{"ZZ_FIRST": "first"}, {"ZZ_SECOND": "second"}]))
+        index_at = struct.unpack_from("<I", res, 0x20)[0] & 0x0FFFFFFF
+        struct.pack_into("<Q", res, index_at + 16 + 8, 4 | 3)  # second string: chunk 3 of 2
+        self.assertEqual(list(T.string_tables(bytes(res))), [{T.joaat("ZZ_FIRST"): "first"}])
 
     def test_language(self):
         self.assertEqual(T.language(EN.values()), "en")
@@ -176,6 +242,35 @@ class TestDialogue(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_unreadable_subdirectory_preserves_previous_tables_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            blocked = os.path.join(source, "blocked")
+            os.makedirs(blocked)
+            write(os.path.join(source, "visible.bin"), make_resource(EN))
+            write(os.path.join(blocked, "hidden.bin"), make_resource(DE))
+            report = os.path.join(tmp, "tables.csv")
+            previous = b"previous complete report\n"
+            write(report, previous)
+            scandir = os.scandir
+
+            def scan(path):
+                if path == blocked:
+                    raise PermissionError(errno.EACCES, "Permission denied", path)
+                return scandir(path)
+
+            with (patch.object(os, "scandir", side_effect=scan),
+                  contextlib.redirect_stderr(io.StringIO()) as error,
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(T.main([source, "--tables", report]), 2)
+
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(len(error.getvalue().splitlines()), 1)
+            self.assertIn("cannot read input", error.getvalue())
+            self.assertIn(repr(blocked), error.getvalue())
+            with open(report, "rb") as fh:
+                self.assertEqual(fh.read(), previous)
+
     def test_csv_exports_explicitly_empty_strings(self) -> None:
         strings = {"ZZ_SYNTHETIC_BLANK": "", "ZZ_SYNTHETIC_LINE": "This is the text you know"}
         with tempfile.TemporaryDirectory() as tmp:
@@ -257,6 +352,18 @@ class TestCli(unittest.TestCase):
             self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
                              "staging and backup files must not be left behind")
 
+    def test_report_cannot_replace_the_carve_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "carve")
+            os.mkdir(source)
+            index = write(os.path.join(source, "index.json"), b'{"files": []}')
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as code:
+                T.main([source, "--tables", index])
+            self.assertEqual(code.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), b'{"files": []}')
+
     def test_two_outputs_naming_one_file_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "src")
@@ -271,8 +378,13 @@ class TestCli(unittest.TestCase):
             self.assertFalse(os.path.exists(out), "no report may be written before the check")
 
     def test_missing_input(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(T.main(["/nonexistent"]), 2)
+        # "/nonexistent" is a drive-root path on Windows (C:\nonexistent), which really exists on some hosts.
+        # Use a path inside a fresh temp directory so the input is guaranteed to be missing on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing-input")
+            self.assertFalse(os.path.exists(missing))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(T.main([missing]), 2)
 
     def test_missing_parent_and_hardlinked_outputs_rejected_upfront(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,6 +419,31 @@ class TestCli(unittest.TestCase):
                 rc = T.main([src, "--labels", bad_labels])
             self.assertEqual(rc, 2)
             self.assertIn("cannot read input", err.getvalue())
+
+    def test_wrong_shape_labels_json_is_clean_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "en.bin"), make_resource(EN))
+            for text in ("[1, 2]", '"x"', "null"):
+                with self.subTest(text):
+                    labels = os.path.join(tmp, "labels.json")
+                    with open(labels, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(text)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = T.main([src, "--labels", labels])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("cannot read input", err.getvalue())
+
+    def test_carve_folder_with_wrong_shape_index_is_clean_error(self):
+        for name, text in (("list", "[]"), ("nofiles", "{}"), ("badrow", '{"files": [1]}')):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = T.main([tmp])
+                self.assertEqual(rc, 2)
+                self.assertIn("cannot read input", err.getvalue())
 
 
 UNDECIDED = {"ZZ_CODE_1": "qqq zzz", "ZZ_CODE_2": "xkcd 42"}        # no script, letter or word decides: xx
@@ -394,6 +531,45 @@ class TestNestedArchiveLanguage(unittest.TestCase):
             with open(out, encoding="utf-8", newline="") as fh:
                 self.assertEqual([(r["lang"], r["guess"], r["archive"]) for r in csv.DictReader(fh)],
                                  [("xx", "xx", "")])
+
+
+class TestVideoBoundaries(unittest.TestCase):
+    def test_video_separates_blobs_in_archives_and_carve_folders(self):
+        import gamedata_index
+        import zlib
+
+        first, second = bytes(T.BLOCK), b"b" * 64
+        compressed = zlib.compress(first)
+        video = bytearray(64)
+        struct.pack_into("<4sI", video, 0, b"KB2n", len(video) - 8)
+        struct.pack_into("<II", video, 0x14, 16, 16)
+        header = struct.pack("<4sIII", b"9FPR", 16, 0, 0)
+        video_off = len(header) + len(compressed)
+        second_off = video_off + len(video)
+        expected = [(len(header), first), (second_off, second)]
+
+        def forbid_video(read):
+            def guarded(source, row):
+                self.assertNotEqual(row.get("type"), "bink2")
+                return read(source, row)
+            return guarded
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "sample.rpf")
+            write(archive, header + compressed + video + zlib.compress(second))
+            for off, data in expected:
+                write(os.path.join(tmp, f"{off:012x}.bin"), data)
+            files = [{"off": off, "size": len(data)} for off, data in expected]
+            files.insert(1, {"off": video_off, "size": len(video), "type": "bink2"})
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as manifest:
+                json.dump({"files": files}, manifest)
+
+            for src, reader in ((archive, gamedata_index.ArchiveSource), (tmp, gamedata_index.DirectorySource)):
+                with self.subTest(source=reader.__name__), patch.object(reader, "read", forbid_video(reader.read)):
+                    actual = [(off, blob) for _source, off, blob in T.blobs(src)]
+                    self.assertEqual([(off, len(blob)) for off, blob in actual],
+                                     [(off, len(blob)) for off, blob in expected])
+                    self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":
