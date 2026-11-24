@@ -63,6 +63,8 @@ The game boots, runs its menus, loads Vice City (peds and cars spawn, and the in
 
 **The fix is to have every program compiled before the game starts.** `setup.ps1 -Game <dump>` now precompiles the whole shader pack and the GPU pipelines once (about 45 minutes; it's resumable). Making that faster and complete is task #1 below.
 
+**New:** `play.ps1` now turns off the game's stall watchdog (`XCL_NO_WATCHDOG`), so the game waits out slow first-time shader builds in the world instead of quitting. The first world load is slow while the cache fills, but it no longer dies.
+
 Already fixed in this repo's runtime: the 64-bit wait ordering (black screen), the BCPack texture decoder (empty world textures), the `CopyFromSubresource` crash at the end of loading, and runaway shader loops.
 
 ---

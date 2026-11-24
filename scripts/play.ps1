@@ -16,6 +16,9 @@ if (-not (Test-Path (Join-Path $Game 'game_scarlett_master.exe'))) {
 
 # Fewer parallel shader compiles: 32 GB machines run out of memory with the default.
 $env:XCL_DXC_THREADS = '4'
+# Turn off the game's 30 s stall watchdog so it waits for slow first-time shader builds
+# instead of killing itself (ivall/xcl#505).
+$env:XCL_NO_WATCHDOG = '1'
 # Write button names here ("A", "DOWN DOWN A") to press them while the game runs.
 $env:XCL_PRESS_FILE = Join-Path $root 'press.txt'
 Set-Content -Path $env:XCL_PRESS_FILE -Value '' -NoNewline

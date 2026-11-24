@@ -5111,6 +5111,50 @@ index 0eec7dc..330beca 100644
 +        }
 +    }
  }
+diff --git a/crates/xcl/src/loader.rs b/crates/xcl/src/loader.rs
+index 52c49af..40faa60 100644
+--- a/crates/xcl/src/loader.rs
++++ b/crates/xcl/src/loader.rs
+@@ -331,6 +331,31 @@ unsafe extern "system" fn main_thread(param: *mut c_void) -> u32 {
+     f(peb() as *mut c_void)
+ }
+ 
++/// `XCL_NO_WATCHDOG=1`: turn off a retail title's stall watchdog (GTA VI 1.0.2.1, ivall/xcl#505)
++/// – its two aborting branches (heartbeat unchanged for 30 s; an in-flight timestamp too old)
++/// become NOPs – so it can wait for a slow pipeline build instead of ending itself. Each site
++/// is patched only when it holds exactly the expected bytes.
++unsafe fn no_watchdog(base: usize) {
++    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
++    if std::env::var("XCL_NO_WATCHDOG").map_or(true, |v| v == "0") {
++        return;
++    }
++    for (rva, old) in [(0x2215c70usize, [0x74u8, 0x04]), (0x2215bdc, [0x73, 0x2e])] {
++        let p = (base + rva) as *mut u8;
++        if !crate::gpu::shader::readable(p as usize, 2) || std::slice::from_raw_parts(p, 2) != old {
++            crate::xlog_warn!("XCL_NO_WATCHDOG: +{rva:#x} does not hold {old:02x?}: left alone");
++            continue;
++        }
++        let mut prot = 0u32;
++        if VirtualProtect(p as _, 2, PAGE_EXECUTE_READWRITE, &mut prot) != 0 {
++            *p = 0x90;
++            *p.add(1) = 0x90;
++            VirtualProtect(p as _, 2, prot, &mut prot);
++            crate::xlog_info!("XCL_NO_WATCHDOG: +{rva:#x} {old:02x?} -> [90, 90]");
++        }
++    }
++}
++
+ /// Make the game the "main image" of the process and run its entry point on a thread
+ /// with the stack size its PE header asks for. Usually never returns (the game calls
+ /// ExitProcess); if the entry returns, its value is returned.
+@@ -346,6 +371,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
+         } else {
+             *(peb().add(0x10) as *mut usize) = m.base;
+         }
++        no_watchdog(m.base);
+         run_tls_callbacks(m, 1);
+     }
+     READY.store(true, Ordering::Release);
 diff --git a/crates/xcl/src/report.rs b/crates/xcl/src/report.rs
 index 378f4b3..d54f98b 100644
 --- a/crates/xcl/src/report.rs
