@@ -29,7 +29,5 @@ xcl.toml
 .env
 
 # Launcher
-launcher/node_modules
-launcher/dist
-launcher/build
-launcher/runtime-bundle
+launcher/target
+launcher/runtime

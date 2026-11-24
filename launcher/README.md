@@ -1,24 +1,20 @@
 # ScarlettPort launcher
 
-Electron + React desktop launcher for ScarlettPort. It runs `scripts\setup.ps1` and
-`scripts\play.ps1` (or VIctory) for you and shows their output live.
+Native Rust launcher (eframe/egui). One exe: the XCL runtime, D3D12 Agility SDK and DXC are
+embedded and unpacked to `%LOCALAPPDATA%\ScarlettPort\runtime` on first run (skipped when the hash matches).
+Settings live in `%LOCALAPPDATA%\ScarlettPort\launcher.json`. No network access except the links you click.
 
-- Pick your unpacked game folder (must contain `game_scarlett_master.exe`); it is remembered.
-- **PLAY** starts the game. Options (gear button): runtime (XCL / VIctory), Series S mode
-  (VIctory, `--console series-s`), auto-advance menus (`-AutoMenu`).
-- **SETUP** runs `setup.ps1` (with `-Game` if a folder is chosen) and shows shader/pipeline progress.
-- The log panel tails the game log; lines with `fps` update the FPS readout.
-- Settings live in `%APPDATA%\scarlettport-launcher\config.json`. No telemetry, no network calls
-  except the links you click.
+- **Play**: pick the folder containing `game_scarlett_master.exe`, press PLAY. Live FPS is read from the log.
+- **Setup**: precompile shaders (`xcl.exe shaders ... --precompile --pipelines --only cs`) with progress.
+- **Logs**, **Progress notes**, **Links**, **Settings** (game folder, auto-advance menus).
 
-## Run / build
+## Build
 
 ```
 cd launcher
-npm install
-npm run dev     # React dev server + Electron window
-npm run dist    # builds a portable exe into launcher\dist
+cargo build --release --locked      # -> target\release\ScarlettPort.exe
 ```
 
-The launcher finds the repo by walking up from its own location (or the portable exe's
-location) looking for `scripts\setup.ps1`; if it can't, use "LOCATE REPO" in the header.
+`build.rs` copies the runtime files into `launcher\runtime\` from `M:\GTA6\xcl-test` and the Windows
+SDK (`C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64`); override with `XCL_SRC` / `DXC_SRC`.
+`ScarlettPort.exe --screenshot=FILE.png` renders the window to a PNG and exits.
