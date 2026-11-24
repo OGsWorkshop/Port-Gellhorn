@@ -1,0 +1,29 @@
+# Build output
+target/
+**/target/
+
+# Game files: never commit anything from a game dump
+*.exe
+*.rpf
+*.ttpf
+*.xvc
+*.msixvc
+*.dxbc
+*.pdb
+*.dmp
+**/MicrosoftGame.config
+!runtime/xcl/tests/data/testgame/MicrosoftGame.config
+game/
+dump/
+
+# Runtime DLLs you download yourself (Agility SDK, DXC)
+*.dll
+D3D12/
+
+# Logs, caches, local config
+*.log
+logs/
+cache/
+victory.toml
+xcl.toml
+.env
