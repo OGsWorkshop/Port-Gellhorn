@@ -26,6 +26,12 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 
 ## 📸 Running right now
 
+### 🆕 First open-world geometry on an NVIDIA GPU
+
+![First world geometry](assets/first-world-geometry.png)
+
+<sub>Captured from inside the open world on an RTX 3060 (Series S profile): one of the game's own render passes drawing the ground in true 3D perspective. It's an internal pass, not the final lit image yet, but it's the world rendering. Next step: the geometry passes that feed the final image.</sub>
+
 The title's own artwork, menus and loading screens, drawn natively on an **RTX 3060** at a locked **30 fps**:
 
 | Title artwork | Loading screen | Loading screen |
