@@ -72,6 +72,12 @@ The game boots, runs its menus, loads the open world (peds and cars spawn, and t
 
 **New:** `play.ps1` now turns off the game's stall watchdog (`XCL_NO_WATCHDOG`), so the game waits out slow first-time shader builds in the world instead of quitting. The first world load is slow while the cache fills, but it no longer dies.
 
+**Latest (Nov 24):**
+- **World asset streaming fixed.** Map, prop and VFX files failed to load once the world started, because requests went out before the game had filled in where the data goes, and the game then waited forever. Requests now wait briefly for the game to finish, and the runs since have had zero failed loads.
+- **Unlit mode (`XCL_FLAT=1`).** Big lighting shaders get a tiny flat grey stand-in, so the world can show without waiting on NVIDIA's slow compiles. Menus and loading screens keep their real shaders.
+- **Pipeline journal.** Every GPU pipeline the game creates is recorded, even in runs that crash, and `xcl pipelines <game>` builds them all ahead of time. This is the path to a one-time "build shaders" step instead of compiling at world start.
+- **Current wall:** the moment the world starts, a piece of GPU work runs past Windows' 2-second limit and the driver resets. Finding which one is task #3.
+
 Already fixed in this repo's runtime: the 64-bit wait ordering (black screen), the BCPack texture decoder (empty world textures), the `CopyFromSubresource` crash at the end of loading, and runaway shader loops.
 
 ---

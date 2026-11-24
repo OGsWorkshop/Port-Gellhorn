@@ -728,7 +728,9 @@ unsafe extern "system" fn copy_from(
     } else {
         m.height.saturating_sub(1).checked_mul(pitch).and_then(|o| o.checked_add(row))
     };
-    let dst_ok = pitch >= row && span.is_some_and(|span| crate::gpu::shader::readable(dst as usize, span));
+    let dst_ok = pitch >= row && span.is_some_and(|span| {
+        span != 0 && span <= 256 << 20 && super::dstorage::writable(dst as usize, span)
+    });
     if !dst_ok {
         static BAD: AtomicU32 = AtomicU32::new(0);
         if BAD.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -892,6 +894,8 @@ mod tests {
 
     #[test]
     fn copy_from_rejects_invalid_dst_span() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY};
+
         let d2 = desc(64, 32, 1, 1, 28, 0x105);
         let d3 = desc_3d(16, 8, 4, 1, 28, 0x105);
         let mut comp2 = std::ptr::null_mut();
@@ -913,6 +917,12 @@ mod tests {
             // null pointers
             assert_eq!(from(comp2, std::ptr::null_mut(), 0, 0, 0, tiled2.as_ptr(), 64 * 4, 0), E_INVALIDARG);
             assert_eq!(from(comp2, dst2.as_mut_ptr(), 0, 0, 0, std::ptr::null(), 64 * 4, 0), E_INVALIDARG);
+
+            let read_only = VirtualAlloc(std::ptr::null(), dst2.len(), MEM_RESERVE | MEM_COMMIT, PAGE_READONLY);
+            assert!(!read_only.is_null());
+            let result = from(comp2, read_only.cast(), 0, 0, 0, tiled2.as_ptr(), 64 * 4, 0);
+            assert_ne!(VirtualFree(read_only, 0, MEM_RELEASE), 0);
+            assert_eq!(result, E_INVALIDARG, "a readable destination can still forbid writes");
 
             // 3D: slice_pitch smaller than one slice when depth > 1
             let tiled3 = vec![0u8; get_size(comp3) as usize];

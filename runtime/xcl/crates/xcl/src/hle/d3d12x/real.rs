@@ -3358,7 +3358,7 @@ const BIG_DRIVER_COMPILE: usize = 256 << 10;
 struct Slots {
     n: Mutex<usize>,
     cv: std::sync::Condvar,
-    most: usize,
+    most: fn() -> usize,
 }
 
 struct SlotGuard(&'static Slots);
@@ -3366,7 +3366,8 @@ struct SlotGuard(&'static Slots);
 impl Slots {
     fn acquire(&'static self) -> SlotGuard {
         let mut n = self.n.lock().unwrap();
-        while *n >= self.most {
+        let most = (self.most)();
+        while *n >= most {
             n = self.cv.wait(n).unwrap();
         }
         *n += 1;
@@ -3381,7 +3382,22 @@ impl Drop for SlotGuard {
     }
 }
 
-static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: big_compiles };
+
+/// Big background driver compiles at once: 1, or `XCL_BIG_COMPILES` (1 – 16). One at a time keeps
+/// the commit of a Windows machine with a small page file in bounds; with the RAM for it more can
+/// run – under Wine + vkd3d-proton each big compute program takes 50 – 120 s through dxil-spirv and
+/// the driver, so a retail title's world-load backlog of them queued behind a single slot.
+fn big_compiles() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("XCL_BIG_COMPILES").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 16);
+        if n > 1 {
+            crate::xlog_info!("D3D12.X: XCL_BIG_COMPILES={n}: up to {n} big compute pipelines built by the driver at once");
+        }
+        n
+    })
+}
 
 /// Before a big driver compile in the background: until 3 GB of commit are free (each takes
 /// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
@@ -3756,28 +3772,20 @@ unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: 
     m.insert(key, std::sync::Arc::new(bytes));
 }
 
-unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+/// The PC desc of a pipeline with a console VS (and PS) and no GS / HS / DS: the translated
+/// shaders, XCL's ABI root signature, PC formats and topology. `translated_graphics_pso`, and
+/// `warm` (`xcl pipelines` makes a run's pipelines in its own process: the same desc, so the
+/// same DXIL and driver cache entries).
+struct GraphicsPrep {
+    desc: D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    rs: *mut c_void,
+    rect_gs: Option<Vec<u8>>,
+    /// the VS / PS DXIL `desc` points at
+    _dxil: (Vec<u8>, Option<Vec<u8>>),
+}
+
+unsafe fn prep_graphics(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8]) -> Option<GraphicsPrep> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
-    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
-        return None;
-    }
-    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
-    let vs = shader_bytes(&d.VS)?;
-    if !is_console(vs) {
-        return None;
-    }
-    if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
-        note_translation_error("PSO with HS/DS – not supported yet".into());
-        return None;
-    }
-    if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
-        let _ = f;
-        return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
-    }
-    // made when first used (`pso_async::lazy`): not even translated now
-    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
-        return None;
-    }
     // a GPU that can run 32-lane waves may run a wave64 VS / PS in waves of 32 (the driver
     // picks; RDNA2 does for pixel shaders): the lanes 32..63 it reads come from `upper_lanes`
     // (split_wave64)
@@ -3792,6 +3800,18 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     let mut samplers = vs_c.samplers;
     let vs_dxil = vs_c.dxil;
     let ps_dxil = match shader_bytes(&d.PS) {
+        // XCL_FLAT: a tiny flat pixel shader for the pipeline's render targets
+        Some(p) if super::flat::wants(p.len()) => {
+            let n = (d.NumRenderTargets as usize).min(8);
+            let formats: Vec<u32> = d.RTVFormats[..n].iter().map(|f| f.0 as u32).collect();
+            match super::flat::flat_ps(&formats) {
+                Ok(b) => Some((*b).clone()),
+                Err(e) => {
+                    note_translation_error(e);
+                    return None;
+                }
+            }
+        }
         Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
             Ok(b) => {
                 samplers.extend(b.samplers);
@@ -3822,6 +3842,32 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         copy.GS = bytecode(gs);
     }
     pc_topology_type(&mut copy);
+    Some(GraphicsPrep { desc: copy, rs, rect_gs, _dxil: (vs_dxil, ps_dxil) })
+}
+
+unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    use crate::gpu::recomp::pso::is_console;
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    let vs = shader_bytes(&d.VS)?;
+    if !is_console(vs) {
+        return None;
+    }
+    if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
+        note_translation_error("PSO with HS/DS – not supported yet".into());
+        return None;
+    }
+    if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
+        let _ = f;
+        return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
+    }
+    // made when first used (`pso_async::lazy`): not even translated now
+    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return None;
+    }
+    let GraphicsPrep { desc: mut copy, rs, rect_gs, _dxil } = prep_graphics(this, d, vs)?;
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
         copy.DepthStencilState.StencilEnable = false.into();
@@ -4095,9 +4141,16 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    // for `xcl pipelines`, which compiles them in its own process (`pso_journal`)
+    let journal = match &owned {
+        OwnedDesc::Graphics(d, ..) => super::pso_journal::graphics(d),
+        OwnedDesc::Compute(d, _) => super::pso_journal::compute(d),
+        OwnedDesc::Stream(..) => 0,
+    };
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+            super::pso_journal::used(journal);
             out as usize
         } else {
             0
@@ -4124,6 +4177,65 @@ unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool 
 unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_mesh_stream(dev.0 as *mut c_void, d.ptr(), &iid, out), Some(hr) if hr >= 0)
+}
+
+/// `xcl pipelines`: a journal's pipeline made on `dev` (a plain device of this process) as
+/// `translated_graphics_pso` / `translated_compute_pso` make it, which fills the DXIL cache
+/// and the driver's, and released. `driver` is held around the driver's compile only (few of
+/// those at once; translation and DXC run freely). Err: what kept it from being made.
+pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, driver: impl FnOnce() -> G) -> Result<(), String> {
+    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    use windows::core::Interface;
+    let this = dev.as_raw();
+    let made: windows::core::Result<ID3D12PipelineState> = match r {
+        super::pso_journal::Replay::Graphics(d, ..) => {
+            let vs = shader_bytes(&d.VS).filter(|v| is_console(v)).ok_or("no console VS")?;
+            if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() || shader_bytes(&d.GS).is_some() {
+                return Err("GS / HS / DS pipeline – left to the title".into());
+            }
+            let GraphicsPrep { desc: mut copy, rect_gs, _dxil, .. } = prep_graphics(this, d, vs).ok_or("not translated")?;
+            let _slot = driver();
+            let mut made = None;
+            let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| match dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(c) {
+                Ok(p) => {
+                    made = Some(p);
+                    S_OK
+                }
+                Err(e) => e.code().0,
+            });
+            made.ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(hr)))
+        }
+        super::pso_journal::Replay::Compute(d, _) => {
+            let cs = shader_bytes(&d.CS).filter(|c| is_console(c)).ok_or("no console CS")?;
+            let compiled = console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this))?;
+            let rs = abi_rs_for(this, &compiled.samplers).ok_or("no root signature")?;
+            let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(&**d);
+            copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+            copy.CS = bytecode(&compiled.dxil);
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            // the driver's result goes where `translated_compute_pso` looks for it (`driver_cache`)
+            let disk = driver_cache::path(&compiled.dxil, copy.Flags.0);
+            if disk.as_deref().is_some_and(std::path::Path::is_file) {
+                return Ok(());
+            }
+            // a big one as the title's background makes it: one at a time, within the commit left
+            let _big = (compiled.dxil.len() >= BIG_DRIVER_COMPILE).then(|| {
+                let slot = BIG_COMPILES.acquire();
+                wait_for_commit();
+                slot
+            });
+            let _slot = driver();
+            let started = std::time::Instant::now();
+            let made = dev.CreateComputePipelineState::<ID3D12PipelineState>(&copy);
+            if let (Ok(p), Some(path)) = (&made, &disk) {
+                if let Ok(b) = p.GetCachedBlob() {
+                    driver_cache::keep(path, std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()), started.elapsed());
+                }
+            }
+            made
+        }
+    };
+    made.map(drop).map_err(|e| format!("the driver refused it: {e}"))
 }
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -4563,6 +4675,26 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             note_translation_error(e);
             return Some(E_INVALIDARG);
         }
+    };
+    // XCL_FLAT: the flat pixel shader for the stream's render target formats
+    let (ps, ps_samplers) = if ps.as_ref().is_some_and(|p| super::flat::wants(p.len())) {
+        let formats: Vec<u32> = subs
+            .iter()
+            .find(|s| s.0 == 15 && s.1.len() >= 36)
+            .map(|s| {
+                let n = (u32::from_le_bytes(s.1[32..36].try_into().unwrap()) as usize).min(8);
+                (0..n).map(|k| super::device_x::pc_target_format(u32::from_le_bytes(s.1[4 * k..4 * k + 4].try_into().unwrap()))).collect()
+            })
+            .unwrap_or_default();
+        match super::flat::flat_ps(&formats) {
+            Ok(b) => (Some((*b).clone()), Vec::new()),
+            Err(e) => {
+                note_translation_error(e);
+                return Some(E_INVALIDARG);
+            }
+        }
+    } else {
+        (ps, ps_samplers)
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
@@ -5303,6 +5435,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        29 => q_copy_page_mappings(a1 as u32, a2, a3, a4 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -5348,6 +5481,34 @@ macro_rules! queue_slots {
     };
 }
 queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
+
+/// command queue #29 (#31 in the newer layout) `CopyPageMappingsBatchX(count, batches, pool,
+/// pool pages, flags)`: the title maps pages of its memory into GPU views – a retail game the
+/// pages its texture streaming fills (a 6 GB pool) into the GPU views its textures are in,
+/// tens of thousands of them while its world loads. Recorded per page (`kernelx::mirrors`);
+/// as a stub every mapping was dropped (#1031).
+unsafe fn q_copy_page_mappings(count: u32, batches: usize, pool: usize, pool_pages: u32) -> HRESULT {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static MAPPED: AtomicU64 = AtomicU64::new(0);
+    static UNMAPPED: AtomicU64 = AtomicU64::new(0);
+    static ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+    static PHYSICAL: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    match crate::hle::kernelx::mirrors::apply_batches(count, batches, pool, pool_pages) {
+        Some(d) => {
+            let add = |total: &AtomicU64, k: u64| total.fetch_add(k, Ordering::Relaxed) + k;
+            let (m, p, u, e) = (add(&MAPPED, d.mapped), add(&PHYSICAL, d.physical), add(&UNMAPPED, d.unmapped), add(&ELSEWHERE, d.elsewhere));
+            if n == 1 || n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: queue CopyPageMappingsBatchX: {n} calls; GPU-view pages so far: {m} mapped ({p} to a physical page the title mapped there), {u} unmapped; {e} pages elsewhere ignored (pool {pool:#x}, {pool_pages} pages of 64 KiB)");
+            }
+        }
+        None => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("D3D12.X: queue CopyPageMappingsBatchX({count}, {batches:#x}, {pool:#x}, {pool_pages}): a batch or range is unreadable or leaves the pool – the call is ignored"));
+        }
+    }
+    S_OK
+}
 
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
 /// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled
