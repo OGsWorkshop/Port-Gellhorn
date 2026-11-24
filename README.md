@@ -26,6 +26,12 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 
 ## 📸 Running right now
 
+### 🆕 The world with our own stand-in lighting
+
+![World with fallback lighting](assets/world-fallback-light.png)
+
+<sub>The game's real picture on an RTX 3060, with a stand-in lighting pass (`VICTORY_FALLBACK_LIGHT=1`): sky, a sun, fog, and the world's own geometry buffers. Fences, a bin and props are there; terrain and most surface colours are still missing because their shaders don't translate yet. About 1 fps.</sub>
+
 ### 🆕 Gameplay has started: the movement tutorial
 
 ![Movement tutorial prompt](assets/tutorial-prompt.png)
