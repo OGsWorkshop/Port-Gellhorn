@@ -30,7 +30,7 @@ AI coding agents are welcome. The rules are the same for code written by hand an
 
 - `runtime/xcl`: read `runtime/xcl/AGENTS.md` for its build, test and code-style notes.
 - `runtime/victory`: `cargo rustc --release -p victory --bin victory --locked -- -C link-arg=/EXPORT:D3D12SDKVersion,DATA -C link-arg=/EXPORT:D3D12SDKPath,DATA`
-- Fixes that are general (not GTA-specific) are worth upstreaming too. Each runtime has its own repo.
+- Fixes that are general (not title-specific) are worth upstreaming too. Each runtime has its own repo.
 
 ## Useful switches
 

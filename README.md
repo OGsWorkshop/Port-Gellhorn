@@ -1,8 +1,8 @@
 <div align="center">
 
-# GTA VI → PC · Native Port
+# ScarlettPort
 
-**Grand Theft Auto VI, running natively on Windows from your own Xbox Series dump.**
+**A native Windows port layer for a next-gen Xbox Series X|S open-world title, running from your own files.**
 No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDNA2 GPU code is recompiled for your graphics card on the fly.
 
 ### Progress to playable
@@ -26,11 +26,11 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 
 ## 📸 Running right now
 
-GTA VI's own artwork, menus and loading screens, drawn natively on an **RTX 3060** at a locked **30 fps**:
+The title's own artwork, menus and loading screens, drawn natively on an **RTX 3060** at a locked **30 fps**:
 
-| Title artwork | Loading: Jason | Loading: Lucia |
+| Title artwork | Loading screen | Loading screen |
 |:---:|:---:|:---:|
-| ![Title artwork](assets/title-art.png) | ![Jason loading screen](assets/loading-jason.png) | ![Lucia loading screen](assets/loading-lucia.png) |
+| ![Title artwork](assets/title-art.png) | ![Loading screen](assets/loading-1.png) | ![Loading screen](assets/loading-2.png) |
 
 | First-boot setup | Legal notices | Terms & policies |
 |:---:|:---:|:---:|
@@ -55,7 +55,7 @@ GTA VI's own artwork, menus and loading screens, drawn natively on an **RTX 3060
 
 ### The current wall: the first seconds in the world
 
-The game boots, runs its menus, loads Vice City (peds and cars spawn, and the in-world audio plays), and then dies within seconds. We've narrowed down why:
+The game boots, runs its menus, loads the open world (peds and cars spawn, and the in-world audio plays), and then dies within seconds. We've narrowed down why:
 
 - When the world starts, the game asks for **~10,000 GPU programs at once**. Compiling them on NVIDIA takes far longer than the game will wait.
 - If those draws **wait** for their programs, the game's own 30-second watchdog decides it has hung and quits.
@@ -71,13 +71,13 @@ Already fixed in this repo's runtime: the 64-bit wait ordering (black screen), t
 
 ## 🚀 Run it
 
-> **You need your own unpacked GTA VI Xbox Series dump.** This repo contains **no game files** of any kind, and never will.
+> **You need your own unpacked Xbox Series copy of the game.** This repo contains **no game files** of any kind, and never will.
 
 **Requirements:** Windows 10/11 x64 · a D3D12 GPU with Shader Model 6.6 and mesh shaders (RTX 20-series / RX 6000 or newer) · 32 GB RAM recommended · [Rust](https://rustup.rs) (stable MSVC) · Windows SDK (for DXC)
 
 ```powershell
-git clone https://github.com/ZigZagBoi1/GTA6-PC-Native.git
-cd GTA6-PC-Native
+git clone https://github.com/ZigZagBoi1/ScarlettPort.git
+cd ScarlettPort
 .\scripts\setup.ps1 -Game "D:\path\to\your\dump"     # build + Agility SDK + precompile all shaders (~45 min, once)
 .\scripts\play.ps1  -Game "D:\path\to\your\dump" -AutoMenu
 ```
@@ -124,7 +124,7 @@ Every task is sized for **one person + one AI coding agent**. Pick one, comment 
 ## 🗂️ What's in here
 
 ```
-GTA6-PC-Native/
+ScarlettPort/
 ├── scripts/          setup.ps1, play.ps1: build and run
 ├── runtime/
 │   ├── xcl/          main runtime: console OS, D3D12.X, RDNA2 → HLSL → DXIL recompiler
@@ -138,13 +138,12 @@ GTA6-PC-Native/
 
 ## ⚖️ Legal
 
-- This project contains **no Rockstar or Take-Two code, assets or game files**, and no console SDK code. You must own the game and provide your own dump.
+- This project contains **no code, assets or files from the game or its publisher**, and no console SDK code. You must own the game and provide your own dump.
 - Nothing here decrypts, unpacks or bypasses DRM.
-- *Grand Theft Auto VI* is a trademark of Take-Two Interactive. This project is not affiliated with or endorsed by Rockstar Games or Take-Two.
 - `runtime/xcl` is GPL-2.0-only, © the XCL authors. `runtime/victory` is GPL-3.0-or-later, © the VIctory authors. Each keeps its own `LICENSE`. See [`LICENSE.md`](LICENSE.md).
 
 <div align="center">
 
-**If this got you hyped, star it ⭐ and share it. Every PR gets us closer to Vice City on PC.**
+**If this got you hyped, star it ⭐ and share it. Every PR gets us closer to playable.**
 
 </div>

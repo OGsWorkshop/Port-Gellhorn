@@ -1,4 +1,4 @@
-# Launches GTA VI from your own unpacked Xbox Series dump.
+# Launches the game from your own unpacked Xbox Series dump.
 # Usage: .\scripts\play.ps1 -Game "D:\path\to\dump" [-AutoMenu]
 param(
     [Parameter(Mandatory)] [string]$Game,
@@ -27,5 +27,5 @@ if ($AutoMenu) { $env:XCL_PRESS_AT = ((22..70 | Where-Object { ($_ - 22) % 6 -eq
 $logs = Join-Path $root 'logs'
 New-Item -ItemType Directory -Force $logs | Out-Null
 $log = Join-Path $logs ("run-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
-Write-Host "Starting GTA VI... log: $log" -ForegroundColor Cyan
+Write-Host "Starting... log: $log" -ForegroundColor Cyan
 & $xcl run $Game *> $log
