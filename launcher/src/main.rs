@@ -28,7 +28,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPO_URL: &str = "https://github.com/ZigZagBoi1/ScarlettPort";
 pub const PAYPAL_URL: &str = "https://www.paypal.me/SalwanStudios";
 pub const KOFI_URL: &str = "https://ko-fi.com/ziggymar";
-pub const PLAYABLE_PERCENT: f32 = 20.;
+pub const PLAYABLE_PERCENT: f32 = 25.;
 const MAX_LOG: usize = 3000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]

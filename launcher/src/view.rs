@@ -212,7 +212,7 @@ impl Launcher {
             self.start(RunKind::Pipelines);
         }
         let prog = row(52.);
-        section_row(ui, prog, "row-progress", Icon::Info, "Progress to playable", "Menus, loading and the open world run. Geometry passes are next.", Status { text: &format!("{PLAYABLE_PERCENT:.0}%"), color: None }, false);
+        section_row(ui, prog, "row-progress", Icon::Info, "Progress to playable", "Menus, loading and world streaming work. World rendering is next.", Status { text: &format!("{PLAYABLE_PERCENT:.0}%"), color: None }, false);
         let track = Rect::from_min_max(pos2(prog.min.x + 14., prog.max.y - 5.), pos2(prog.max.x - 14., prog.max.y - 3.));
         progress(&ui.painter().clone(), track, Some(PLAYABLE_PERCENT / 100.), time);
         let (status, color) = match self.fps {
