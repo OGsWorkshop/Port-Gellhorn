@@ -138,14 +138,14 @@ Two ways to run it:
 git clone https://github.com/ZigZagBoi1/ScarlettPort.git
 cd ScarlettPort
 .\scripts\setup-victory.ps1                                         # build + Agility SDK
-.\scripts\play-victory.ps1 -Game "D:\path	o\your\dump" -AutoInput -DebugView
+.\scripts\play-victory.ps1 -Game "D:\path\to\your\dump" -AutoInput -DebugView
 ```
 
 **B. XCL + launcher: menus and loading screens at 30 fps**
 
 ```powershell
-.\scripts\setup.ps1 -Game "D:\path	o\your\dump"     # build + Agility SDK + precompile all shaders (~45 min, once)
-.\scripts\play.ps1  -Game "D:\path	o\your\dump" -AutoMenu
+.\scripts\setup.ps1 -Game "D:\path\to\your\dump"     # build + Agility SDK + precompile all shaders (~45 min, once)
+.\scripts\play.ps1  -Game "D:\path\to\your\dump" -AutoMenu
 ```
 
 Or download the one-exe launcher from [Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases).
