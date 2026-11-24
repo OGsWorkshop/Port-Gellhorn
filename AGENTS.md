@@ -33,9 +33,8 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 
 ## Claim before you start
 
-This is a **local-only copy with no GitHub remote**. The former coordination issue and issue #313 no longer exist.
-Before changing anything, read the existing source and `docs/`, then tell the user what you found and what you intend
-to change. Do not set up a remote or publish this copy without an explicit decision from the user.
+The former coordination issue and issue #313 no longer exist. Before changing anything, read the existing source
+and `docs/`, then tell the user what you found and what you intend to change.
 
 - For the D3D12 → Vulkan layer (`runtime/shims/d3d12_*`, `runtime/src/vulkan_*`), read `docs/d3d12_vulkan.md`; it
   lists which D3D12 methods are still open.

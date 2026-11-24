@@ -1,3 +1,2 @@
 blank_issues_enabled: true
-# Local-only project with no GitHub remote. See README.md#how-to-build for prerequisites,
-# Build.bat, and the make_game.py options.
+# See README.md#how-to-build for prerequisites, Build.bat, and the make_game.py options.

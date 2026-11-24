@@ -30,9 +30,8 @@ happens **on your PC, from your own copy of the game**.
 
 > [!NOTE]
 > Port Gellhorn is an independent local successor to the Leonida project, which is no longer available on GitHub.
-> Every source file and the full git history were preserved under the original GPL-3.0 license. This copy has no
-> GitHub remote and is for local development only. Game-world references to Leonida in the docs and code are left
-> intact because they name places in the game, not this project.
+> Every source file and the full git history were preserved under the original GPL-3.0 license. Game-world references
+> to Leonida in the docs and code are left intact because they name places in the game, not this project.
 
 > [!IMPORTANT]
 > This repository **does not contain the game, keys or an executable**, and it does not explain how to get them. You
@@ -71,8 +70,9 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
 **The easy way:**
 
 1. Install the prerequisites below.
-2. Use this local copy. It already includes the `third_party/rpf9-explorer` submodule and its git history. There is
-   no GitHub remote: do not clone or publish it.
+2. Clone with its submodule: `git clone --recursive https://github.com/OGsWorkshop/Port-Gellhorn.git`. A
+   "Download ZIP" leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed, and otherwise
+   tells you what to do.
 3. Double-click **`Build.bat`**.
 
 It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents (also where Windows keeps them,
