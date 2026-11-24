@@ -4182,6 +4182,28 @@ index 2995f05..2cde570 100644
      /// Reproduces the exact intra-list fork-join pattern seen on retail compute queues:
      ///   q_compute list O_c: Write64(cell_A, frame) -> Wait64(cell_B >= frame) -> Write64(cell_C, frame)
      ///   q_direct  list O_d: Wait64(cell_A >= frame) -> Write64(cell_B, frame)
+diff --git a/crates/xcl/src/hle/d3d12x/present.rs b/crates/xcl/src/hle/d3d12x/present.rs
+index 01b3c92..fb24191 100644
+--- a/crates/xcl/src/hle/d3d12x/present.rs
++++ b/crates/xcl/src/hle/d3d12x/present.rs
+@@ -398,7 +398,7 @@ unsafe fn show_compiling(hwnd: HWND) {
+         }
+         last.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+     };
+-    let title = format!("XCL – {} | {fps:.1} FPS", window_name());
++    let title = format!("Ziggy – {} | {fps:.1} FPS", window_name());
+     let text = if recent {
+         let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
+         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
+@@ -434,7 +434,7 @@ fn window_thread() {
+         let hwnd = CreateWindowExW(
+             WINDOW_EX_STYLE(0),
+             class,
+-            &HSTRING::from(format!("XCL – {title}")),
++            &HSTRING::from(format!("Ziggy – {title}")),
+             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+             x,
+             y,
 diff --git a/crates/xcl/src/hle/d3d12x/pso_async.rs b/crates/xcl/src/hle/d3d12x/pso_async.rs
 index b303cf5..33a85cf 100644
 --- a/crates/xcl/src/hle/d3d12x/pso_async.rs
@@ -5155,6 +5177,19 @@ index 52c49af..40faa60 100644
          run_tls_callbacks(m, 1);
      }
      READY.store(true, Ordering::Release);
+diff --git a/crates/xcl/src/main.rs b/crates/xcl/src/main.rs
+index 83ed102..4e9e658 100644
+--- a/crates/xcl/src/main.rs
++++ b/crates/xcl/src/main.rs
+@@ -237,7 +237,7 @@ fn pick_game_file() -> Option<PathBuf> {
+     let f = unsafe { system_proc("comdlg32.dll", "GetOpenFileNameW") }?;
+     // pairs of (description, pattern), each ending in NUL, the list in one more
+     let filter: Vec<u16> = "Xbox game (*.exe, MicrosoftGame.config)\0*.exe;MicrosoftGame.config\0All files\0*.*\0\0".encode_utf16().collect();
+-    let title = wide("XCL – choose a game");
++    let title = wide("Ziggy – choose a game");
+     let mut file = vec![0u16; 32768];
+     let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
 diff --git a/crates/xcl/src/report.rs b/crates/xcl/src/report.rs
 index 378f4b3..d54f98b 100644
 --- a/crates/xcl/src/report.rs

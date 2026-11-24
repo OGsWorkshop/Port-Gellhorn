@@ -237,7 +237,7 @@ fn pick_game_file() -> Option<PathBuf> {
     let f = unsafe { system_proc("comdlg32.dll", "GetOpenFileNameW") }?;
     // pairs of (description, pattern), each ending in NUL, the list in one more
     let filter: Vec<u16> = "Xbox game (*.exe, MicrosoftGame.config)\0*.exe;MicrosoftGame.config\0All files\0*.*\0\0".encode_utf16().collect();
-    let title = wide("XCL – choose a game");
+    let title = wide("Ziggy – choose a game");
     let mut file = vec![0u16; 32768];
     let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
