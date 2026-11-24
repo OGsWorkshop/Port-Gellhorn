@@ -48,8 +48,15 @@ Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 
 ## Project status
 
-**Early. The game does not boot yet.** Everything that can be done without the game's executable is in place, so
-work on booting can start as soon as one is available to a developer.
+**The game boots through the bundled VIctory runtime.** `victory/` is the VIctory project, included as a git subtree
+with its original history. It runs the title's x86-64 code on Windows and presents frames through D3D12. Combined
+with Port Gellhorn's RDNA2 → SPIR-V translator, asset tools and measured console formats, this gives working boot,
+first-boot screens, intro video, menus, and loading into the world. World rendering is still incomplete; see
+[victory/README.md](victory/README.md) for the detailed subsystem status.
+
+`Run-Victory.ps1` launches the title from this repository with the game package, cache and saves kept outside it.
+A diagnostics build (`cargo build --profile diag -p victory --features diagnostics`, from `victory/`) can capture
+presented frames with `VICTORY_CAPTURE=<dir>`.
 
 | What | Status |
 |---|---|
