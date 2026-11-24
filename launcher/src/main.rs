@@ -7,6 +7,7 @@ mod display;
 mod flow;
 mod game;
 mod runtime;
+mod saves;
 mod theme;
 mod view;
 
@@ -124,6 +125,12 @@ pub struct Launcher {
     pub mark: egui::TextureHandle,
     pub art: egui::TextureHandle,
     pub shot: Option<(String, u32)>,
+    /// Result line of the last save backup (Settings, Game).
+    pub save_note: String,
+    /// When the current Play run started (a crash report newer than this belongs to it).
+    pub play_since: Option<std::time::SystemTime>,
+    /// The crash report written by the last Play run, if it crashed.
+    pub crash_report: Option<PathBuf>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -205,6 +212,9 @@ impl Launcher {
             mark,
             art,
             shot: std::env::args().find_map(|a| a.strip_prefix("--screenshot=").map(|p| (p.to_string(), 0))),
+            save_note: String::new(),
+            play_since: None,
+            crash_report: None,
         };
         if fresh_cache {
             l.save();
@@ -288,6 +298,25 @@ impl Launcher {
         });
     }
 
+    /// Copies the title's saves to `<cache>\save-backups\<date>` and keeps the newest `saves::KEEP`.
+    pub fn backup_saves(&mut self) -> Option<String> {
+        if !self.game_ok {
+            return None;
+        }
+        let data = game::title_data_dir(std::path::Path::new(&self.config.game_path));
+        let root = saves::backup_root(&self.config.cache_dir);
+        let note = match saves::backup(&saves::sources(&data), &root, &saves::now_stamp()) {
+            Ok(Some((dest, files, bytes))) => {
+                saves::prune(&root, saves::KEEP);
+                format!("Backed up {files} files ({}) to {}", game::human(bytes), dest.display())
+            }
+            Ok(None) => "No saves to back up yet.".to_string(),
+            Err(e) => format!("Backup failed: {e}"),
+        };
+        self.log(note.clone(), LogKind::Info);
+        Some(note)
+    }
+
     pub fn start(&mut self, kind: RunKind) {
         if self.running.is_some() {
             return;
@@ -303,6 +332,11 @@ impl Launcher {
             return;
         }
         let game = PathBuf::from(&self.config.game_path);
+        if kind == RunKind::Play {
+            self.save_note = self.backup_saves().unwrap_or_default();
+            self.play_since = Some(std::time::SystemTime::now());
+            self.crash_report = None;
+        }
         let _ = std::fs::create_dir_all(game::dxil_dir(&self.config.cache_dir));
         let mut cmd = Command::new(runtime::xcl_exe());
         cmd.current_dir(&rt)
@@ -499,12 +533,16 @@ impl Launcher {
                             RunKind::Play => {}
                         }
                     }
+                    if kind == RunKind::Play && code != Some(0) {
+                        let since = self.play_since.unwrap_or(std::time::UNIX_EPOCH);
+                        self.crash_report = saves::fresh_report(&saves::reports_dir(), since);
+                    }
                     let note = match code {
                         Some(0) => "Finished.".to_string(),
                         Some(c) => format!("Stopped (exit code {c})."),
                         None => "Stopped.".to_string(),
                     };
-                    self.status = note.clone();
+                    self.status = if self.crash_report.is_some() { "The game crashed - a report was saved.".to_string() } else { note.clone() };
                     self.log(
                         format!(
                             "{} ended. {note}",

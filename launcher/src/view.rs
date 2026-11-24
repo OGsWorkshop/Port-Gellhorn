@@ -3,6 +3,7 @@
 use crate::theme::*;
 use crate::flow::{self, Stage, World};
 use crate::game;
+use crate::saves;
 use crate::{Launcher, LogKind, Page, RunKind, GAME_EXE, KOFI_URL, PAYPAL_URL, PLAYABLE_PERCENT, REPO_URL, VERSION};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, Rect, Sense, Stroke, Ui};
 use std::time::{Duration, Instant};
@@ -474,7 +475,21 @@ impl Launcher {
             let all: Vec<&str> = self.logs.iter().map(|(t, _)| t.as_str()).collect();
             ui.ctx().copy_text(all.join("\n"));
         }
-        let panel = Rect::from_min_max(pos2(area.min.x, 100.), area.max);
+        if link(ui, pos2(area.max.x - 128., 72.), Align2::RIGHT_TOP, "log-crashes", "Open crash reports") {
+            saves::open_folder(&saves::reports_dir());
+        }
+        let mut top = 100.;
+        if let Some(report) = self.crash_report.clone() {
+            let banner = Rect::from_min_size(pos2(area.min.x, top), vec2(area.width(), 48.));
+            p.rect_filled(banner, RADIUS_MD, BG_100);
+            p.rect_stroke(banner, RADIUS_MD, Stroke::new(1.0_f32, DANGER), egui::StrokeKind::Inside);
+            p.text(banner.left_center() + vec2(16., 0.), Align2::LEFT_CENTER, "The game crashed \u{2013} a report was saved", font(14., "semibold"), TEXT);
+            if button(ui, Rect::from_center_size(pos2(banner.max.x - 56., banner.center().y), vec2(88., CONTROL)), "crash-open", "Open", Kind::Secondary, true, None) {
+                saves::reveal(&report);
+            }
+            top += 48. + 8.;
+        }
+        let panel = Rect::from_min_max(pos2(area.min.x, top), area.max);
         p.rect_filled(panel, RADIUS_MD, BG_100);
         p.rect_stroke(panel, RADIUS_MD, Stroke::new(1.0_f32, LINE), egui::StrokeKind::Inside);
         let inner = panel.shrink2(vec2(14., 10.));
@@ -563,7 +578,28 @@ impl Launcher {
         let (note, ok) = self.folder_note.clone();
         let note_color = if self.folder_busy { TEXT_MUTED } else if ok { SUCCESS } else { mix(DANGER, TEXT, 0.2) };
         let galley = p.layout(note, font(12.5, "regular"), note_color, c.width());
+        let note_h = galley.size().y;
         p.galley(pos2(c.min.x, by + CONTROL + 12.), galley, note_color);
+
+        let top = by + CONTROL + 12. + note_h + 26.;
+        let data = if self.game_ok { Some(game::title_data_dir(std::path::Path::new(&self.config.game_path))) } else { None };
+        caption(&p, pos2(c.min.x, top), Align2::LEFT_TOP, "Saves");
+        let shown = match &data {
+            Some(d) => fit_end(ui, &saves::saves_dir(d).display().to_string(), font(12.5, "regular"), c.width()),
+            None => "Pick the game folder first.".to_string(),
+        };
+        p.text(pos2(c.min.x, top + 20.), Align2::LEFT_TOP, shown, font(12.5, "regular"), TEXT_MUTED);
+        let sy = top + 46.;
+        if button(ui, Rect::from_min_size(pos2(c.min.x, sy), vec2(132., CONTROL)), "saves-open", "Open folder", Kind::Secondary, data.is_some(), Some(Icon::Folder)) {
+            if let Some(d) = &data {
+                saves::open_folder(&saves::saves_dir(d));
+            }
+        }
+        if button(ui, Rect::from_min_size(pos2(c.min.x + 140., sy), vec2(132., CONTROL)), "saves-backup", "Back up now", Kind::Secondary, data.is_some() && self.running.is_none(), Some(Icon::Download)) {
+            self.save_note = self.backup_saves().unwrap_or_default();
+        }
+        p.text(pos2(c.min.x, sy + CONTROL + 12.), Align2::LEFT_TOP, fit_end(ui, &self.save_note, font(12.5, "regular"), c.width()), font(12.5, "regular"), TEXT_MUTED);
+        p.text(pos2(c.min.x, sy + CONTROL + 32.), Align2::LEFT_TOP, format!("Saves are also backed up before each Play (the last {} are kept).", saves::KEEP), font(12., "regular"), TEXT_FAINT);
     }
 
     fn settings_display(&mut self, ui: &mut Ui, c: Rect) {
