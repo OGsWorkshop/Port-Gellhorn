@@ -1,0 +1,80 @@
+{
+  "name": "scarlettport-launcher",
+  "version": "0.1.0",
+  "description": "ScarlettPort desktop launcher",
+  "private": true,
+  "homepage": "./",
+  "main": "electron/main.js",
+  "dependencies": {
+    "@fontsource/poppins": "^4.5.10",
+    "react": "^16.13.1",
+    "react-dom": "^16.13.1",
+    "react-icons": "^3.11.0",
+    "react-scripts": "3.4.3",
+    "styled-components": "^5.2.0"
+  },
+  "scripts": {
+    "start": "cross-env BROWSER=none NODE_OPTIONS=--openssl-legacy-provider react-scripts start",
+    "build": "cross-env NODE_OPTIONS=--openssl-legacy-provider react-scripts build",
+    "electron": "electron .",
+    "dev": "concurrently -k \"npm start\" \"wait-on http://localhost:3000 && electron .\"",
+    "dist": "npm run stage-runtime && npm run build && electron-builder",
+    "stage-runtime": "node tools/stage-runtime.js"
+  },
+  "devDependencies": {
+    "concurrently": "^5.3.0",
+    "cross-env": "^7.0.3",
+    "electron": "^13.6.9",
+    "electron-builder": "^22.14.13",
+    "wait-on": "^5.3.0"
+  },
+  "build": {
+    "extends": null,
+    "publish": null,
+    "appId": "app.scarlettport.launcher",
+    "productName": "ScarlettPort",
+    "icon": "src/assets/icon.png",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "build/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "src/assets/icon.png"
+    },
+    "asar": true,
+    "extraResources": [
+      {
+        "from": "runtime-bundle",
+        "to": "runtime"
+      }
+    ],
+    "portable": {
+      "artifactName": "ScarlettPort.exe"
+    }
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version"
+    ]
+  }
+}

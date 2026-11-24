@@ -27,3 +27,9 @@ cache/
 victory.toml
 xcl.toml
 .env
+
+# Launcher
+launcher/node_modules
+launcher/dist
+launcher/build
+launcher/runtime-bundle
