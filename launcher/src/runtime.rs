@@ -26,7 +26,13 @@ pub fn xcl_exe() -> PathBuf {
     runtime_dir().join("xcl.exe")
 }
 
-fn bundle_hash() -> String {
+/// Hash of the embedded runtime (computed once; it is what "shaders built for" refers to).
+pub fn bundle_hash() -> &'static str {
+    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    H.get_or_init(compute_hash)
+}
+
+fn compute_hash() -> String {
     let mut h = Sha256::new();
     for (name, bytes) in FILES {
         h.update(name.as_bytes());

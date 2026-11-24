@@ -1,6 +1,8 @@
 //! Every screen. Same shell, spacing and widgets as the reference design; all colours,
 //! type and widgets come from theme.rs.
 use crate::theme::*;
+use crate::flow::{self, Stage, World};
+use crate::game;
 use crate::{Launcher, LogKind, Page, RunKind, GAME_EXE, KOFI_URL, PAYPAL_URL, PLAYABLE_PERCENT, REPO_URL, VERSION};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, Rect, Sense, Stroke, Ui};
 use std::time::{Duration, Instant};
@@ -152,37 +154,72 @@ impl Launcher {
         let mut y = header.max.y + 16.;
         let mut row = |h: f32| {
             let rect = Rect::from_min_max(pos2(area.min.x, y), pos2(area.max.x, y + h));
-            y += h + 10.;
+            y += h + 6.;
             rect
         };
-        let (status, color) = if self.game_ok { ("Verified", Some(SUCCESS)) } else { ("Not set", Some(WARNING)) };
-        let path = if self.game_ok { self.config.game_path.clone() } else { format!("Pick the folder that contains {GAME_EXE}") };
-        if section_row(ui, row(58.), "row-game", Icon::Folder, "Game files", &path, Status { text: status, color }, true) {
+        let missing = game::missing(&self.game_checks);
+        let (status, color) = if !self.game_ok {
+            ("Not set".to_string(), Some(WARNING))
+        } else if missing.is_empty() {
+            ("Ready".to_string(), Some(SUCCESS))
+        } else {
+            (format!("Missing {}", missing.iter().map(|m| m.trim_end_matches(".exe")).collect::<Vec<_>>().join(", ")), Some(WARNING))
+        };
+        let path = if self.game_ok { game::summary(&self.game_checks) } else { format!("Pick the folder that contains {GAME_EXE}") };
+        if section_row(ui, row(52.), "row-game", Icon::Folder, "Game files", &path, Status { text: &status, color }, true) {
             self.settings_tab = 0;
             self.go(Page::Settings);
         }
         let (status, color) = if self.runtime_dir.is_some() { ("Ready", Some(SUCCESS)) } else { ("Unpacking…", None) };
         let note = self.runtime_note.clone();
-        if section_row(ui, row(58.), "row-runtime", Icon::Server, "XCL runtime", &note, Status { text: status, color }, true) {
+        if section_row(ui, row(52.), "row-runtime", Icon::Server, "XCL runtime", &note, Status { text: status, color }, true) {
             self.settings_tab = 2;
             self.go(Page::Settings);
         }
-        let (meta, status) = match self.shader {
-            Some((d, t, s)) => (format!("{d} of {t} shaders  ·  {s} s elapsed"), format!("{}%", d * 100 / t.max(1))),
-            None => ("Build the shader cache once (about 45 min, resumable)".to_string(), "Open".to_string()),
+        let stage = self.stage();
+        let (meta, status, color) = match stage {
+            Stage::BuildingShaders => match self.shader {
+                Some((d, t, s)) => {
+                    let eta = self.eta_secs.map(|e| format!("  ·  about {} left", flow::duration(e))).unwrap_or_default();
+                    (format!("{d} of {t} shaders  ·  {s} s elapsed{eta}"), format!("{}%", d * 100 / t.max(1)), None)
+                }
+                None => ("Starting the shader build…".to_string(), "Building".to_string(), None),
+            },
+            Stage::Ready => ("Built for this runtime".to_string(), "Ready".to_string(), Some(SUCCESS)),
+            Stage::ShadersNotBuilt if self.shaders_stale() => ("The runtime changed since the shaders were built. Rebuild them (resumes where it stopped).".to_string(), "Stale".to_string(), Some(WARNING)),
+            Stage::ShadersNotBuilt => ("Build the shader cache once (about 45 min, resumable)".to_string(), "Not built".to_string(), Some(WARNING)),
+            Stage::GameNotSet => ("Needs the game folder first".to_string(), "Waiting".to_string(), None),
         };
-        if section_row(ui, row(58.), "row-shaders", Icon::Download, "Shaders", &meta, Status { text: &status, color: None }, true) {
+        if section_row(ui, row(52.), "row-shaders", Icon::Download, "Shaders", &meta, Status { text: &status, color }, true) {
             self.go(Page::Setup);
         }
-        let prog = row(58.);
-        section_row(ui, prog, "row-progress", Icon::Info, "Progress to playable", "Menus, loading and the open world run. Geometry passes are next.", Status { text: &format!("{PLAYABLE_PERCENT:.0}%"), color: None }, false);
+        let world = self.world();
+        let (meta, status, color) = match world {
+            World::Waiting => ("Build the shaders first".to_string(), "Waiting", None),
+            World::NeedPlay => ("Play once to record world pipelines".to_string(), "No journal", None),
+            World::Available => ("Build the pipelines your last run recorded (2 threads, low priority)".to_string(), "Build", Some(WARNING)),
+            World::Building => (
+                match self.world_progress {
+                    Some((d, l)) => format!("{d} done, {l} left"),
+                    None => "Starting…".to_string(),
+                },
+                "Building",
+                None,
+            ),
+            World::Done => ("Up to date with your last run".to_string(), "Ready", Some(SUCCESS)),
+        };
+        if section_row(ui, row(52.), "row-world", Icon::Server, "World pipelines", &meta, Status { text: status, color }, world == World::Available) {
+            self.start(RunKind::Pipelines);
+        }
+        let prog = row(52.);
+        section_row(ui, prog, "row-progress", Icon::Info, "Progress to playable", "Menus, loading and world streaming work. World rendering is next.", Status { text: &format!("{PLAYABLE_PERCENT:.0}%"), color: None }, false);
         let track = Rect::from_min_max(pos2(prog.min.x + 14., prog.max.y - 5.), pos2(prog.max.x - 14., prog.max.y - 3.));
         progress(&ui.painter().clone(), track, Some(PLAYABLE_PERCENT / 100.), time);
         let (status, color) = match self.fps {
             Some(f) => (format!("{f:.1} fps"), Some(SUCCESS)),
             None => ("Not running".to_string(), None),
         };
-        if section_row(ui, row(58.), "row-fps", Icon::History, "Frame rate", "Read live from the game log", Status { text: &status, color }, true) {
+        if section_row(ui, row(52.), "row-fps", Icon::History, "Frame rate", "Read live from the game log", Status { text: &status, color }, true) {
             self.go(Page::Logs);
         }
     }
@@ -214,16 +251,32 @@ impl Launcher {
         p.text(pos2(x, bottom - 30.), Align2::LEFT_BOTTOM, "ScarlettPort", font(30., "black"), Color32::WHITE);
 
         let running = self.running;
+        let stage = self.stage();
         let (fraction, mut meta_color): (Option<Option<f32>>, Color32) = match running {
             Some(RunKind::Precompile) => (Some(self.shader.map(|(d, t, _)| d as f32 / t.max(1) as f32)), white(0.75)),
+            Some(RunKind::Pipelines) => (Some(self.world_progress.map(|(d, l)| d as f32 / (d + l).max(1) as f32)), white(0.75)),
             Some(RunKind::Play) => (Some(None), white(0.75)),
             None => (None, white(0.75)),
         };
-        let meta = if running.is_some() && !self.status.is_empty() {
+        let meta = if running == Some(RunKind::Precompile) {
+            match self.shader {
+                Some((d, t, secs)) => {
+                    let eta = self.eta_secs.map(|e| format!("  ·  about {} left", flow::duration(e))).unwrap_or_default();
+                    format!("Building shaders {d}/{t}  ·  {} elapsed{eta}", flow::duration(secs))
+                }
+                None => self.status.clone(),
+            }
+        } else if running.is_some() && !self.status.is_empty() {
             self.status.clone()
         } else if !self.game_ok {
             meta_color = WARNING;
-            format!("Pick your game folder to begin  ·  needs {GAME_EXE}")
+            format!("Step 1: pick your game folder  ·  needs {GAME_EXE}")
+        } else if stage == Stage::GameNotSet {
+            meta_color = WARNING;
+            format!("Game folder incomplete  ·  missing {}", game::missing(&self.game_checks).join(", "))
+        } else if stage == Stage::ShadersNotBuilt {
+            meta_color = WARNING;
+            if self.shaders_stale() { "Runtime updated  ·  rebuild the shaders before playing".to_string() } else { "Step 2: build the shaders once (about 45 min)  ·  then press Play".to_string() }
         } else if !self.status.is_empty() {
             self.status.clone()
         } else {
@@ -237,8 +290,28 @@ impl Launcher {
             if button_font(ui, button_rect, "hdr-stop", "Stop", Kind::Secondary, true, Some(Icon::Stop), font(15., "bold"), 0.) {
                 self.stop_run();
             }
-        } else if button_font(ui, button_rect, "hdr-play", "PLAY", Kind::Primary, self.runtime_dir.is_some(), Some(Icon::Play), font(15., "black"), 2.) {
-            self.start(RunKind::Play);
+        } else {
+            let (text, kind_font, tracking) = match stage {
+                Stage::GameNotSet => ("SELECT GAME", font(13., "black"), 1.5),
+                Stage::ShadersNotBuilt | Stage::BuildingShaders => ("BUILD SHADERS", font(13., "black"), 1.5),
+                Stage::Ready => ("PLAY", font(15., "black"), 2.),
+            };
+            let enabled = match stage {
+                Stage::GameNotSet => !self.folder_busy,
+                _ => self.runtime_dir.is_some(),
+            };
+            let icon = if stage == Stage::Ready { Icon::Play } else if stage == Stage::GameNotSet { Icon::Folder } else { Icon::Download };
+            if button_font(ui, button_rect, "hdr-play", text, Kind::Primary, enabled, Some(icon), kind_font, tracking) {
+                match stage {
+                    Stage::GameNotSet => self.pick_folder(),
+                    Stage::ShadersNotBuilt => self.confirm_precompile = true,
+                    Stage::Ready => self.start(RunKind::Play),
+                    Stage::BuildingShaders => {}
+                }
+            }
+            if stage != Stage::Ready && self.game_ok && self.runtime_dir.is_some() && link(ui, pos2(button_rect.center().x - 28., button_rect.max.y + 12.), Align2::LEFT_CENTER, "hdr-anyway", "play anyway") {
+                self.start(RunKind::Play);
+            }
         }
         if let Some(f) = fraction {
             let line = Rect::from_min_max(pos2(rect.min.x + 1., rect.max.y - 3.), pos2(rect.max.x - 1., rect.max.y - 1.));
@@ -506,6 +579,30 @@ impl Launcher {
             self.config.auto_menu = on;
             self.save();
         }
+
+        let top = row.max.y + 28.;
+        caption(&p, pos2(c.min.x, top), Align2::LEFT_TOP, "Cache location");
+        p.text(pos2(c.min.x, top + 20.), Align2::LEFT_TOP, "Compiled shaders go to <folder>\\dxil. It needs about 40 GB, so pick a drive with room.", font(12.5, "regular"), TEXT_MUTED);
+        let field = Rect::from_min_size(pos2(c.min.x, top + 46.), vec2(c.width().min(640.), 44.));
+        let busy = self.running.is_some();
+        if text_field(ui, field, "cache-edit", &mut self.config.cache_dir, "Folder", Some(Icon::Folder), !busy).changed() {
+            self.cache_free = None;
+            self.save();
+        }
+        let by = field.max.y + 10.;
+        if button(ui, Rect::from_min_size(pos2(c.min.x, by), vec2(150., CONTROL)), "cache-default", "Use default", Kind::Secondary, !busy, Some(Icon::Refresh)) {
+            self.config.cache_dir = game::default_cache();
+            self.cache_free = None;
+            self.save();
+        }
+        let dir = self.config.cache_dir.trim().to_string();
+        let drive = if dir.as_bytes().get(1) == Some(&b':') { format!("{}:", &dir[..1].to_uppercase()) } else { "That drive".to_string() };
+        let (text, color) = match self.cache_free.and_then(|(_, f)| f) {
+            Some(f) if f < game::LOW_SPACE => (format!("{drive} has only {} free. The shader cache needs about 40 GB.", game::human(f)), WARNING),
+            Some(f) => (format!("{drive} has {} free.", game::human(f)), SUCCESS),
+            None => ("Free space unknown: the folder or its drive was not found.".to_string(), WARNING),
+        };
+        p.text(pos2(c.min.x, by + CONTROL + 12.), Align2::LEFT_TOP, text, font(12.5, "regular"), color);
     }
 
     fn settings_about(&mut self, ui: &mut Ui, c: Rect) {
