@@ -1,11 +1,9 @@
 # Launches GTA VI from your own unpacked Xbox Series dump.
-# Usage: .\scripts\play.ps1 -Game "D:\path\to\dump" [-AutoMenu] [-Lazy]
+# Usage: .\scripts\play.ps1 -Game "D:\path\to\dump" [-AutoMenu]
 param(
     [Parameter(Mandatory)] [string]$Game,
-    # Press A every 3 s from 20 s to 200 s, to walk the menus hands-free.
-    [switch]$AutoMenu,
-    # Compile shaders on first use instead of up front (faster start, black until compiled).
-    [switch]$Lazy
+    # Press A every 6 s from 22 s to 70 s: walks the account picker and title screens hands-free.
+    [switch]$AutoMenu
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -16,8 +14,12 @@ if (-not (Test-Path (Join-Path $Game 'game_scarlett_master.exe'))) {
     throw "No game_scarlett_master.exe in '$Game'. Point -Game at your unpacked dump."
 }
 
-if (-not $Lazy) { $env:XCL_LAZY_PSO = '0' }
-if ($AutoMenu)  { $env:XCL_PRESS_A_AT = ((20..200 | Where-Object { ($_ - 20) % 3 -eq 0 }) -join ',') }
+# Fewer parallel shader compiles: 32 GB machines run out of memory with the default.
+$env:XCL_DXC_THREADS = '4'
+# Write button names here ("A", "DOWN DOWN A") to press them while the game runs.
+$env:XCL_PRESS_FILE = Join-Path $root 'press.txt'
+Set-Content -Path $env:XCL_PRESS_FILE -Value '' -NoNewline
+if ($AutoMenu) { $env:XCL_PRESS_AT = ((22..70 | Where-Object { ($_ - 22) % 6 -eq 0 }) | ForEach-Object { "${_}:A" }) -join ',' }
 
 $logs = Join-Path $root 'logs'
 New-Item -ItemType Directory -Force $logs | Out-Null

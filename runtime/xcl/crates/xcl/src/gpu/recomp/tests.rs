@@ -5683,6 +5683,124 @@ fn mesh_split_wave64_form() {
     assert!(super::translate_mesh(&lane, ms, true, true, 1).unwrap().hlsl.contains("xcl_x_rla_uniform("));
 }
 
+/// Split wave64: the half, the console wave and the other half's size come from the hardware
+/// wave's first console thread (`xcl_wb`, through `WaveReadLaneFirst`), so the GPU compiler
+/// knows them – and the exchanged EXEC / VCC / SGPRs and their branches – to be wave-uniform.
+/// The values are those of the per-lane formulas they replace: checked against them for every
+/// group size up to 1024 and several orders in which the hardware waves take their console
+/// threads (`xcl_x_thread`), and the HLSL of each mode pinned (the native forms keep theirs).
+#[test]
+fn split_wave64_wave_uniform_half() {
+    // xcl_x_thread: each full hardware wave takes the next 32 console threads from a counter
+    // as it arrives, a partial one (threads % 32) the last ones; lane = the prefix count
+    for threads in 1u32..=1024 {
+        let full = threads / 32;
+        for rot in [0u32, 1, full / 2, full.saturating_sub(1)] {
+            let mut bases: Vec<u32> = (0..full).map(|k| 32 * ((k + rot) % full.max(1))).collect();
+            let rest = threads % 32;
+            if rest != 0 {
+                bases.push(threads & !31);
+            }
+            for &base in &bases {
+                let n = if base == threads & !31 && rest != 0 { rest } else { 32 };
+                let wb = base & !31; // WaveReadLaneFirst(xcl_tid) & ~31u: the first lane's prefix is 0
+                for p in 0..n {
+                    let tid = base + p;
+                    let xn_old = if threads > ((tid & !31) ^ 32) { 32u32.min(threads - ((tid & !31) ^ 32)) } else { 0 };
+                    let xn_new = if threads > (wb ^ 32) { 32u32.min(threads - (wb ^ 32)) } else { 0 };
+                    assert_eq!(((tid >> 5) & 1, tid >> 6, xn_old), ((wb >> 5) & 1, wb >> 6, xn_new), "{threads} threads, console thread {tid}");
+                    // the wave index of TG_SIZE and of mesh s3 (gi / 64 with gi = xcl_tid)
+                    assert_eq!(tid / 64, wb >> 6, "{threads} threads, console thread {tid}");
+                }
+            }
+        }
+    }
+    let code = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(40)),
+        ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 2)], None), // TG_SIZE in compute
+    ]);
+    let entry = "    uint xcl_tid = xcl_x_thread(gi);\n    lane_id = xcl_tid & 63u;\n    uint xcl_wb = WaveReadLaneFirst(xcl_tid) & ~31u;\n    xcl_half = (xcl_wb >> 5) & 1u;\n    xcl_cw = xcl_wb >> 6;\n    xcl_xn = XCL_X_THREADS > (xcl_wb ^ 32u) ? min(32u, XCL_X_THREADS - (xcl_wb ^ 32u)) : 0u;\n";
+    let cs = |threads: u32| Mode::Compute(super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 });
+    let ms = Mode::Mesh(super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] });
+    for mode in [Mode::Kernel, cs(96), cs(256), ms] {
+        let split = translate(&code, &Options { mode: mode.clone(), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+        assert!(split.complete(), "{:?}", split.unsupported_why);
+        assert!(split.hlsl.contains(entry), "{mode:?}\n{}", split.hlsl);
+        assert!(!split.hlsl.contains("(xcl_tid >> 5)") && !split.hlsl.contains("xcl_tid >> 6"), "{mode:?}");
+        let native = translate(&code, &Options { mode: mode.clone(), wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+        assert!(!native.hlsl.contains("xcl_wb") && !native.hlsl.contains("xcl_cw"), "{mode:?}");
+        match &mode {
+            Mode::Compute(c) => {
+                // TG_SIZE (s2): the wave index is the console wave
+                let w = c.threads[0].div_ceil(64);
+                assert!(split.hlsl.contains(&format!("    s2 = {w}u | (xcl_cw << 6);\n")), "{}", split.hlsl);
+                assert!(native.hlsl.contains(&format!("    s2 = {w}u | ((gi / 64u) << 6);\n")), "{}", native.hlsl);
+            }
+            Mode::Mesh(_) => {
+                assert!(split.hlsl.contains("    uint xcl_wave = xcl_cw;\n"));
+                assert!(native.hlsl.contains("    uint xcl_wave = gi / 64u;\n"));
+            }
+            _ => {}
+        }
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&split.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", split.hlsl));
+        }
+    }
+}
+
+/// Groups that are not a multiple of 64 threads (a console wave without its upper half, or
+/// with part of it) and several console waves per group: EXEC at entry (the other half's
+/// size), a mask read whole (s_bcnt1 of vcc: exchanged), a mask read lane by lane (half-local)
+/// and TG_SIZE's wave index give the console's values in every console wave – the half, the
+/// console wave and the other half's size of the split form (32-lane GPUs) included.
+#[test]
+fn gpu_split_wave64_partial_groups() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    // out[thread] = (popcount(vcc = lane < 40), popcount(exec), TG_SIZE, lane < 20 ? 7 : 5)
+    let p = prog(&[
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 0)], Some(63)), // lane
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 2)], Some(40)),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 106)], None),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 126)], None),
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 2), ("SRC1", 255)], Some(20)),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", 133), ("SRC1", 135), ("SRC2", 20)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 11)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 132), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    for threads in [40u32, 64, 96, 100, 160, 256] {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if runner::split_wave64() {
+            assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "{threads}: the vcc read whole");
+            assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 1, "{threads}: the selector");
+        }
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        // three groups, all writing the same values to the same addresses (v0 = thread in the group)
+        let out = runner::dispatch(&dxil, [3, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; (threads * 4) as usize]).unwrap();
+        let waves = threads.div_ceil(64);
+        for k in 0..threads {
+            let (w, l) = (k / 64, k % 64);
+            let n = 64.min(threads - 64 * w);
+            let at = (4 * k) as usize;
+            let what = format!("{threads} threads, thread {k} (console wave {w}, lane {l})");
+            assert_eq!(out[at], n.min(40), "{what}: s_bcnt1 of vcc");
+            assert_eq!(out[at + 1], n, "{what}: s_bcnt1 of exec at entry");
+            assert_eq!(out[at + 2], waves | w << 6, "{what}: TG_SIZE");
+            assert_eq!(out[at + 3], if l < 20 { 7 } else { 5 }, "{what}: v_cndmask on a half-local mask");
+        }
+    }
+}
+
 /// Operations whose result spans both 32-lane halves of a wave64 – what the split form
 /// exchanges: masks with bits in either half (counted, scanned, branched on), readlane /
 /// readfirstlane of a lane in the other half, ds_bpermute across the halves, a GLC scalar
@@ -5788,6 +5906,138 @@ fn gpu_split_wave64_lane_local_masks() {
         let sum = a + ((7u64 << 32) | 0x20);
         assert_eq!((v[4], v[5]), (sum as u32, (sum >> 32) as u32), "lane {l}: 64-bit add with carry");
     }
+}
+
+/// Split-wave64 uniform lane-read batching rules: consecutive independent reads share one
+/// multi-word `xcl_x_meet()`, while SGPR/EXEC dependencies, jump targets, and the per-wave
+/// slot cap split batches cleanly.
+#[test]
+fn split_wave64_readlane_batching_rules() {
+    let split = |mode| Options { mode, wave64: true, split_wave64: true, ..Default::default() };
+
+    // 4 consecutive v_readfirstlane_b32 (e.g. a 128-bit descriptor waterfall): 1 exchange, slot 4
+    let four = prog(&[
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 0)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 2)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 3)], None),
+    ]);
+    let t = translate(&four, &split(Mode::Kernel)).unwrap();
+    assert_eq!(t.hlsl.matches("= xcl_x_meet();").count(), 1, "4 reads share 1 meet:\n{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0);
+    assert!(t.hlsl.contains("#define XCL_X_SLOT 4u"), "{}", t.hlsl);
+
+    // Native wave64 (split_wave64 = false) is untouched: no split exchange prelude or calls
+    let t_native = translate(&four, &Options { mode: Mode::Kernel, wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+    assert!(!t_native.hlsl.contains("xcl_x_meet"));
+    assert!(!t_native.hlsl.contains("xcl_x_put"));
+
+    // Dependency on lane-selector SGPR breaks the batch
+    let dep = prog(&[
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("SRC1", 10)], None),
+    ]);
+    let t = translate(&dep, &split(Mode::Kernel)).unwrap();
+    assert_eq!(t.hlsl.matches("= xcl_x_meet();").count(), 0, "SGPR dependency must not batch");
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 2);
+
+    // Writing EXEC breaks a following v_readfirstlane_b32
+    let exec_dep = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 126), ("SRC0", V + 0), ("SRC1", 128)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+    ]);
+    let t = translate(&exec_dep, &split(Mode::Kernel)).unwrap();
+    assert_eq!(t.hlsl.matches("= xcl_x_meet();").count(), 0, "EXEC write must split following v_readfirstlane");
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 2);
+
+    // Branch target landing between two reads splits basic blocks (never batched across a leader)
+    let branch_split = prog(&[
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None), // targets the second v_readfirstlane
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 0)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+    ]);
+    let t = translate(&branch_split, &split(Mode::Kernel)).unwrap();
+    assert_eq!(t.hlsl.matches("= xcl_x_meet();").count(), 0, "jump target must split batch");
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 2);
+
+    // Slot cap: 10 consecutive reads -> 8 + 2 in 64-thread groups (slot 8), 4 + 4 + 2 in 1024-thread groups (slot 4)
+    let ten = prog(
+        &(0..10u64)
+            .map(|i| ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 10 + i), ("SRC0", V + i)], None))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l))
+            .collect::<Vec<_>>(),
+    );
+    let t64 = translate(&ten, &split(Mode::Kernel)).unwrap();
+    assert!(t64.hlsl.contains("#define XCL_X_SLOT 8u"), "64-thread cap should be 8");
+    assert_eq!(t64.hlsl.matches("= xcl_x_meet();").count(), 2, "10 reads -> batches of 8 + 2");
+
+    let cs1024 = super::CsInterface { threads: [1024, 1, 1], ..Default::default() };
+    let t1024 = translate(&ten, &split(Mode::Compute(cs1024))).unwrap();
+    assert!(t1024.hlsl.contains("#define XCL_X_SLOT 4u"), "1024-thread cap should be 4");
+    assert_eq!(t1024.hlsl.matches("= xcl_x_meet();").count(), 3, "10 reads -> batches of 4 + 4 + 2");
+}
+
+/// GPU verification of batched split-wave64 `v_readfirstlane_b32` / `v_readlane_b32`:
+/// upper-half active lanes, mixed lower/upper lane reads in one exchange, SGPR dependency split,
+/// and EXEC-modifying split.
+#[test]
+fn gpu_split_wave64_batched_readlanes() {
+    if !gpu_ready() {
+        return;
+    }
+    // Activate only lane 38 (upper half: exec_lo = 0, exec_hi = 1 << 6)
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(1 << 6)),
+        // Batch 1 (4 words): 4 consecutive v_readfirstlane_b32 from upper-half lane 38
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 0)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 2)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 3)], None),
+        // Batch 2 (3 words): mixed lower lane (5), upper lane (41), and v_readfirstlane (38)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 128 + 41)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 0), ("SRC1", 128 + 5)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 1), ("SRC1", 20)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 16), ("SRC0", V + 2)], None),
+        // Dependency split: s17 = v4[lane 41] (= 7), then s18 = v5[lane s17] (= v5[7])
+        ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 4), ("SRC1", 20)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 5), ("SRC1", 17)], None),
+        // EXEC dependency split: exec_lo = v6[lane 41] (= 1 << 9), then s19 = v7[first_lane = 9]
+        ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 126), ("SRC0", V + 6), ("SRC1", 20)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 19), ("SRC0", V + 7)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("= xcl_x_meet();").count(), 2, "two independent runs batched:\n{}", t.hlsl);
+        assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 4, "two dependent pairs kept separate");
+    }
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[0] = 0x1000 + l;
+        r[1] = 0x2000 + l;
+        r[2] = 0x3000 + l;
+        r[3] = 0x4000 + l;
+        r[4] = if l == 41 { 7 } else { 0 };
+        r[5] = 0x5000 + l;
+        r[6] = if l == 41 { 1 << 9 } else { 0 };
+        r[7] = 0x7000 + l;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.sgpr[10], 0x1000 + 38, "batch 1 word 0 (lane 38)");
+    assert_eq!(r.sgpr[11], 0x2000 + 38, "batch 1 word 1 (lane 38)");
+    assert_eq!(r.sgpr[12], 0x3000 + 38, "batch 1 word 2 (lane 38)");
+    assert_eq!(r.sgpr[13], 0x4000 + 38, "batch 1 word 3 (lane 38)");
+    assert_eq!(r.sgpr[14], 0x1000 + 5, "batch 2 lower lane 5");
+    assert_eq!(r.sgpr[15], 0x2000 + 41, "batch 2 upper lane 41");
+    assert_eq!(r.sgpr[16], 0x3000 + 38, "batch 2 v_readfirstlane lane 38");
+    assert_eq!(r.sgpr[17], 7, "dependent lane index from upper half");
+    assert_eq!(r.sgpr[18], 0x5000 + 7, "dependent readlane uses new s17");
+    assert_eq!(r.sgpr[19], 0x7000 + 9, "v_readfirstlane observes updated exec_lo (lane 9)");
 }
 
 /// Masks that are read whole after a write `x64_masks` must not take for an overwrite (an

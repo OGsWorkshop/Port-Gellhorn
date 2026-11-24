@@ -27,6 +27,6 @@ Every change we made to a runtime is also in `patches/` as a plain diff against 
 
 | Patch | Base | What it does |
 |---|---|---|
-| `xcl-01-mesh-ms-in-as-slot.patch` | xcl `077ce40` | translate console mesh pipelines whose MS sits in the AS slot instead of refusing them (GTA VI uses these heavily) |
+| `xcl-gta-stack.patch` | xcl `main` | everything this repo's XCL adds: upstream PRs #684, #850, #851, #891, #900, #906 and #944, the BCPack decoder from #905, a 4096-iteration cap on shader loops, `XCL_PRESS_FILE` live input, and `XCL_SKIP_CS_OVER` (a debugging switch) |
 | `victory-01-wave64-emulation-and-agility-sdk.patch` | VIctory `d2a4bae` | wave64 emulation on 32-lane GPUs; Agility SDK opt-in so Windows 10 works |
 | `victory-02-auto-input.patch` | above | `VICTORY_AUTO_INPUT`: hands-free menu presses |

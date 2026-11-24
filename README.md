@@ -26,11 +26,15 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 
 ## 📸 Running right now
 
-GTA VI's first-boot setup and menus, drawn natively on an **RTX 3060** at a locked **30 fps**:
+GTA VI's own artwork, menus and loading screens, drawn natively on an **RTX 3060** at a locked **30 fps**:
 
-| First-boot setup | Legal notices |
-|:---:|:---:|
-| ![Subtitles setup screen](assets/menu-subtitles.png) | ![Legal notices screen](assets/menu-legal.png) |
+| Title artwork | Loading: Jason | Loading: Lucia |
+|:---:|:---:|:---:|
+| ![Title artwork](assets/title-art.png) | ![Jason loading screen](assets/loading-jason.png) | ![Lucia loading screen](assets/loading-lucia.png) |
+
+| First-boot setup | Legal notices | Terms & policies |
+|:---:|:---:|:---:|
+| ![Subtitles setup screen](assets/menu-subtitles.png) | ![Legal notices screen](assets/menu-legal.png) | ![Terms screen](assets/menu-terms.png) |
 
 <sub>Gameplay screenshots go here the moment the world renders. Watch the repo ⭐ so you see it first.</sub>
 
@@ -49,14 +53,17 @@ GTA VI's first-boot setup and menus, drawn natively on an **RTX 3060** at a lock
 | Gameplay | ⏳ | |
 | 1:1 at 30 fps on a mid-range PC | ⏳ | the goal |
 
-### The current wall: black screen after loading
+### The current wall: the first seconds in the world
 
-We know what causes it. There are two separate problems:
+The game boots, runs its menus, loads Vice City (peds and cars spawn, and the in-world audio plays), and then dies within seconds. We've narrowed down why:
 
-1. **Shader compile stalls.** On first launch every new shader freezes rendering while it compiles, long enough for the game to think it hung and quit. This gets better once shaders are cached.
-2. **GPU work out of order.** The GPU ends up waiting on itself in the wrong order, so the game draws from data that was never written. That causes both the black screen and the crash.
+- When the world starts, the game asks for **~10,000 GPU programs at once**. Compiling them on NVIDIA takes far longer than the game will wait.
+- If those draws **wait** for their programs, the game's own 30-second watchdog decides it has hung and quits.
+- If those draws are **skipped**, their outputs are never written. Later GPU work reads that garbage (e.g. indirect draw counts), runs far past Windows' 2-second GPU timeout, and the device resets.
 
-Fix #2 and we're very likely at gameplay. **That's task #1 below.**
+**The fix is to have every program compiled before the game starts.** `setup.ps1 -Game <dump>` now precompiles the whole shader pack and the GPU pipelines once (about 45 minutes; it's resumable). Making that faster and complete is task #1 below.
+
+Already fixed in this repo's runtime: the 64-bit wait ordering (black screen), the BCPack texture decoder (empty world textures), the `CopyFromSubresource` crash at the end of loading, and runaway shader loops.
 
 ---
 
@@ -69,12 +76,12 @@ Fix #2 and we're very likely at gameplay. **That's task #1 below.**
 ```powershell
 git clone https://github.com/ZigZagBoi1/GTA6-PC-Native.git
 cd GTA6-PC-Native
-.\scripts\setup.ps1                                   # builds the runtime, fetches the D3D12 Agility SDK
-.\scripts\play.ps1 -Game "D:\path\to\your\dump" -AutoMenu
+.\scripts\setup.ps1 -Game "D:\path\to\your\dump"     # build + Agility SDK + precompile all shaders (~45 min, once)
+.\scripts\play.ps1  -Game "D:\path\to\your\dump" -AutoMenu
 ```
 
-- `-AutoMenu` presses A for you every few seconds so the menus advance without a controller.
-- First launch compiles tens of thousands of shaders. Let it run; later launches are much faster.
+- `-AutoMenu` presses A for you so the menus advance without a controller.
+- While the game runs, write button names into `press.txt` (e.g. `DOWN DOWN A`) to press them. Handy for scripting and for AI agents testing a build.
 - Logs go to `logs\`. Attach one when you open an issue.
 - Controls: an Xbox controller works best. On keyboard and mouse, Enter = A, Esc = B, WASD = left stick, and the mouse moves the right stick.
 
@@ -88,10 +95,10 @@ Every task is sized for **one person + one AI coding agent**. Pick one, comment 
 
 ### 🔥 Critical path to gameplay
 
-- [ ] **#1 Fix GPU work ordering (the black screen).** Draws read memory that no earlier GPU work has written yet. Audit fence, signal and wait ordering across queues in `runtime/xcl/crates/xcl/src/hle/d3d12x/list_x.rs`, and add a debug mode that logs every cross-queue wait together with the signal it waits for.
-- [ ] **#2 Stop shader stalls killing the game.** Precompile the shader pack before launch (`xcl shaders --precompile`), wire it into `scripts/setup.ps1`, and make sure no single compile blocks a frame long enough to trip the game's hang watchdog.
-- [ ] **#3 Validate mesh pipelines with MS in the AS slot.** Our patch ([`patches/xcl-01-mesh-ms-in-as-slot.patch`](patches/xcl-01-mesh-ms-in-as-slot.patch)) translates them instead of refusing them. Confirm they draw correctly and don't break other pipelines.
-- [ ] **#4 Make auto-menu pick "Next".** On Legal Notices, A selects "Copyright" instead of "Next". Teach `-AutoMenu` to send DOWN, DOWN, A there (`XCL_PRESS_AT` already supports `DOWN`).
+- [ ] **#1 Zero shader compiles at world load.** `setup.ps1 -Game` precompiles the pack; make sure the world's programs are then *all* cache hits at runtime (`compiling shaders: N done` should stay at 0). Find what still misses (graphics pipelines, mesh passes, split-wave64 variants) and precompile those too.
+- [ ] **#2 Keep the watchdog fed.** While a program is still building, keep the game's main-thread heartbeat alive without skipping work. See `pso_async.rs` and issue #505 in the XCL repo for the watchdog's address and logic.
+- [ ] **#3 Never read garbage from a skipped dispatch.** When a dispatch is skipped, zero or clamp the indirect-argument buffers it would have written, so an `ExecuteIndirect` can't run for minutes.
+- [ ] **#4 Mesh pipelines with the MS in the AS slot.** The game uses these and upstream XCL refuses them; an experimental translation exists in the git history. Make them draw correctly.
 
 ### 🎨 Rendering
 

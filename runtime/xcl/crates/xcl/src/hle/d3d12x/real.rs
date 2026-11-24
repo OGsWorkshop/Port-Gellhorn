@@ -3463,6 +3463,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    if skip_cs_over().is_some_and(|max| dxil.len() > max) {
+        BIG_CS.lock().unwrap().get_or_insert_with(std::collections::HashSet::new).insert(*ppv as usize);
+        crate::xlog_warn!("D3D12.X: compute PSO {:#x} has {} B of DXIL: its dispatches are skipped (XCL_SKIP_CS_OVER)", *ppv as usize, dxil.len());
+    }
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -3470,6 +3474,19 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         if reused { ", the driver's blob of an earlier build" } else { "" }
     );
     Some(Ok(hr))
+}
+
+/// `XCL_SKIP_CS_OVER=<bytes>`: compute pipelines whose translated DXIL is larger are built,
+/// but their dispatches are skipped (to find a program that holds the GPU past its timeout).
+fn skip_cs_over() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_SKIP_CS_OVER").ok().and_then(|v| v.trim().parse().ok()))
+}
+static BIG_CS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// A pipeline `XCL_SKIP_CS_OVER` keeps from running.
+pub(super) fn is_skipped_big_compute(pso: usize) -> bool {
+    skip_cs_over().is_some() && BIG_CS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
 /// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
@@ -4279,47 +4296,14 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    // A console MS container in the AS slot and no MS subobject: treat the
-    // AS-slot shader as the MS. The console puts MS in the AS slot for
-    // pipelines that have no amplification stage.
+    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
+    // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
+    // from then on (a black screen every run); refused, it goes on to its menus. What it
+    // expects of them is not known yet.
     if let (None, Some(a)) = (ms_slot, as_slot) {
         if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
-            let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
-            let (tp, (ps, ps_samplers)) = match (console_mesh(a, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
-                (Ok(tp), Ok(ps)) => (tp, ps),
-                (Err(e), _) => {
-                    note_translation_error(format!("MS (from AS slot): {e}"));
-                    return Some(E_INVALIDARG);
-                }
-                (_, Err(e)) => {
-                    note_translation_error(e);
-                    return Some(E_INVALIDARG);
-                }
-            };
-            let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
-            let mut out = StreamOut::default();
-            out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-            out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-            if let Some(p) = &ps {
-                out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-            }
-            for (ty, payload) in &subs {
-                let skip = [0, 2, 19, 24, 25].contains(ty);
-                if !skip {
-                    let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
-                    if (*ty == 15 && payload.len() >= 32) || (*ty == 16 && payload.len() >= 4) {
-                        let mut p = payload.to_vec();
-                        for k in 0..if *ty == 15 { 8 } else { 1 } {
-                            let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
-                            p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
-                        }
-                        out.raw(*ty, &p, palign == 8);
-                        continue;
-                    }
-                    out.raw(*ty, payload, palign == 8);
-                }
-            }
-            return Some(finish_two_pass(this, &out, tp, rs, "MS(AS)", riid, ppv));
+            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
+            return Some(E_INVALIDARG);
         }
     }
     let ms = ms_slot?;

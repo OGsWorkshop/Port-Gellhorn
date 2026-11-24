@@ -259,7 +259,37 @@ fn scripted() -> u32 {
     });
     // seconds since the host started, as the log's times (not since the title first polled)
     let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g) | live_press(t)
+}
+
+/// `XCL_PRESS_FILE=<path>`: button names written to that file ("A", "DOWN A") are pressed one
+/// after another, 150 ms each, then the file is emptied – the menus driven while the title runs.
+fn live_press(t: f64) -> u32 {
+    static Q: Mutex<(f64, f64, Vec<u32>)> = Mutex::new((0.0, 0.0, Vec::new()));
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("XCL_PRESS_FILE").ok()) else { return 0 };
+    let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
+    if q.2.is_empty() && t - q.0 >= 0.05 {
+        q.0 = t;
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if !s.trim().is_empty() {
+                let _ = std::fs::write(path, "");
+                q.2 = s.split_whitespace().rev().filter_map(button_named).collect();
+                q.1 = t;
+            }
+        }
+    }
+    let Some(&b) = q.2.last() else { return 0 };
+    let held = t - q.1;
+    if held < 0.15 {
+        b
+    } else {
+        if held >= 0.3 {
+            q.2.pop();
+            q.1 = t;
+        }
+        0
+    }
 }
 
 #[link(name = "user32")]

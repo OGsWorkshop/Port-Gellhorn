@@ -809,7 +809,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // the background translation failed, skip instead of binding XCL's
                         // ABI root signature onto the stand-in
                         let real = super::pso_async::resolve_wait((*p).pc);
-                        if !super::real::is_translated_compute(real) {
+                        if !super::real::is_translated_compute(real) || super::real::is_skipped_big_compute(real) {
                             out.skipped_dispatches += 1;
                             continue;
                         }

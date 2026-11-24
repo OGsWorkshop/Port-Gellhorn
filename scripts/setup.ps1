@@ -1,5 +1,7 @@
-# Builds the runtime and fetches the D3D12 Agility SDK (needed on Windows 10).
-# Usage: .\scripts\setup.ps1
+# Builds the runtime, fetches the D3D12 Agility SDK (needed on Windows 10) and, with -Game,
+# precompiles every shader of the game so it never waits on the shader compiler mid-game.
+# Usage: .\scripts\setup.ps1 [-Game "D:\path\to\dump"]
+param([string]$Game)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $bin  = Join-Path $root 'runtime\xcl\target\release'
@@ -25,6 +27,14 @@ if (-not (Test-Path (Join-Path $agility 'D3D12Core.dll'))) {
     New-Item -ItemType Directory -Force $agility | Out-Null
     Copy-Item (Join-Path $tmp 'build\native\bin\x64\D3D12Core.dll') $agility
     Copy-Item (Join-Path $tmp 'build\native\bin\x64\d3d12SDKLayers.dll') $agility
+}
+
+if ($Game) {
+    $pack = Join-Path $Game 'shaders.rpf'
+    if (-not (Test-Path $pack)) { throw "No shaders.rpf in '$Game'." }
+    Write-Host '==> Precompiling all ~26,500 shaders + GPU pipelines (about 45 min, once; resumable)...' -ForegroundColor Cyan
+    $env:XCL_DXC_THREADS = '8'; $env:XCL_PIPELINE_THREADS = '3'
+    & (Join-Path $bin 'xcl.exe') shaders $pack --precompile --pipelines
 }
 
 Write-Host ''

@@ -851,6 +851,150 @@ impl Em {
 
     // ---------------------------------------------------------------- one instruction
 
+    /// Emit one basic block's instructions in order; stops at the first non-fallthrough flow.
+    /// In split-wave64 mode, consecutive independent `v_readfirstlane_b32` / `v_readlane_b32`
+    /// instructions share a single multi-word `xcl_x_meet()` exchange instead of one per read.
+    pub fn emit_insts(&mut self, block: &[Decoded], end: u64) -> Flow {
+        let mut flow = Flow::Next;
+        let mut i = 0;
+        while i < block.len() {
+            if self.x64() {
+                let n = self.x64_readlane_batch_len(&block[i..]);
+                if n >= 2 && self.emit_x64_readlane_batch(&block[i..i + n]) {
+                    i += n;
+                    continue;
+                }
+            }
+            let next = block.get(i + 1).map(|n| n.pc).unwrap_or(end);
+            flow = self.inst(&block[i], next);
+            if !matches!(flow, Flow::Next) {
+                break;
+            }
+            i += 1;
+        }
+        flow
+    }
+
+    /// SGPRs read by a plain `v_readfirstlane_b32` / `v_readlane_b32` source code.
+    fn x64_readlane_src_sgprs(code: u64) -> u128 {
+        match code {
+            0..=124 | 126..=127 => 1u128 << code,
+            251 => 3u128 << 106, // VCCZ
+            252 => 3u128 << 126, // EXECZ
+            _ => 0,
+        }
+    }
+
+    /// If `d` is a split-wave64 `v_readfirstlane_b32` / `v_readlane_b32` that will emit an
+    /// exchange, returns `(sgprs_read, sgprs_written)`.
+    fn x64_batchable_readlane(&self, d: &Decoded) -> Option<(u128, u128)> {
+        if d.variant != Variant::Plain {
+            return None;
+        }
+        let name = d.inst.name;
+        if !matches!(name, "V_READFIRSTLANE_B32" | "V_READLANE_B32") {
+            return None;
+        }
+        if !(d.enc.name.starts_with("ENC_VOP") || d.enc.name.starts_with("VOP")) {
+            return None;
+        }
+        if name == "V_READLANE_B32" && self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).is_some() {
+            return None;
+        }
+        let (outs, _) = Self::ops(d);
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+        let written = match dst {
+            Dst::S(n) if n < 128 => 1u128 << n,
+            Dst::Null => 0,
+            _ => return None,
+        };
+        let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
+        let mut reads = Self::x64_readlane_src_sgprs(fv("SRC0"));
+        if name == "V_READFIRSTLANE_B32" {
+            reads |= 3u128 << 126; // EXEC_LO | EXEC_HI
+        } else {
+            reads |= Self::x64_readlane_src_sgprs(fv("SRC1"));
+        }
+        Some((reads, written))
+    }
+
+    /// Length of a dependency-free split-wave64 `v_readfirstlane_b32` / `v_readlane_b32` batch
+    /// starting at `rest[0]`. Bounded so the per-wave exchange slots stay <= 256 dwords (1 KB).
+    fn x64_readlane_batch_len(&self, rest: &[Decoded]) -> usize {
+        let waves = self.x64_threads().div_ceil(64).max(1) as usize;
+        let cap = (64 / waves).clamp(2, 8);
+        let mut written = 0u128;
+        let mut n = 0;
+        for d in rest.iter().take(cap) {
+            let Some((r, w)) = self.x64_batchable_readlane(d) else { break };
+            if (r & written) != 0 {
+                break;
+            }
+            written |= w;
+            n += 1;
+        }
+        n
+    }
+
+    /// Emit `batch` (`len >= 2`) of consecutive split-wave64 `v_readfirstlane_b32` /
+    /// `v_readlane_b32` instructions using a single multi-word `xcl_x_meet()` exchange.
+    fn emit_x64_readlane_batch(&mut self, batch: &[Decoded]) -> bool {
+        struct Item {
+            pc: u64,
+            text: String,
+            src: String,
+            lane: Option<String>,
+            dst: Dst,
+        }
+        let mut items = Vec::with_capacity(batch.len());
+        let mut need_first = false;
+        for d in batch {
+            let (outs, ins) = Self::ops(d);
+            let Ok(u) = self.sources(d, &ins, false) else { return false };
+            let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+            let src = u.first().cloned().unwrap_or_default();
+            let lane = if d.inst.name == "V_READFIRSTLANE_B32" {
+                need_first = true;
+                None
+            } else {
+                Some(u.get(1).cloned().unwrap_or_default())
+            };
+            items.push(Item { pc: d.pc, text: rdna2::format(d), src, lane, dst });
+        }
+        self.x64_words = self.x64_words.max(items.len());
+        for it in &items {
+            self.line(&format!("// {:04x}: {}", it.pc, it.text));
+            self.cur_pc = it.pc;
+        }
+        let t = self.t();
+        if need_first {
+            let (el, eh) = (self.sreg(126), self.sreg(127));
+            self.line(&format!("uint {t}_fl = first_lane({el}, {eh});"));
+        }
+        let mut lanes = Vec::with_capacity(items.len());
+        for (i, it) in items.iter().enumerate() {
+            let l = match &it.lane {
+                None => format!("{t}_fl"),
+                Some(b) => {
+                    let lv = format!("{t}_l{i}");
+                    self.line(&format!("uint {lv} = ({b}) & 63u;"));
+                    lv
+                }
+            };
+            self.line(&format!("uint {t}_m{i} = WaveReadLaneAt({}, {l} & 31u);", it.src));
+            self.line(&format!("xcl_x_put({i}u, {t}_m{i});"));
+            lanes.push(l);
+        }
+        self.line(&format!("bool {t}_ok = xcl_x_meet();"));
+        for (i, (it, l)) in items.iter().zip(lanes.iter()).enumerate() {
+            self.line(&format!(
+                "uint {t}_r{i} = ({l} >> 5) == xcl_half ? {t}_m{i} : ({t}_ok ? xcl_x_get({i}u) : 0u);"
+            ));
+            self.write32(&it.dst, &format!("{t}_r{i}"));
+        }
+        true
+    }
+
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
         let name = d.inst.name.to_ascii_lowercase();
         let text = rdna2::format(d);
@@ -4226,9 +4370,15 @@ impl Em {
 
     /// Split wave64, at the start of `main`: the console thread this thread stands for
     /// (`xcl_tid`, `xcl_x_thread`), its lane, half and wave, and the size of the other half.
+    /// The half, the console wave and the other half's size are the same in every lane of the
+    /// hardware wave (its console threads are 32-aligned): they come from `xcl_wb`, its first
+    /// console thread, through `WaveReadLaneFirst`, so the GPU compiler knows them to be
+    /// wave-uniform – and with them what the exchanges return (EXEC, VCC, the SGPRs, their
+    /// branches), which it otherwise has to treat as per-lane values and divergent branches.
     fn x64_entry(&self, h: &mut String) {
-        h.push_str("    uint xcl_tid = xcl_x_thread(gi);\n    lane_id = xcl_tid & 63u;\n    xcl_half = (xcl_tid >> 5) & 1u;\n    xcl_cw = xcl_tid >> 6;\n");
-        h.push_str("    xcl_xn = XCL_X_THREADS > ((xcl_tid & ~31u) ^ 32u) ? min(32u, XCL_X_THREADS - ((xcl_tid & ~31u) ^ 32u)) : 0u;\n");
+        h.push_str("    uint xcl_tid = xcl_x_thread(gi);\n    lane_id = xcl_tid & 63u;\n    uint xcl_wb = WaveReadLaneFirst(xcl_tid) & ~31u;\n");
+        h.push_str("    xcl_half = (xcl_wb >> 5) & 1u;\n    xcl_cw = xcl_wb >> 6;\n");
+        h.push_str("    xcl_xn = XCL_X_THREADS > (xcl_wb ^ 32u) ? min(32u, XCL_X_THREADS - (xcl_wb ^ 32u)) : 0u;\n");
     }
 
     pub fn finish(&self, body: &str) -> String {
@@ -4431,8 +4581,10 @@ impl Em {
                     }
                 }
                 if cs.tg_size && sg.contains(&next) {
-                    // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
-                    let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
+                    // waves in the group: a last, partial wave counts (96 threads: 2 of 64);
+                    // split, the wave index is `xcl_cw` (gi / 64, known to be wave-uniform)
+                    let wave = if self.x64() { "xcl_cw".to_string() } else { format!("(gi / {lanes}u)") };
+                    let _ = writeln!(h, "    {} = {}u | ({wave} << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
                 for &v in &self.vgprs {
@@ -4471,7 +4623,9 @@ impl Em {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
                 // thread index in the group as the console numbers it: wave · lanes + lane
-                let _ = writeln!(h, "    uint xcl_wave = gi / {lanes}u;\n    uint xcl_slot = xcl_wave * {lanes}u + lane_id;");
+                // (split: the console wave `xcl_cw`, the same value known to be wave-uniform)
+                let wave = if self.x64() { "xcl_cw".to_string() } else { format!("gi / {lanes}u") };
+                let _ = writeln!(h, "    uint xcl_wave = {wave};\n    uint xcl_slot = xcl_wave * {lanes}u + lane_id;");
                 let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", ms.record_dwords());
                 let _ = writeln!(h, "    uint xcl_vtx = xcl_rec + {MESH_HEADER}u + xcl_slot * {}u;", ms.vert_dwords());
                 let _ = writeln!(h, "    uint xcl_prm = xcl_rec + {}u + xcl_slot;", MESH_HEADER + ms.max_vertices as usize * ms.vert_dwords());
@@ -4574,7 +4728,8 @@ impl Em {
                     let _ = writeln!(h, "        bool xcl_es_phase = {};", if es { "true" } else { "false" });
                     let _ = writeln!(h, "        uint xcl_entry_pc = {}u;", if es { 0 } else { gs_start });
                     // the GS phase has no other half to exchange with
-                    let _ = writeln!(h, "        lane_id = gi; xcl_half = gi >> 5; xcl_xn = {}u;", if es { 32 } else { 0 });
+                    // the half from the wave's first lane: the same value, known to be wave-uniform
+                    let _ = writeln!(h, "        lane_id = gi; xcl_half = WaveReadLaneFirst(gi) >> 5; xcl_xn = {}u;", if es { 32 } else { 0 });
                     let _ = writeln!(h, "        uint xcl_emitted = 0u, xcl_strip = 0u, xcl_ntri = 0u, xcl_gs_base = 0xFFFFFFFFu;\n        uint xcl_tri[{maxt}];");
                     load_sgprs(h);
                     if sg.contains(&2) {
@@ -5429,7 +5584,7 @@ bool xcl_x_meet() {
             uint c;
             InterlockedAdd(XCL_XC(xcl_cw * 2u + (xcl_half ^ 1u)), 0u, c);
             if ((int)(c - need) >= 0) break;
-            if (n >= (1u << 20)) { ok = 0u; break; }
+            if (n >= (1u << 12)) { ok = 0u; break; }
         }
     }
     if (WaveReadLaneFirst(ok) == 0u) { xcl_x_dead = true; return false; }
@@ -5518,7 +5673,7 @@ void xcl_s_barrier() {
                 InterlockedCompareExchange(XCL_BAR_STATE, _s, _next, _orig);
                 if (_orig == _s) break;
             }
-            if (_n >= (1u << 20)) {
+            if (_n >= (1u << 12)) {
                 _ok = 0u;
                 uint _orig;
                 InterlockedAdd(XCL_BAR_ALIVE, 0xFFFFFFFFu, _orig);
@@ -5535,7 +5690,7 @@ void xcl_s_barrier() {
 const PRELUDE: &str = r#"
 static uint lane_id;
 // loop iterations a lane may run (`LOOP_GUARD`): far above what a working program needs
-static uint xcl_budget = 1u << 16;
+static uint xcl_budget = 1u << 12;
 // the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
 // `(uint)(((uint64_t)a * b) >> 32) != 0` (the console's integer division code) into
 // umul.with.overflow, which DXIL does not allow (validation fails)

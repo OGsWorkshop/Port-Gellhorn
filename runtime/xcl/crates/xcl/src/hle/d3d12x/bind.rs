@@ -724,6 +724,10 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
+    if super::real::is_skipped_big_compute(pso) {
+        count(DISPATCHES_SKIPPED);
+        return;
+    }
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
