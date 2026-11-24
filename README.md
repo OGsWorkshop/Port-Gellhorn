@@ -26,7 +26,13 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 
 ## 📸 Running right now
 
-### 🆕 First open-world geometry on an NVIDIA GPU
+### 🆕 The opening scene's 3D world on an RTX 3060
+
+![Opening scene geometry in debug colours](assets/world-sofa-debug.png)
+
+<sub>A sofa from the game's opening scene, drawn in real time on an RTX 3060 with a debug colour view (VIctory + community PRs, `VICTORY_DEBUG_PS=1`, one of the game's internal buffers). The geometry is there; the lighting pass that turns these buffers into the final picture still outputs black. That is the next thing to fix.</sub>
+
+### First open-world geometry on an NVIDIA GPU
 
 ![First world geometry](assets/first-world-geometry.png)
 
