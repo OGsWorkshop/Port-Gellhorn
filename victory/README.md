@@ -1,17 +1,21 @@
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+the user supplies. In Port Gellhorn this runtime lives in `victory/` as a git
+subtree with its original history. It runs the real Xbox executable and
+presents through host D3D12; the old Leonida map viewer is not the current
+build. See [docs/architecture.md](docs/architecture.md).
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
+> [!IMPORTANT]
+> No game data, executable, key or protection workaround is in the repository.
+> The only title executable used for verification is the user's own retail
+> `game_scarlett_master.exe`; no reconstructed EXE, helper or viewer is
+> presented as GTA VI.
 
-## Status (2026-11-23)
+## Status (2026-11-24)
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+**The game boots and renders the real world. It is not playable, and not
+smooth on the test machine.**
 
 | Stage | State |
 |-------|-------|
@@ -19,30 +23,45 @@ loads the world, where rendering fails.
 | Intro video with sound | works |
 | Start screen, profile and saves | works |
 | Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
+| The world (first mission's intro) | renders through host D3D12 with indirect draws and thousands of draws per frame; ~0.5-3 fps during world streaming |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on Windows 11, NVIDIA GeForce RTX 3060 Ti, driver **32.0.16.2124**,
+16 GB RAM. Real D3D12 world rendering is confirmed on that GPU in release and
+diagnostics runs. Streaming is limited by CPU-side copy/watch work and
+draw/pipeline overhead, not by a missing presentation path; faster PCs may do
+better, but no smooth-performance claim is made. Captured frames stay local
+and are not distributed.
 
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+Early builds peaked at ~9.1 GB VRAM; lazy host-texture creation and capped
+placed allocations bring that to ~5.1 GB. PSV structured-buffer shader
+translation is fixed; sparse/unmapped-page handling and per-submission watch
+sharing are still being finalized. These reduce footprint, not frame time.
+
+> **Warning.** Keep `-DebugLayer` / `VICTORY_D3D12_DEBUG=1` off on this driver:
+> the D3D12 debug layer fails with `0x80070057` (`E_INVALIDARG`), so the run
+> never reaches the title. Earlier builds could hang a real GPU and reset the
+> display driver; current runs on the 3060 Ti complete. A diagnostics build
+> with `VICTORY_D3D12_WARP=1` renders on the software adapter as a diagnosis
+> fallback, not a fix.
 
 What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
+| Loader | Runs the title's real executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
+| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Sparse/unmapped-page and per-submission watch work is being finalized; real queries, depth bounds, HDR and scaling are missing |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 in the bundled snapshot; PSV structured-buffer translation is fixed | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
+| Textures | Console tiled layouts and detiling for the modes the title uses; host textures created lazily, placed allocations capped | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
+
+Shader counts are from the bundled source snapshot; local validation builds
+may be ahead of them.
 
 ## Getting started
 
@@ -62,16 +81,38 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
-Run the title:
+Run the title on a real GPU:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+$env:VICTORY_GAME_DIR = '<your game package>'
+$env:VICTORY_CACHE_DIR = '<outside the repo>\cache'
+$env:VICTORY_DATA_DIR = '<outside the repo>\data'
+# Keep VICTORY_D3D12_DEBUG unset (see the warning above).
+target\release\victory.exe run "$env:VICTORY_GAME_DIR\game_scarlett_master.exe" --execute
 ```
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
+
+> **Local validation only.** The real-GPU reproduction used an untracked helper
+> at `C:\Users\rhyth\victory-integration\LAUNCH_GTA6_INTEGRATION_GPU.ps1` with
+> `-RunName <name> -CacheRun render1 -LowRam`. It is not distributed with the
+> repository and is not a setup step for a clone. `-LowRam` selects the
+> low-memory path (lazy host textures, capped placed allocations);
+> `-DebugLayer` was not used, for the driver reason above. Do not add the
+> helper, its logs or its captures to git.
+
+**Data policy.** No archives, executables, shaders, textures, audio, keys,
+captured frames, caches or logs are committed; all paths stay outside the
+repository (`.gitignore` and `cargo xtask policy` enforce this). Captured
+frames from local verification stay on the local machine.
+
+**Cargo.** Set `VICTORY_*` variables per process, not in the user or machine
+environment: inherited values change `cargo build` and `cargo test` in other
+terminals. No Cargo configuration change is needed; `victory/.cargo/config.toml`
+only defines the `xtask` alias.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
@@ -103,7 +144,9 @@ info and above).
 
 ## Debugging
 
-A release build has no debugging aids. Build them in with
+A release build has no debugging aids. The variables below are for diagnosis
+only: none restores a missing draw, produces final video, or is a fix. Build
+them in with
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
@@ -117,9 +160,10 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `VICTORY_SHOW_TARGET` | inspect render-target selection while diagnosing a missing pass |
+| `VICTORY_DUMP_TARGETS=1` | with capture set, saves every render target of those frames |
+| `VICTORY_D3D12_DEBUG=1` | host debug layer — unusable on the driver above (`0x80070057`); leave it off |
+| `VICTORY_D3D12_GBV=1` | with the debug layer, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
