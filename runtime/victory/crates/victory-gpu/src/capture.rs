@@ -21,14 +21,54 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let every = *EVERY.get_or_init(|| std::env::var("VICTORY_CAPTURE_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    });
     (every > 0 && n % every == 0)
         || LIST
             .get_or_init(|| {
                 let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-                list.split(',').filter_map(|f| f.trim().parse().ok()).collect()
+                list.split(',')
+                    .filter_map(|f| f.trim().parse().ok())
+                    .collect()
             })
             .contains(&n)
+        || n == NEXT_BUSY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `VICTORY_CAPTURE_BUSY=<draws>[,<count>]`: the frame after one that ran
+/// more than `<draws>` draws and dispatches on the host is listed too (as if
+/// named in `VICTORY_CAPTURE_FRAMES`), up to `<count>` times (default 2),
+/// every 8th frame: the world, whose frame numbers vary run to run.
+static NEXT_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// At the present of `frame`, after `ran` host draws and dispatches since
+/// the last present: lists a later frame if `VICTORY_CAPTURE_BUSY` says so.
+pub(crate) fn note_busy(frame: u64, ran: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SETTING: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let Some((draws, count)) = *SETTING.get_or_init(|| {
+        let v = std::env::var("VICTORY_CAPTURE_BUSY").ok()?;
+        let mut it = v.split(',').map(|x| x.trim().parse::<u64>().ok());
+        Some((it.next()??, it.next().flatten().unwrap_or(2)))
+    }) else {
+        return;
+    };
+    if ran > draws
+        && DONE.load(Relaxed) < count
+        && frame >= LAST.load(Relaxed) + 8
+        && NEXT_BUSY.load(Relaxed) <= frame
+    {
+        NEXT_BUSY.store(frame + 1, Relaxed);
+        LAST.store(frame + 1, Relaxed);
+        DONE.fetch_add(1, Relaxed);
+        tracing::info!(frame = frame + 1, ran, "VICTORY_CAPTURE_BUSY: capturing the next frame");
+    }
 }
 
 /// Whether frame `n` is saved.
@@ -210,15 +250,134 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// `VICTORY_DUMP_FRAMES=<list>` limits target dumps to those frames (others stay captured).
+fn dumpable(n: u64) -> bool {
+    static L: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
+    match L.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_FRAMES")
+            .ok()
+            .map(|v| v.split(',').filter_map(|f| f.trim().parse().ok()).collect())
+    }) {
+        Some(l) => l.contains(&n),
+        None => listed(n),
+    }
+}
+
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_SHOW_TARGET=<n>`: every frame shows the `n`th texture it
+/// rendered to or wrote (first-use order, the `<i>` of a target dump's file
+/// names) instead of what the title presents; frames with fewer targets show
+/// the title's own picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
+/// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) the
+/// most draws wrote, which in a world frame is a G-buffer layer. A debugging
+/// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
+/// finished picture.
+#[derive(Clone, Copy)]
+pub(crate) enum Show {
+    Index(usize),
+    Busiest,
+    /// `WxH-fN[-K]`: the K-th (default 1st) target of that size and format.
+    Match(u64, u32, i32, usize),
+}
+
+fn parse_match(v: &str) -> Option<Show> {
+    let (dim, rest) = v.split_once('-')?;
+    let (w, h) = dim.split_once(['x', 'X'])?;
+    let mut it = rest.split('-');
+    let f = it.next()?.strip_prefix(['f', 'F'])?.parse().ok()?;
+    let k: usize = it.next().map_or(Some(1), |k| k.parse().ok())?;
+    Some(Show::Match(w.parse().ok()?, h.parse().ok()?, f, k.max(1)))
+}
+
+pub(crate) fn show_index() -> Option<Show> {
+    static N: std::sync::OnceLock<Option<Show>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHOW_TARGET").ok()?;
+        let v = v.trim();
+        let show = if v.eq_ignore_ascii_case("busiest") {
+            Show::Busiest
+        } else if let Some(m) = parse_match(v) {
+            m
+        } else {
+            Show::Index(v.parse().ok()?)
+        };
+        tracing::warn!(target = v, "VICTORY_SHOW_TARGET: showing a render target instead of the title's picture");
+        Some(show)
+    })
+}
+
+/// Draws that wrote each noted target this frame (show mode `busiest`).
+static HITS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// At the present of `frame` in show mode: the noted target to show, if the
+/// frame has one. Clears the frame's list unless a dump still needs it.
+pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    let show = show_index()?;
+    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
+    if frame.is_power_of_two() && frame >= 256 {
+        let list: Vec<String> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, (r, c))| {
+                // SAFETY: a live resource.
+                let d = unsafe { c.texture.GetDesc() };
+                let n = hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1);
+                format!("{i}: {}x{} f{} ({n} draws)", d.Width, d.Height, d.Format.0)
+            })
+            .collect();
+        tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
+    }
+    let pick = match show {
+        Show::Index(n) => targets.get(n).map(|(_, c)| c.clone()),
+        Show::Match(w, h, f, k) => targets
+            .iter()
+            .filter(|(_, c)| {
+                // SAFETY: a live resource.
+                let d = unsafe { c.texture.GetDesc() };
+                d.Width == w && d.Height == h && d.Format.0 == f
+            })
+            .nth(k - 1)
+            .map(|(_, c)| c.clone()),
+        Show::Busiest => targets
+            .iter()
+            .filter(|(_, c)| {
+                // SAFETY: a live resource.
+                let d = unsafe { c.texture.GetDesc() };
+                d.Width >= 1280
+                    // Screen-shaped (16:9): not a shadow map, which more draws write.
+                    && d.Width * 9 == u64::from(d.Height) * 16
+                    && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
+            })
+            .max_by_key(|(r, _)| hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1))
+            .map(|(_, c)| c.clone()),
+    };
+    if !(dump_on() && dumpable(frame)) {
+        targets.clear();
+    }
+    hits.clear();
+    pick
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() {
         return;
+    }
+    let dumping = dump_on() && dumpable(crate::queue::presented() + 1);
+    if !dumping && show_index().is_none() {
+        return;
+    }
+    if show_index().is_some() {
+        let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
+        match hits.iter_mut().find(|h| h.0 == resource as usize) {
+            Some(h) => h.1 += 1,
+            None => hits.push((resource as usize, 1)),
+        }
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
@@ -541,3 +700,5 @@ mod tests {
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
     }
 }
+
+// touch

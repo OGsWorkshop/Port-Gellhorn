@@ -29,7 +29,7 @@ AI coding agents are welcome. The rules are the same for code written by hand an
 ## Working on a runtime
 
 - `runtime/xcl`: read `runtime/xcl/AGENTS.md` for its build, test and code-style notes.
-- `runtime/victory`: `cargo rustc --release -p victory --bin victory --locked -- -C link-arg=/EXPORT:D3D12SDKVersion,DATA -C link-arg=/EXPORT:D3D12SDKPath,DATA`
+- `runtime/victory`: `cargo rustc --release -p victory --bin victory --features diagnostics --locked -- -C link-arg=/EXPORT:D3D12SDKVersion,DATA -C link-arg=/EXPORT:D3D12SDKPath,DATA`
 - Fixes that are general (not title-specific) are worth upstreaming too. Each runtime has its own repo.
 
 ## Useful switches
@@ -41,5 +41,5 @@ AI coding agents are welcome. The rules are the same for code written by hand an
 | `XCL_DXC_THREADS=N` | XCL | shader compile threads |
 | `VICTORY_AUTO_INPUT=1` | VIctory | press A every 2 s for the first 2 minutes |
 | `VICTORY_WAVE64_EMULATE=1` | VIctory | emulate 64-lane waves on 32-lane GPUs |
-| `VICTORY_CAPTURE=<dir>` | VIctory | save presented frames as PNG |
-| `VICTORY_PRESENT_TARGET=WxH:fmt` | VIctory | present an internal render target (debug black screens) |
+| `VICTORY_CAPTURE_EVERY=N` | VIctory | save the frame and every render target every N frames |
+| `VICTORY_SHOW_TARGET=WxH-fN` | VIctory | show an internal render target in the window (with `VICTORY_DEBUG_PS=1`) |

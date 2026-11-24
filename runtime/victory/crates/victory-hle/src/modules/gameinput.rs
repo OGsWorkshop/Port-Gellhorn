@@ -537,7 +537,16 @@ fn live_press(keys: &mut Vec<KeyState>) {
                         "DOWN" => Some(0x28),
                         "LEFT" => Some(0x25),
                         "RIGHT" => Some(0x27),
-                        "MENU" => Some(0x1B),
+                        "MENU" | "START" => Some(0x1B),
+                        "VIEW" => Some(0x09),
+                        "LS_UP" => Some(b'W'),
+                        "LS_DOWN" => Some(b'S'),
+                        "LS_LEFT" => Some(b'A'),
+                        "LS_RIGHT" => Some(b'D'),
+                        "RS_UP" => Some(b'I'),
+                        "RS_DOWN" => Some(b'K'),
+                        "RS_LEFT" => Some(b'J'),
+                        "RS_RIGHT" => Some(b'L'),
                         "X" => Some(b'X'),
                         "Y" => Some(b'Y'),
                         _ => None,
@@ -549,9 +558,11 @@ fn live_press(keys: &mut Vec<KeyState>) {
     }
     let Some(&vk) = q.1.last() else { return };
     let held = q.2.map_or(Duration::ZERO, |t| now - t);
-    if held < Duration::from_millis(150) {
+    // Stick tokens (LS_*, RS_*) are held 1.5 s, buttons 150 ms.
+    let hold = if b"WASDIJKL".contains(&vk) { 1500 } else { 150 };
+    if held < Duration::from_millis(hold) {
         keys.push(KeyState { scan_code: 0, code_point: 0, virtual_key: vk, dead_key: false });
-    } else if held >= Duration::from_millis(300) {
+    } else if held >= Duration::from_millis(hold + 150) {
         q.1.pop();
         q.2 = Some(now);
     }

@@ -333,11 +333,7 @@ fn translate(
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-                // Per-lane descriptors are traced on the per-lane form; its
-                // failure is listed after the resources' and I/O's.
-                let structured = structure::structure(&program);
-                let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                let res = match resource::track(&program, &p.layout, p.stage) {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
                         Some(r)
@@ -372,7 +368,7 @@ fn translate(
                         Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
                     }
                 }
-                let structured = match structured {
+                let structured = match structure::structure(&program) {
                     Ok(s) => {
                         tally_structured(&program, &s, t);
                         Some(s)
@@ -390,7 +386,15 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    let options = emit::TranslateOptions {
+                        wave64: checks
+                            .host
+                            .as_ref()
+                            .map_or(emit::Wave64Mode::Native, |(h, _)| {
+                                h.recommended_wave64_mode()
+                            }),
+                    };
+                    match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -566,8 +570,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
             }
             resource::Source::Phi { .. }
             | resource::Source::Select { .. }
-            | resource::Source::Lanes { .. }
-            | resource::Source::LanePhi { .. } => {
+            | resource::Source::Lanes { .. } => {
                 unreachable!("leaves are no phis, selects or per-lane choices")
             }
         };

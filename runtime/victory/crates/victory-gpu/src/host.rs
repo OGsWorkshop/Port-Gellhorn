@@ -208,6 +208,9 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         tracing::info!("host D3D12 device ready");
+        let wave64_mode = recommended_wave64_mode(&device);
+        crate::shader_cache::set_wave64_mode(wave64_mode);
+        tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
         Ok(Host {
             device,
             queue,
@@ -223,6 +226,31 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// Queries D3D12 wave lane capabilities and chooses the Wave64 lowering mode.
+fn recommended_wave64_mode(device: &ID3D12Device) -> victory_shader::emit::Wave64Mode {
+    use victory_shader::emit::Wave64Mode;
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: plain D3D12 feature query with valid struct size.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts).cast(),
+            size_of_val(&opts) as u32,
+        )
+    }
+    .is_ok();
+    if !ok || !opts.WaveOps.as_bool() {
+        return Wave64Mode::Emulate;
+    }
+    if opts.WaveLaneCountMin <= 64 && opts.WaveLaneCountMax >= 64 {
+        Wave64Mode::Native
+    } else if opts.WaveLaneCountMin <= 32 && opts.WaveLaneCountMax >= 32 {
+        Wave64Mode::Wave32
+    } else {
+        Wave64Mode::Emulate
     }
 }
 
@@ -294,6 +322,11 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Depth targets the list gave unordered access to since it last made
+    /// them current: their twins hold their contents until copied back.
+    twins: Mutex<Vec<HostCopy>>,
+    /// The list failed to close: it is dropped at submission.
+    pub(crate) broken: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -301,6 +334,10 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// GPU-writable scratch for indirect rectangle expansion (`rectangles`):
+    /// expanded vertices, rewritten draw arguments and per-draw atomic
+    /// counters, reused across draws and across resets.
+    rect_scratch: Mutex<RectScratch>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -323,6 +360,9 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+/// A title texture's host copy, as lists hold it.
+type HostCopy = std::sync::Arc<crate::resource::HostTexture>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -366,6 +406,29 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// Per-list GPU-writable buffers for indirect rectangle expansion
+/// (`crate::rectangles`): one vertex scratch buffer (reused per draw after
+/// its VB -> UAV barrier), one rewritten-arguments buffer (grown if a draw
+/// has more records), and chunks of 4-byte atomic counters zeroed before
+/// submission.
+#[derive(Default)]
+struct RectScratch {
+    vertices: Option<ID3D12Resource>,
+    args: Option<(ID3D12Resource, u64)>,
+    counters: Vec<(ID3D12Resource, usize, u64)>,
+    counter_chunk: usize,
+    counter_used: u32,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the counter pointers are
+// persistent mappings written only before submission.
+unsafe impl Send for RectScratch {}
+
+/// Counters per chunk (4 KiB = 1024 words).
+const RECT_COUNTER_CHUNK: u32 = 1024;
+/// Initial rewritten-arguments buffer size (64 KiB = 4096 draw records).
+const RECT_ARGS_MIN: u64 = 64 << 10;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -449,46 +512,6 @@ impl Host {
         })
     }
 
-    /// The host GPU's supported wave-lane range `(WaveLaneCountMin,
-    /// WaveLaneCountMax)` from `D3D12_FEATURE_D3D12_OPTIONS1` (defaults to
-    /// `(32, 64)` when the query fails, so nothing is refused for it).
-    /// Note: WARP (`VICTORY_D3D12_WARP=1`) reports `(4, 4)` even on 64-lane
-    /// hardware, so shaders requiring wider waves are refused there too.
-    pub(crate) fn wave_lanes(&self) -> (u32, u32) {
-        static LANES: OnceLock<(u32, u32)> = OnceLock::new();
-        *LANES.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-            // SAFETY: the query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS1,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-            };
-            let (min, max) = if ok
-                && options.WaveLaneCountMin > 0
-                && options.WaveLaneCountMax >= options.WaveLaneCountMin
-            {
-                (options.WaveLaneCountMin, options.WaveLaneCountMax)
-            } else {
-                (32, 64)
-            };
-            if max < 32 {
-                tracing::info!(
-                    min,
-                    max,
-                    "host wave lanes (software/WARP adapter reports narrow waves; wider-wave shaders will be refused)"
-                );
-            } else {
-                tracing::info!(min, max, "host wave lanes");
-            }
-            (min, max)
-        })
-    }
-
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -518,9 +541,12 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                twins: Mutex::default(),
+                broken: std::sync::atomic::AtomicBool::new(false),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                rect_scratch: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -540,16 +566,23 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
-        for list in runs {
-            list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
+        let back = {
+            let mut batch = Batch::default();
+            for list in runs {
+                if list.broken.load(std::sync::atomic::Ordering::Relaxed) {
+                    firsts.push(lists.len());
+                    continue;
+                }
+                list.run_deferred(&mut batch);
+                firsts.push(lists.len());
+                if let Some(prelude) = list.prelude() {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
             }
-            lists.push(list.list.cast().ok());
-        }
-        batch.flush();
+            batch.flush();
+            batch.copy_back
+        };
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -615,23 +648,8 @@ impl Host {
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
+        // which tell the title the GPU is done.
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
-                }
-            }
-        }
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
             let written = shadow.copy_back(address, len);
@@ -900,6 +918,13 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Lists end, and so start, with depth targets current, not twins.
+        let twins = std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()));
+        for depth in &twins {
+            if let Some(twin) = &depth.twin {
+                self.copy_texture(depth, twin);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -911,23 +936,33 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
-            fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
-            ));
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+                fail(format_args!(
+                    "a host command list did not close ({e}): a command recorded into it was invalid"
+                ));
+            }
+            tracing::warn!(error = %e, "a host command list did not close; its work is dropped");
+            self.broken.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.broken.store(false, std::sync::atomic::Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
+        }
+        {
+            let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (rect.counter_chunk, rect.counter_used) = (0, 0);
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -943,7 +978,8 @@ impl HostList {
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
-    /// the texture there at submission.
+    /// the texture there at submission. A depth target with a twin is given
+    /// unordered access through the twin ([`HostList::sync_twin`]).
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
@@ -951,17 +987,90 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        if let Some(twin) = &copy.twin
+            && self.sync_twin(&copy, twin, wanted)
+        {
+            // Unordered access goes to the twin; the depth stays as it is.
+            return None;
+        }
         let wanted = legal_state(texture, wanted);
+        self.track(&copy, wanted).map(|before| (texture, before))
+    }
+
+    /// Notes that the list has `copy` in `wanted` from here on: the state it
+    /// leaves, if that is a change (none on the list's first use).
+    fn track(&self, copy: &HostCopy, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
+        }
+    }
+
+    /// [`HostList::track`], with the barrier to record if it is a change.
+    fn move_to(&self, copy: &HostCopy, wanted: u32) -> Option<D3D12_RESOURCE_BARRIER> {
+        let before = self.track(copy, wanted)?;
+        Some(transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        ))
+    }
+
+    /// Keeps a depth target and its unordered access twin coherent in this
+    /// list: unordered access (`wanted`) after other use copies the depth
+    /// into the twin, other use after unordered access copies the twin back
+    /// (as `close` does). Whether `wanted` is unordered access.
+    /// shortcut: a dispatch that also reads the depth through a shader view
+    /// readied after its unordered access view loses its writes (the read
+    /// copies the twin back first); whole-texture states cannot have both.
+    fn sync_twin(&self, depth: &HostCopy, twin: &HostCopy, wanted: u32) -> bool {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let unordered = wanted & UNORDERED_ACCESS != 0;
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let ahead = twins.iter().position(|d| std::sync::Arc::ptr_eq(d, depth));
+        match (unordered, ahead) {
+            (true, None) => {
+                twins.push(depth.clone());
+                drop(twins);
+                self.copy_texture(twin, depth);
+            }
+            (false, Some(i)) => {
+                twins.swap_remove(i);
+                drop(twins);
+                self.copy_texture(depth, twin);
+            }
+            _ => {}
+        }
+        if unordered && let Some(barrier) = self.move_to(twin, UNORDERED_ACCESS) {
+            // SAFETY: an open list and a live texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+        unordered
+    }
+
+    /// Records a copy of all of `src` into `dst` (a depth target and its
+    /// twin), with the transitions it needs.
+    fn copy_texture(&self, dst: &HostCopy, src: &HostCopy) {
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> =
+            [self.move_to(dst, COPY_DEST), self.move_to(src, COPY_SOURCE)]
+                .into_iter()
+                .flatten()
+                .collect();
+        // SAFETY: an open list and live textures, in the copy states by then.
+        unsafe {
+            if !barriers.is_empty() {
+                self.list.ResourceBarrier(&barriers);
+            }
+            self.list.CopyResource(&dst.texture, &src.texture);
         }
     }
 
@@ -1170,6 +1279,69 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
+    /// The list's GPU-writable scratch buffer for expanded indirect
+    /// rectangle vertices (`capacity` bytes), created on first use.
+    pub(crate) fn rect_vertices(&self, capacity: u64) -> Option<ID3D12Resource> {
+        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if rect.vertices.is_none() {
+            let buffer = host()?.default_buffer(capacity)?;
+            name(&buffer, || format!("rect scratch {capacity:#x}"));
+            rect.vertices = Some(buffer);
+        }
+        rect.vertices.clone()
+    }
+
+    /// A GPU-writable buffer of at least `bytes` for rewritten indirect
+    /// draw arguments, kept alive until the list is reset.
+    pub(crate) fn rect_args(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let want = bytes.max(RECT_ARGS_MIN).next_multiple_of(256);
+        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buf, len)) = &rect.args
+            && *len >= want
+        {
+            return Some(buf.clone());
+        }
+        let buffer = host()?.default_buffer(want)?;
+        name(&buffer, || format!("rect args {want:#x}"));
+        let old = rect.args.replace((buffer.clone(), want));
+        drop(rect);
+        if let Some((old, _)) = old {
+            self.keep(&old);
+        }
+        Some(buffer)
+    }
+
+    /// The host GPU address of a 4-byte atomic counter for one indirect
+    /// rectangle draw, zeroed at each submission before the list runs.
+    pub(crate) fn rect_counter(&self) -> Option<u64> {
+        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if rect.counter_used == RECT_COUNTER_CHUNK {
+            rect.counter_chunk += 1;
+            rect.counter_used = 0;
+        }
+        if rect.counter_chunk == rect.counters.len() {
+            let bytes = u64::from(RECT_COUNTER_CHUNK) * 4;
+            let (buffer, data) = host()?.shared_buffer(bytes)?;
+            name(&buffer, || "rect counters".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            rect.counters.push((buffer, data as usize, gpu));
+            rect.counter_used = 0;
+        }
+        let (_, data, gpu) = rect.counters[rect.counter_chunk];
+        let slot = rect.counter_used;
+        rect.counter_used += 1;
+        drop(rect);
+        if slot == 0 {
+            let bytes = RECT_COUNTER_CHUNK as usize * 4;
+            // SAFETY: the list's own mapped chunk, zeroed before it runs.
+            self.defer_host(move || unsafe {
+                std::ptr::write_bytes(data as *mut u8, 0, bytes);
+            });
+        }
+        Some(gpu + u64::from(slot) * 4)
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
@@ -1216,7 +1388,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written(Some((dst, dst.saturating_add(len))));
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1240,7 +1412,7 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                        batch.title_written(None);
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1251,9 +1423,7 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                    batch.gpu_write(shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1269,9 +1439,12 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, per buffer copy, merged where
+/// they share or touch a 64 KiB page: done before a step that writes title
+/// memory or gives a range to shaders, and before the lists run. Ranges
+/// pages apart stay apart: one range covering a big buffer's low and high
+/// ends would have its untouched middle checked (and its stale pages
+/// copied) too.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -1279,22 +1452,89 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Per copy, `[from, to)` ranges in the order they came.
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)>,
+    /// Per copy, ranges already brought up to date in this submission and
+    /// not written since by a step of it (sorted, disjoint): a list asking
+    /// for one again (the world's lists read the same 174 MB heap through
+    /// dozens of ranges, each asked of the kernel's write watch again) is
+    /// not asked again until a step may have written title memory there.
+    fresh: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Write ranges already declared in this submission (shadow identity, address, bytes).
+    write_ranges: std::collections::HashSet<(usize, usize, usize)>,
+    /// The same ranges, holding the shadows in first-declaration order for copy-back.
+    copy_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+}
+
+/// `[from, to)` ranges of title memory.
+type Ranges = Vec<(usize, usize)>;
+
+/// Sorts `[from, to)` ranges and merges those whose `page`-sized pages
+/// overlap or touch; empty ranges go.
+fn coalesce_ranges(ranges: &mut Ranges, page: usize) {
+    ranges.retain(|&(from, to)| from < to);
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(from, to) in ranges.iter() {
+        match merged.last_mut() {
+            Some((_, end)) if from / page <= end.div_ceil(page) => *end = (*end).max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    *ranges = merged;
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        if len == 0 {
+            return;
+        }
+        let range = (address, address.saturating_add(len));
+        if self.is_fresh(shadow, range) {
+            return;
+        }
         match self
             .refreshes
             .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((_, ranges)) => ranges.push(range),
+            None => self.refreshes.push((shadow.clone(), vec![range])),
         }
+    }
+
+    /// Whether `range` is wholly inside what is already up to date.
+    fn is_fresh(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, range: (usize, usize)) -> bool {
+        self.fresh
+            .iter()
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+            .is_some_and(|(_, ranges)| ranges.iter().any(|&(a, b)| a <= range.0 && range.1 <= b))
+    }
+
+    /// Notes `ranges` of `shadow` up to date.
+    fn note_fresh(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, ranges: &[(usize, usize)]) {
+        let at = match self.fresh.iter().position(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+            Some(at) => at,
+            None => {
+                self.fresh.push((shadow.clone(), Vec::new()));
+                self.fresh.len() - 1
+            }
+        };
+        let known = &mut self.fresh[at].1;
+        known.extend_from_slice(ranges);
+        // Merge only ranges that overlap or touch exactly (no page rounding:
+        // a gap between them was not checked).
+        known.sort_unstable();
+        let mut merged: Ranges = Vec::with_capacity(known.len());
+        for &(from, to) in known.iter() {
+            match merged.last_mut() {
+                Some((_, end)) if from <= *end => *end = (*end).max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        *known = merged;
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -1303,22 +1543,52 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    fn gpu_write(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        // Even a repeated declaration comes after the preceding refreshes.
+        self.flush();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if self.write_ranges.insert(key) {
+            shadow.writing(address, len);
+            self.copy_back.push((shadow.clone(), address, len));
+        }
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
+    ///
+    /// `written`: the title range the step writes, if it is known; what may
+    /// be up to date there is not any more (all of it when unknown).
+    fn title_written(&mut self, written: Option<(usize, usize)>) {
         self.flush();
         self.textures.clear();
+        match written {
+            None => self.fresh.clear(),
+            Some((from, to)) => {
+                for (_, ranges) in &mut self.fresh {
+                    ranges.retain(|&(a, b)| b <= from || to <= a);
+                }
+            }
+        }
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        for (shadow, mut ranges) in std::mem::take(&mut self.refreshes) {
+            coalesce_ranges(&mut ranges, crate::watch::PAGE);
+            self.note_fresh(&shadow, &ranges);
+            for (from, to) in ranges {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1853,6 +2123,48 @@ impl Host {
             }
         }
     }
+
+    /// A GPU-only default-heap buffer that shaders can write (unordered
+    /// access). Starts in the common state.
+    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a default-heap buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no default buffer");
+                None
+            }
+        }
+    }
 }
 
 /// For adapters without device-removed data (the software one): the last
@@ -2022,8 +2334,58 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, coalesce_ranges};
     use std::sync::Arc;
+
+    const PAGE: usize = crate::watch::PAGE;
+
+    fn coalesced(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        coalesce_ranges(&mut ranges, PAGE);
+        ranges
+    }
+
+    #[test]
+    fn empty_ranges_are_dropped() {
+        assert_eq!(coalesced(vec![]), []);
+        assert_eq!(coalesced(vec![(5, 5), (PAGE, PAGE)]), []);
+        assert_eq!(coalesced(vec![(10, 10), (20, 30)]), [(20, 30)]);
+    }
+
+    #[test]
+    fn ranges_in_one_page_merge() {
+        assert_eq!(coalesced(vec![(100, 200), (10, 20), (150, 400)]), [(10, 400)]);
+        // Nested and repeated.
+        assert_eq!(coalesced(vec![(0, PAGE), (8, 16), (0, PAGE)]), [(0, PAGE)]);
+    }
+
+    #[test]
+    fn ranges_in_touching_pages_merge() {
+        // Ends in page 0, starts in page 1.
+        assert_eq!(coalesced(vec![(PAGE + 8, PAGE + 16), (0, 8)]), [(0, PAGE + 16)]);
+        // Ends exactly at page 1's start, starts in page 1.
+        assert_eq!(coalesced(vec![(0, PAGE), (PAGE + 100, 2 * PAGE)]), [(0, 2 * PAGE)]);
+        // A chain of ranges each in the page after the last.
+        let chain: Vec<_> = (0..8).map(|p| (p * PAGE + 10, p * PAGE + 20)).collect();
+        assert_eq!(coalesced(chain), [(10, 7 * PAGE + 20)]);
+    }
+
+    #[test]
+    fn ranges_pages_apart_stay_apart() {
+        // A whole untouched page between them.
+        assert_eq!(coalesced(vec![(2 * PAGE, 2 * PAGE + 1), (0, 1)]), [(0, 1), (2 * PAGE, 2 * PAGE + 1)]);
+        // The low and high ends of a 256 MiB buffer.
+        let (low, high) = (1 << 30, (1 << 30) + (256 << 20) - 64);
+        assert_eq!(
+            coalesced(vec![(high, high + 64), (low, low + 64), (low + 32, low + 128)]),
+            [(low, low + 128), (high, high + 64)]
+        );
+    }
+
+    #[test]
+    fn ranges_at_the_top_of_the_address_space_do_not_overflow() {
+        let top = usize::MAX;
+        assert_eq!(coalesced(vec![(top - 8, top), (top - 100, top - 50)]), [(top - 100, top)]);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
@@ -2046,7 +2408,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
-        batch.title_written();
+        batch.title_written(None);
         assert!(batch.texture_due(&a));
         assert!(!batch.texture_due(&a));
         // A fresh submission starts over.

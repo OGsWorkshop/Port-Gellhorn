@@ -81,7 +81,13 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_cs(&words)
+}
 
+/// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
+/// layout: 4 root constants in `s0..s3`, the address of a table holding a
+/// UAV in `s4`.
+fn lower_cs(words: &[u32]) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -123,10 +129,9 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res =
-        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -137,6 +142,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        options: super::TranslateOptions::default(),
     })
     .expect("lower");
 
@@ -160,11 +166,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     shader
 }
 
-/// One GPU test at a time. With these tests on the hardware adapter and WARP
-/// from several test threads at once, now and then none of their dispatches
-/// ever completes and the test binary hangs; and two GPU tests at once on
-/// WARP can end the test process with an access violation. Other GPU test
-/// modules take this lock too.
+/// Held by every test that dispatches, so they take the GPU one at a time.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
@@ -174,6 +176,9 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    // One test at a time: with these tests on the hardware adapter and WARP
+    // from several test threads at once, now and then none of their
+    // dispatches ever completes and the test binary hangs.
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -190,7 +195,8 @@ fn run_cases(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
+                    (root, _) => super::host::guard(root, 1, 0)
+                        .unwrap_or_else(|| panic!("unexpected user data {:?}", (root, u.slot))),
                 };
             }
             let out = host
@@ -935,5 +941,46 @@ fn v_cmp_class_f16_matches_rdna2() {
             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
+    });
+}
+
+/// A descriptor at a heap address the program's data computes (the table
+/// address plus an index, as bindless code adds one it loads). Stale data
+/// gives any index; one past the host heap is undefined: NVIDIA wraps it
+/// onto another slot (without the guard, index 2^25 writes through slot 0
+/// here), and a descriptor of another kind there hangs the GPU. Such an
+/// index reads the heap's guard slot (null) instead: the store is dropped.
+/// In range, the store lands.
+#[test]
+fn a_heap_index_past_the_heap_reads_the_guard_slot() {
+    let words = [
+        s_mov_b32(5, 0x80),     // s5 = 0
+        sop2(0x1E, 6, 0, 0x85), // s_lshl_b32 s6, s0, 5: the index from data
+        // s_load_dwordx4 s[8:11], s[4:5], s6
+        s_load_dwordx4(8, 4)[0],
+        6 << 25,
+        vop1(0x001, 0, 0x87), // v_mov_b32 v0, 7
+        buffer_store_dword(0, 8, 0)[0],
+        buffer_store_dword(0, 8, 0)[1],
+        S_ENDPGM,
+    ];
+    let shader = lower_cs(&words);
+    // The guard is a user-data dword of its own, past the console's.
+    let guard: Vec<_> = shader
+        .user_data
+        .iter()
+        .filter(|u| u.root == RootType::ResourceHeap)
+        .collect();
+    assert_eq!(guard.len(), 1, "{:?}", shader.user_data);
+    assert_eq!(guard[0].index, 5, "after s0..s4");
+    let cases = [
+        [0, 0, 0, 0],           // heap index 0: the UAV
+        [1, 0, 0, 0],           // the guard slot itself
+        [1 << 25, 0, 0, 0],     // far past the heap
+        [0x07FF_FFFF, 0, 0, 0], // the last index an address gives
+    ];
+    run_cases(&shader, &cases, |label, i, k, got| {
+        let want = if i == 0 { 7 } else { 0 };
+        assert_eq!(got, want, "{label}: index {:#x}", k[0]);
     });
 }

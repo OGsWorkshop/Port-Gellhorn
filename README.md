@@ -130,19 +130,32 @@ Already fixed in this repo's runtime: the 64-bit wait ordering (black screen), t
 
 **Requirements:** Windows 10/11 x64 · a D3D12 GPU with Shader Model 6.6 and mesh shaders (RTX 20-series / RX 6000 or newer) · 32 GB RAM recommended · [Rust](https://rustup.rs) (stable MSVC) · Windows SDK (for DXC)
 
+Two ways to run it:
+
+**A. VIctory stack: furthest today** (world geometry on screen, movement tutorial, about 1 fps, final image still black)
+
 ```powershell
 git clone https://github.com/ZigZagBoi1/ScarlettPort.git
 cd ScarlettPort
-.\scripts\setup.ps1 -Game "D:\path\to\your\dump"     # build + Agility SDK + precompile all shaders (~45 min, once)
-.\scripts\play.ps1  -Game "D:\path\to\your\dump" -AutoMenu
+.\scripts\setup-victory.ps1                                         # build + Agility SDK
+.\scripts\play-victory.ps1 -Game "D:\path	o\your\dump" -AutoInput -DebugView
 ```
 
-- `-AutoMenu` presses A for you so the menus advance without a controller.
+**B. XCL + launcher: menus and loading screens at 30 fps**
+
+```powershell
+.\scripts\setup.ps1 -Game "D:\path	o\your\dump"     # build + Agility SDK + precompile all shaders (~45 min, once)
+.\scripts\play.ps1  -Game "D:\path	o\your\dump" -AutoMenu
+```
+
+Or download the one-exe launcher from [Releases](https://github.com/ZigZagBoi1/ScarlettPort/releases).
+
+- `-AutoInput` / `-AutoMenu` press A for you so the menus advance without a controller. `-DebugView` shows one of the game's internal geometry buffers in the window.
 - While the game runs, write button names into `press.txt` (e.g. `DOWN DOWN A`) to press them. Handy for scripting and for AI agents testing a build.
 - Logs go to `logs\`. Attach one when you open an issue.
 - Controls: an Xbox controller works best. On keyboard and mouse, Enter = A, Esc = B, WASD = left stick, and the mouse moves the right stick.
 
-Want the build that currently shows the menus? See [`docs/RUNTIMES.md`](docs/RUNTIMES.md).
+Environment variables and differences between the two: [`docs/RUNTIMES.md`](docs/RUNTIMES.md).
 
 ---
 
@@ -180,12 +193,13 @@ Every task is sized for **one person + one AI coding agent**. Pick one, comment 
 
 ```
 ScarlettPort/
-├── scripts/          setup.ps1, play.ps1: build and run
+├── scripts/          setup.ps1 / play.ps1 (XCL), setup-victory.ps1 / play-victory.ps1 (VIctory stack)
 ├── runtime/
-│   ├── xcl/          main runtime: console OS, D3D12.X, RDNA2 → HLSL → DXIL recompiler
-│   └── victory/      second runtime: RDNA2 → DXIL directly; currently shows the menus
+│   ├── xcl/          XCL: console OS, D3D12.X, RDNA2 → HLSL → DXIL recompiler; menus and loading at 30 fps
+│   └── victory/      VIctory stack: RDNA2 → DXIL directly; world geometry and the tutorial (see SCARLETTPORT.md)
+├── launcher/         native one-exe launcher (Rust, egui)
 ├── patches/          our changes to each runtime, as plain diffs (easy to review and upstream)
-├── docs/             STATUS, RUNTIMES, technical findings
+├── docs/             STATUS, RUNTIMES
 └── assets/           screenshots
 ```
 

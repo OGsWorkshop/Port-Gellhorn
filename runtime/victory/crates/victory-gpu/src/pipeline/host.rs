@@ -34,6 +34,15 @@ pub(crate) struct GraphicsState {
     samples: DXGI_SAMPLE_DESC,
 }
 
+impl GraphicsState {
+    /// Whether this draws depth-tested geometry (the 3D scene), not flat
+    /// layers (interface, full-screen passes), which keep their own pixel
+    /// shaders in the debug view.
+    pub(crate) fn draws_geometry(&self) -> bool {
+        self.depth_format != DXGI_FORMAT_UNKNOWN && self.depth.DepthEnable.as_bool()
+    }
+}
+
 impl Default for GraphicsState {
     fn default() -> Self {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -156,7 +165,7 @@ impl GraphicsState {
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
                     for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+                        f.0 = crate::resource::target_format(f.0 as u32) as i32;
                     }
                 }
                 16 => {
@@ -243,6 +252,16 @@ pub(crate) struct Input {
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
+/// Whether root SRVs are bound as one-view tables of the buffer's host
+/// copy (reads past its end return zeros) rather than root descriptors
+/// (unbounded: a mesh shader's vertex fetch, which has no record limit,
+/// read past the copy into memory the host had freed). Set
+/// `VICTORY_ROOT_SRV_DIRECT=1` to go back.
+pub(crate) fn bounded_root_srvs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -277,51 +296,27 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
-/// Reads the required wave-lane range `(min, max)` from an emitted DXIL
-/// container's `PSV0` runtime info (`MinimumExpectedWaveLaneCount` and
-/// `MaximumExpectedWaveLaneCount`). Returns `None` when unconstrained
-/// (`min == 0` and `max == u32::MAX` or `0`) or absent.
-fn dxil_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
-    let container = victory_shader::Container::parse(dxil).ok()?;
-    let psv = container.part(victory_shader::FourCC::PSV0)?.data;
-    if psv.len() < 28 {
-        return None;
-    }
-    let info_size = u32::from_le_bytes(psv[0..4].try_into().ok()?);
-    if info_size < 24 {
-        return None;
-    }
-    let min = u32::from_le_bytes(psv[20..24].try_into().ok()?);
-    let max = u32::from_le_bytes(psv[24..28].try_into().ok()?);
-    if min == 0 && (max == 0 || max == u32::MAX) {
-        return None;
-    }
-    Some((min.max(1), if max == 0 { u32::MAX } else { max }))
+/// `VICTORY_DEBUG_PS=1`: graphics pipelines that draw depth-tested
+/// geometry draw with our debug pixel shader ([`victory_shader::emit::debug_ps`]), surfaces coloured by their
+/// slope, instead of the title's: the geometry of every draw whose vertex
+/// or mesh stage translates, lit or not, its pixel shader translated or not.
+pub(crate) fn debug_ps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DEBUG_PS").is_some();
+        if on {
+            tracing::info!("graphics pipelines draw with the debug pixel shader (VICTORY_DEBUG_PS)");
+        }
+        on
+    })
 }
 
-/// Whether a translated `stage` program cannot run on a host whose waves have
-/// `host_lanes = (min, max)` lanes.
-///
-/// - If the emitted DXIL module declares a `PSV0` wave-lane range (e.g.
-///   `WaveSize(64)` or `WaveSize(32)`), it is refused whenever the host's
-///   `[min, max]` range does not overlap it. This lets per-lane or split
-///   wave64 compute translations (declaring `WaveSize(32)` or unconstrained)
-///   run on 32-lane hosts while still refusing modules that require 64 lanes
-///   (and refusing 32/64-lane modules on 4-lane WARP).
-/// - Console `wave64` mesh programs do not carry `PSV0` `WaveSize(64)`
-///   metadata, so they are refused whenever `host_lanes.1 < 64`.
-/// - Vertex and pixel programs run per lane and are kept unless their emitted
-///   DXIL explicitly requires an unsupported wave size.
-fn wave_lanes_unsupported(
-    stage: &str,
-    console_wave64: bool,
-    emitted_wave: Option<(u32, u32)>,
-    (host_min, host_max): (u32, u32),
-) -> bool {
-    if let Some((req_min, req_max)) = emitted_wave {
-        return host_max < req_min || host_min > req_max;
-    }
-    stage == "mesh" && console_wave64 && host_max < 64
+/// Whether geometry whose pixel shader does not translate (or is refused)
+/// is drawn with the debug pixel shader instead of dropped: on unless
+/// `VICTORY_PS_FALLBACK=0`.
+fn ps_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PS_FALLBACK").map_or(true, |v| v != "0"))
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -337,8 +332,35 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
-    /// state `g`, or for one compute shader.
+    /// state `g`, or for one compute shader. A pipeline drawing depth-tested
+    /// geometry falls back to our debug pixel shader where the title's does
+    /// not translate or the host refuses it (and, in the debug view, to the
+    /// title's where ours is refused), so its geometry is drawn rather than
+    /// dropped (`VICTORY_PS_FALLBACK=0` turns that off).
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        let geometry = g.is_some_and(GraphicsState::draws_geometry)
+            && shaders.iter().any(|s| s.stage == "pixel");
+        if !geometry {
+            return Self::make(shaders, g, false);
+        }
+        let first = debug_ps();
+        if let Some(p) = Self::make(shaders, g, first) {
+            return Some(p);
+        }
+        if !first && !ps_fallback() {
+            return None;
+        }
+        let p = Self::make(shaders, g, !first)?;
+        if !first {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!("pixel shaders that do not translate are replaced by the debug one"));
+        }
+        Some(p)
+    }
+
+    /// [`HostPipeline::new`] with our debug pixel shader (`debug`) or the
+    /// title's.
+    fn make(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, debug: bool) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -364,43 +386,26 @@ impl HostPipeline {
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            // Debug view: the title's pixel shader is left out (it need not
+            // translate) and ours stands in at the pixel slot.
+            if !debug {
+                stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            }
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
-        let host_lanes = host()?.wave_lanes();
-        if let Some(ms) = mesh
-            && wave_lanes_unsupported(ms.stage, ms.wave64(), None, host_lanes)
-        {
-            return refuse(
-                if host_lanes.1 < 32 {
-                    "a mesh program written for 64-lane waves, on a host without them (e.g. 4-lane WARP)"
-                } else {
-                    "a mesh program written for 64-lane waves, on a host without them"
-                },
-                shaders,
-            );
-        }
         for (s, _) in &stages {
-            let t = s.translated()?;
-            let emitted = dxil_wave_lanes(&t.host.dxil);
-            if wave_lanes_unsupported(s.stage, s.wave64(), emitted, host_lanes) {
-                return refuse(
-                    if host_lanes.1 < 32 {
-                        "a shader requiring wider waves than this host supports (e.g. 4-lane WARP)"
-                    } else {
-                        "a shader requiring 64-lane waves, on a host without them"
-                    },
-                    shaders,
-                );
-            }
+            s.translated()?;
         }
         let host = host()?;
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        // Ranges the table parameters point at, alive until the root
+        // signature is made.
+        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
@@ -439,6 +444,32 @@ impl HostPipeline {
                 ),
             ] {
                 for &slot in slots {
+                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+                        // A one-view table: the view's size bounds the reads,
+                        // which a root descriptor leaves unbounded.
+                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                            NumDescriptors: 1,
+                            BaseShaderRegister: u32::from(slot),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                            OffsetInDescriptorsFromTableStart: 0,
+                        }));
+                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                        out.push((slot, params.len() as u32));
+                        params.push(D3D12_ROOT_PARAMETER1 {
+                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                    NumDescriptorRanges: 1,
+                                    pDescriptorRanges: range,
+                                },
+                            },
+                            ShaderVisibility: visibility,
+                        });
+                        continue;
+                    }
                     out.push((slot, params.len() as u32));
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,
@@ -479,7 +510,18 @@ impl HostPipeline {
                 return None;
             }
         };
+        // The debug view's pixel shader, one output per colour target.
+        let debug = (compute.is_none() && debug)
+            .then(|| victory_shader::emit::debug_ps(g.map_or(1, |g| g.targets.NumRenderTargets)));
         let code = |i: usize| {
+            if i == 1
+                && let Some(d) = &debug
+            {
+                return D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: d.dxil.as_ptr().cast(),
+                    BytecodeLength: d.dxil.len(),
+                };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
@@ -734,101 +776,5 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{dxil_wave_lanes, wave_lanes_unsupported};
-
-    fn synthetic_dxbc_with_psv0(min_lanes: u32, max_lanes: u32) -> Vec<u8> {
-        let mut psv = Vec::new();
-        psv.extend_from_slice(&48u32.to_le_bytes()); // PSVRuntimeInfo2 size
-        let mut info = [0u8; 48];
-        info[16..20].copy_from_slice(&min_lanes.to_le_bytes());
-        info[20..24].copy_from_slice(&max_lanes.to_le_bytes());
-        psv.extend_from_slice(&info);
-
-        // DXBC header (32 bytes) + 1 part offset (4 bytes) + part header (8 bytes) + psv.
-        let part_offset = 36u32;
-        let total_size = part_offset + 8 + psv.len() as u32;
-        let mut out = Vec::with_capacity(total_size as usize);
-        out.extend_from_slice(b"DXBC");
-        out.extend_from_slice(&[0u8; 16]); // digest
-        out.extend_from_slice(&1u32.to_le_bytes()); // version
-        out.extend_from_slice(&total_size.to_le_bytes());
-        out.extend_from_slice(&1u32.to_le_bytes()); // part count
-        out.extend_from_slice(&part_offset.to_le_bytes());
-        out.extend_from_slice(b"PSV0");
-        out.extend_from_slice(&(psv.len() as u32).to_le_bytes());
-        out.extend_from_slice(&psv);
-        out
-    }
-
-    #[test]
-    fn emitted_wave_size_checked_against_host_range() {
-        // Compute declaring WaveSize(64) is refused on 32-lane NVIDIA and 4-lane WARP,
-        // and allowed on 64-lane hosts.
-        assert!(wave_lanes_unsupported(
-            "compute",
-            true,
-            Some((64, 64)),
-            (32, 32)
-        ));
-        assert!(wave_lanes_unsupported(
-            "compute",
-            true,
-            Some((64, 64)),
-            (4, 4)
-        ));
-        assert!(!wave_lanes_unsupported(
-            "compute",
-            true,
-            Some((64, 64)),
-            (32, 64)
-        ));
-
-        // Wave64 compute lowered to WaveSize(32) (e.g. split emulation) or per-lane
-        // (no WaveSize) runs on 32-lane hosts; WaveSize(32) is still refused on 4-lane WARP.
-        assert!(!wave_lanes_unsupported(
-            "compute",
-            true,
-            Some((32, 32)),
-            (32, 32)
-        ));
-        assert!(wave_lanes_unsupported(
-            "compute",
-            true,
-            Some((32, 32)),
-            (4, 4)
-        ));
-        assert!(!wave_lanes_unsupported("compute", true, None, (32, 32)));
-        assert!(!wave_lanes_unsupported("compute", true, None, (4, 4)));
-
-        // Console wave64 mesh has no PSV0 WaveSize metadata and still needs 64-lane hosts.
-        assert!(wave_lanes_unsupported("mesh", true, None, (32, 32)));
-        assert!(wave_lanes_unsupported("mesh", true, None, (4, 4)));
-        assert!(!wave_lanes_unsupported("mesh", true, None, (32, 64)));
-        assert!(!wave_lanes_unsupported("mesh", false, None, (32, 32)));
-
-        // Vertex and pixel programs run per lane.
-        assert!(!wave_lanes_unsupported("vertex", true, None, (32, 32)));
-        assert!(!wave_lanes_unsupported("pixel", true, None, (4, 4)));
-    }
-
-    #[test]
-    fn dxil_wave_lanes_reads_psv0_bounds() {
-        assert_eq!(
-            dxil_wave_lanes(&synthetic_dxbc_with_psv0(0, u32::MAX)),
-            None
-        );
-        assert_eq!(
-            dxil_wave_lanes(&synthetic_dxbc_with_psv0(64, 64)),
-            Some((64, 64))
-        );
-        assert_eq!(
-            dxil_wave_lanes(&synthetic_dxbc_with_psv0(32, 32)),
-            Some((32, 32))
-        );
     }
 }

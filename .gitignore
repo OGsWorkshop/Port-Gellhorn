@@ -27,6 +27,7 @@ cache/
 victory.toml
 xcl.toml
 .env
+press.txt
 
 # Launcher
 launcher/target

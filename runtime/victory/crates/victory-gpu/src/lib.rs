@@ -20,6 +20,8 @@ mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod producers;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -38,6 +40,8 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

@@ -117,13 +117,32 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
+        crate::descriptor::resync_title_writes();
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        let mut skipped = 0;
         let host_lists: Vec<_> = lists
             .iter()
+            .filter(|&&l| {
+                let may = crate::list::may_run(l);
+                skipped += usize::from(!may);
+                may
+            })
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
+        if skipped > 0 {
+            static LOST: AtomicBool = AtomicBool::new(false);
+            if !LOST.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    skipped,
+                    "lists submitted again after their dynamic descriptor slots were taken back are not run"
+                );
+            }
+        }
         host.execute(&host_lists);
+        for &l in lists {
+            crate::list::finished(l);
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -272,8 +291,25 @@ extern "system" fn present(
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::draw::drawn() + crate::draw::dispatched();
+        crate::capture::note_busy(frame, now - LAST.swap(now, Ordering::Relaxed));
+    }
+    // Show mode (diagnostics builds) picks its target before a dump takes
+    // the frame's list.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let shown = crate::capture::shown(frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let (Some(copy), Some(host)) = (&shown, crate::host::host()) {
+        let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+        if host.present(&copy.texture, state, frame).is_some() {
+            return S_OK;
+        }
     }
     #[cfg(windows)]
     if planes > 0

@@ -99,8 +99,6 @@ impl Hasher for Fx {
 
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
-/// Case splits [`Bools::meet`] makes before it gives up.
-const MAX_MEET: usize = 1 << 16;
 
 impl Bools {
     fn new() -> Self {
@@ -223,38 +221,6 @@ impl Bools {
         self.ite(a, nb, b)
     }
 
-    /// Whether some lane can satisfy every `(b, holds)` of `all` at once:
-    /// `b` where `holds`, its negation where not. Yes when the search grows
-    /// too large to finish.
-    pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
-        let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
-    }
-
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
-        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
-        if all.iter().any(fails) {
-            return false;
-        }
-        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-        if all.is_empty() || *budget == 0 {
-            return true;
-        }
-        *budget -= 1;
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
-            let next = all
-                .iter()
-                .map(|&(b, holds)| {
-                    let (lo, hi) = self.split(b, v);
-                    (if value { hi } else { lo }, holds)
-                })
-                .collect();
-            self.meet_in(next, budget)
-        })
-    }
-
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -340,29 +306,22 @@ pub struct Structured {
     /// enough (lanes outside EXEC then never get there, so a VGPR write
     /// needs no old value). Always `None` for scalar instructions.
     pub guards: Vec<Vec<Option<Bool>>>,
-    /// Per block: what holds in every lane that enters it (over forward
-    /// edges; a loop header forgets what its loop redefines).
-    pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
-    /// Exact Wave64 pairs for checking masks at their uses.
-    paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
-    /// they are written: every such lane reaches the writing block, so a
-    /// ballot there gives the mask as data.
+    /// they are written, or for a join only in lanes that reach it: every
+    /// such lane reaches the writing block, so a ballot there gives the
+    /// mask as data.
     pub active: HashSet<Value>,
-}
-
-impl Structured {
-    pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
-        match high {
-            Some(high) => self.paired_masks.get(&(low, high)),
-            None => self.masks.get(&low),
-        }
-        .copied()
-    }
+    /// Masks (low dwords) set in every lane that does not run where they
+    /// are written (EXEC clear there, or not reaching a join): a ballot
+    /// there, with every lane it leaves out set, gives the mask as data.
+    pub outside: HashSet<Value>,
+    /// The lane's bit of other values read as masks (constants, numbers),
+    /// by their low dword's value: what a mask join takes in from them.
+    pub numbers: HashMap<Value, Bool>,
 }
 
 /// Builds the per-lane form of `program`.
@@ -413,6 +372,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::outside`].
+    outside: HashSet<Value>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -476,6 +437,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            outside: HashSet::new(),
         })
     }
 
@@ -488,6 +450,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.outside.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -581,17 +544,95 @@ impl<'a> Lanes<'a> {
         wrong
     }
 
+    /// Mask joins read per lane: a ballot in the join's block sees the
+    /// lanes that reach it. Only before the first loop, where what a lane
+    /// knows on entering a block is exactly whether it gets there, and only
+    /// joins whose lanes all see the wave's value (`per_lane`).
+    fn joined_masks(&mut self, cond: &[Bool]) {
+        let first_loop = (0..self.order.len())
+            .find(|&i| {
+                let s = self.order[i];
+                self.incoming[s].iter().any(|&(q, _)| self.index[q] >= i)
+            })
+            .unwrap_or(usize::MAX);
+        let joins: Vec<(Key, usize, Bool)> = self
+            .masks
+            .iter()
+            .filter_map(|(&k, &m)| {
+                let &(block, _) = self.phis.get(&k.0).or_else(|| self.phis.get(&k.1))?;
+                (self.index[block] < first_loop).then_some((k, block, m))
+            })
+            .collect();
+        for (k, block, m) in joins {
+            if self.active.contains(&k.0)
+                || self.outside.contains(&k.0)
+                || !self.per_lane(k, block, cond)
+            {
+                continue;
+            }
+            let there = cond[block];
+            let away = self.b.not(there);
+            if self.b.implies(m, there) {
+                self.active.insert(k.0);
+            } else if self.b.implies(away, m) {
+                self.outside.insert(k.0);
+            }
+        }
+    }
+
+    /// Whether every lane's own incoming mask at join `k` is the wave's.
+    /// The wave arrives from the last predecessor, in program order, that
+    /// any lane reaches; so a lane arriving over an edge must find there
+    /// the mask of every edge from that one on (`s20 = 0; if (..) s20 = vcc`
+    /// holds, where vcc is clear in the lanes that skip; `s20 = -1` before
+    /// it does not).
+    fn per_lane(&mut self, k: Key, block: usize, cond: &[Bool]) -> bool {
+        let p = self.p;
+        let target = &p.blocks[block];
+        let (lo, hi) = (self.phis.get(&k.0).copied(), self.phis.get(&k.1).copied());
+        let arg = |phi: Option<(usize, usize)>, own: Value, n: usize| {
+            phi.map_or(own, |(_, i)| target.phis[i].args[n])
+        };
+        let mut edges = Vec::new();
+        for n in 0..target.preds.len() {
+            let (q, taken) = self.incoming[block][n];
+            if p.blocks[q].offset >= target.offset {
+                return false;
+            }
+            let e = self.edge(cond[q], q, taken);
+            let m = self.mask((arg(lo, k.0, n), arg(hi, k.1, n))).0;
+            edges.push((p.blocks[q].offset, e, m));
+        }
+        for &(at, e, m) in &edges {
+            for &(from, _, other) in &edges {
+                if from < at {
+                    continue;
+                }
+                let differ = self.b.xor(m, other);
+                let same = self.b.not(differ);
+                if !self.b.implies(e, same) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn finish(
         mut self,
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        self.joined_masks(cond);
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
             .iter()
             .enumerate()
             .map(|(n, block)| {
+                // Reachability is fixed within the block. Vector instructions
+                // with the same EXEC therefore need the same guard.
+                let mut last_guard = None;
                 block
                     .insts
                     .iter()
@@ -601,8 +642,16 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
-                        (&Some(e), _) if b.implies(cond[n], e) => None,
-                        (&Some(e), _) => Some(b.given(e, cond[n])),
+                        (&Some(e), _) => {
+                            if let Some((prev, guard)) = last_guard
+                                && prev == e
+                            {
+                                return guard;
+                            }
+                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
+                            last_guard = Some((e, guard));
+                            guard
+                        }
                     })
                     .collect()
             })
@@ -632,12 +681,12 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            outside: self.outside,
+            numbers: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             bools: self.b,
             exits,
             guards,
-            reach: cond.to_vec(),
         })
     }
 
@@ -937,6 +986,13 @@ impl<'a> Lanes<'a> {
                             || exec.is_some_and(|e| self.b.implies(m, e))
                         {
                             self.active.insert(k.0);
+                        } else if let Some(e) = exec {
+                            // Set wherever EXEC is clear (`s_not` of a compare,
+                            // the lanes a branch left out).
+                            let off = self.b.not(e);
+                            if self.b.implies(off, m) {
+                                self.outside.insert(k.0);
+                            }
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
@@ -981,6 +1037,17 @@ impl<'a> Lanes<'a> {
                     && let Some(k) = self.key(|r| inst.read(r), code)
                 {
                     self.mask(k);
+                }
+                // So is a join read as a number (`v_mov_b32 v1, s20` after
+                // a branch that wrote a compare to s20).
+                for op in &v.src {
+                    if let Operand::Scalar { code, .. } = *op
+                        && code != NULL
+                        && let Some(k) = self.key(|r| inst.read(r), code)
+                        && (self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1))
+                    {
+                        self.mask(k);
+                    }
                 }
                 if name.starts_with("v_cmpx") {
                     if let Some(k) = self.key(|r| inst.write(r), EXEC) {
@@ -1158,6 +1225,37 @@ mod tests {
         assert_eq!(s.guards[0][0], None, "the compare runs in every lane");
         let g = s.guards[0][1].expect("guard");
         assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
+    }
+
+    #[test]
+    fn guards_follow_exec_and_block_reachability() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBF88_0005, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7DA4_0880, // v_cmpx_eq_u32 exec, 0, v4
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let lane = |block: usize, i: usize| {
+            Atom::Lane(p.blocks[block].insts[i].write(Reg::S(EXEC)).unwrap())
+        };
+        let a = s.guards[0][1].unwrap();
+        let b = s.guards[1][2].unwrap();
+        assert_eq!(s.bools.node(a), Some((lane(0, 0), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[0], [None, Some(a), Some(a), None]);
+        // The fallthrough already implies the first compare. Only the second
+        // compare needs testing, and the scalar move never needs a guard.
+        assert_eq!(s.bools.node(b), Some((lane(1, 1), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[1], [None, None, Some(b), None, Some(b)]);
     }
 
     #[test]
