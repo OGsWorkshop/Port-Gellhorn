@@ -9,6 +9,9 @@ AI coding agents are welcome. The rules are the same for code written by hand an
 3. **Test it on real hardware** and say what you ran: GPU, driver, Windows build, and what changed (fps, how far the game got, which log lines appeared or went away).
 4. **Never commit game files.** No executables, `.rpf` archives, shaders dumped from the game, `MicrosoftGame.config`, saves or logs that contain game data. `.gitignore` blocks the common ones, but check your diff anyway.
 5. **Keep upstream licenses and credits** in `runtime/xcl` and `runtime/victory`.
+6. **One author per commit.** Commit messages must not contain `Co-Authored-By` trailers; CI rejects them. The author of a commit is the person who takes responsibility for it and who the license and history attribute it to, so a commit has exactly one. Credit others in the PR description instead.
+
+CI (`.github/workflows/ci.yml`) also checks that no `.exe`, `.dll`, `.pdb`, `.rpf` or file over 2 MB is tracked, that `scripts/*.ps1` parse, and that the runtimes and launcher build. Build instructions: [docs/BUILDING.md](docs/BUILDING.md). Direction: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## PR description
 

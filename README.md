@@ -155,7 +155,7 @@ Or download the one-exe launcher from [Releases](https://github.com/ZigZagBoi1/S
 - Logs go to `logs\`. Attach one when you open an issue.
 - Controls: an Xbox controller works best. On keyboard and mouse, Enter = A, Esc = B, WASD = left stick, and the mouse moves the right stick.
 
-Environment variables and differences between the two: [`docs/RUNTIMES.md`](docs/RUNTIMES.md).
+Environment variables and differences between the two: [`docs/RUNTIMES.md`](docs/RUNTIMES.md). Build instructions: [`docs/BUILDING.md`](docs/BUILDING.md). Plan to 30 fps: [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ---
 
@@ -199,7 +199,7 @@ ScarlettPort/
 │   └── victory/      VIctory stack: RDNA2 → DXIL directly; world geometry and the tutorial (see SCARLETTPORT.md)
 ├── launcher/         native one-exe launcher (Rust, egui)
 ├── patches/          our changes to each runtime, as plain diffs (easy to review and upstream)
-├── docs/             STATUS, RUNTIMES
+├── docs/             STATUS, RUNTIMES, BUILDING, ROADMAP
 └── assets/           screenshots
 ```
 
