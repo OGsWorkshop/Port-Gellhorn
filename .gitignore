@@ -32,3 +32,18 @@ press.txt
 # Launcher
 launcher/target
 launcher/runtime
+
+# Private research and anything derived from a game copy: never commit
+kb-private/
+**/kb-private/
+re-*.md
+*decomp*/
+decompilation/
+graphics_research/
+corpus/
+shader-names/
+capture-*/
+captures/
+*.dump
+precompiled-dump/
+settings.xml

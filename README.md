@@ -18,7 +18,7 @@ No emulator. No streaming. The game's own x64 code runs on your CPU, and its RDN
 <a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" height="45"/></a>
 <a href="https://ko-fi.com/ziggymar"><img src="https://img.shields.io/badge/BUY%20A%20COFFEE-Ko--fi-ff5f5f?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" height="45"/></a>
 
-<sub>PayPal: please send as <b>Friends & Family</b> to avoid holds and fees.</sub>
+<sub>Donations are voluntary gifts that support development time. They are not a purchase: they buy no game content, access, builds or perks.<br>PayPal: please send as <b>Friends & Family</b> (a gift).</sub>
 
 </div>
 
@@ -219,6 +219,8 @@ ScarlettPort/
 
 ## ⚖️ Legal
 
+- This project is **not affiliated with, endorsed by or sponsored by** the game's developer or publisher, or by Microsoft. It is free and is not sold.
+- You need your **own legally obtained copy** of the game. This project does not provide, link to or help obtain game files.
 - This project contains **no code, assets or files from the game or its publisher**, and no console SDK code. You must own the game and provide your own dump.
 - Nothing here decrypts, unpacks or bypasses DRM.
 - `runtime/xcl` is GPL-2.0-only, © the XCL authors. `runtime/victory` is GPL-3.0-or-later, © the VIctory authors. Each keeps its own `LICENSE`. See [`LICENSE.md`](LICENSE.md).
