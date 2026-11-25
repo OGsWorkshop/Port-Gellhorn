@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With `crate::rebar`: the bytes of `buffer`, which is in the card's
+    /// memory the CPU maps (0: it is not).
+    rebar: u64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1490,6 +1493,9 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if self.rebar != 0 {
+            crate::rebar::released(self.rebar);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -1759,6 +1765,12 @@ impl Shadow {
     }
 
     /// The copy's own number (see the field).
+    /// Whether the copy is placed over title memory in place (other
+    /// buffers may alias it).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -1818,6 +1830,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            rebar: 0,
         }
     }
 
@@ -1847,6 +1860,10 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        // Testing switch: only the title's read-back buffers are copied back.
+        if !crate::readback::copy_back(address, len) {
+            return;
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2887,6 +2904,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // With `crate::rebar` (level 2): a small one in the card's memory
+        // the CPU maps; never one the title reads on the CPU.
+        if !big
+            && let Some(shadow) = rebar_copy(crate::rebar::Kind::Buffer, key.0, len, size, false)
+        {
+            entry.shadow = Some(shadow);
+            return entry.shadow.clone();
+        }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -2934,6 +2959,30 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
+}
+
+/// A copy of title memory `[start, start + len)` in a buffer of `size`
+/// bytes in the card's memory the CPU maps, if [`crate::rebar`] places it
+/// there (otherwise, or if the buffer cannot be made, `None`: the caller
+/// makes the copy as before). It is a plain copy (no card side): the CPU
+/// writes title memory straight into the card's memory.
+fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window: bool) -> Option<Arc<Shadow>> {
+    let cpu_read = crate::readback::tagged_in(start, len);
+    if !crate::rebar::reserve(kind, size, cpu_read) {
+        return None;
+    }
+    let Some((buffer, data)) = host().and_then(|h| h.gpu_upload_buffer(size)) else {
+        crate::rebar::released(size);
+        return None;
+    };
+    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} in the card's mapped memory"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    tracing::debug!(start = format_args!("{start:#x}"), len, ?kind, "host copy in the card's mapped memory");
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.window = window;
+    shadow.rebar = size;
+    Some(Arc::new(shadow))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3104,6 +3153,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
+    // With `crate::rebar`: in the card's memory the CPU maps.
+    if let Some(shadow) = rebar_copy(crate::rebar::Kind::Window, start, len, len, true) {
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);

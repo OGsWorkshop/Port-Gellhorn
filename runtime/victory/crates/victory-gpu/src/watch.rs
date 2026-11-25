@@ -74,7 +74,7 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
-        .filter(|r| r.0 < r.1)
+        .filter(|r| r.0 < r.1 && !views_only(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -187,7 +187,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     for &(start, end) in ranges {
-        if start >= end {
+        if start >= end || views_only(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -223,6 +223,20 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// Whether `[start, end)` is all placeholder memory by the runtime's record
+/// (`crate::regions`): views of physical pages and the holes between them,
+/// which are not write-watched, so that a write-watch asking about them can
+/// only fail (and an asking ahead that holds them is asked again by
+/// halves). Counted as an asking left out.
+fn views_only(start: usize, end: usize) -> bool {
+    let (from, to) = (start / PAGE * PAGE, end.div_ceil(PAGE).saturating_mul(PAGE));
+    let views = crate::regions::all_placeholder(from, to - from);
+    if views {
+        crate::regions::add(crate::regions::S::WatchesSaved, 1);
+    }
+    views
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -252,6 +266,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    crate::regions::add(crate::regions::S::Watches, 1);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -321,17 +336,23 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    // View memory is not write-watched: by the runtime's record, the
+    // asking is left out (it could only fail).
+    let failed = views_only(first * PAGE, last * PAGE) || {
+        crate::regions::add(crate::regions::S::Watches, 1);
+        // SAFETY: the answer buffer holds `count` entries.
+        let r = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        r != 0
+    };
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -481,11 +502,23 @@ fn is_view(start: usize, end: usize) -> bool {
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
     let mut at = start;
+    // The runtime's record first (`crate::regions`): a view is a view, a
+    // hole is skipped as below; Windows is asked from the first byte the
+    // record does not know.
+    if holes && let Some(runs) = crate::regions::runs_by_view(start, end - start) {
+        match runs.iter().find(|r| r.kind != victory_core::memmap::Kind::Hole) {
+            None => return true,
+            Some(r) if r.kind == victory_core::memmap::Kind::Mapped => return true,
+            Some(r) => at = r.start,
+        }
+    }
     loop {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let n = crate::regions::timed(crate::regions::S::Queries, Some(crate::regions::S::QueryUs), || unsafe {
+            VirtualQuery(at as *const _, &mut info, size_of_val(&info))
+        });
         if n == 0 {
             return false;
         }
@@ -513,20 +546,53 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        }
+        crate::regions::timed(crate::regions::S::Protects, Some(crate::regions::S::ProtectUs), || {
+            // SAFETY: title view memory; only its protection changes.
+            unsafe {
+                VirtualProtect(
+                    (from * BLOCK) as *const _,
+                    (to - from) * BLOCK,
+                    PAGE_READONLY,
+                    &mut old,
+                ) != 0
+            }
+        })
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
+    // By the runtime's record (`crate::regions`): one call per view (a
+    // protection change cannot span two, and the title maps many a page
+    // on its own), holes noted absent without a call or a question.
+    // Before, a run over several views failed and was done block by block,
+    // with a `VirtualQuery` for each block that failed.
+    if let Some(runs) = crate::regions::runs_by_view(from * BLOCK, (to - from) * BLOCK) {
+        use victory_core::memmap::Kind;
+        for run in runs {
+            // Views and the reservations are in whole blocks.
+            let (a, b) = (run.start / BLOCK, run.end.div_ceil(BLOCK));
+            match run.kind {
+                Kind::Mapped if set(a, b) => note(g, a, b),
+                Kind::Hole => g.absent.extend(a..b),
+                // A view whose protection could not change, or memory the
+                // record does not know: as before, block by block.
+                _ => protect_os(g, a, b, &set, &note),
+            }
+        }
+        return;
+    }
+    protect_os(g, from, to, &set, &note);
+}
+
+/// [`protect`] without the record: the whole run, else block by block.
+fn protect_os(
+    g: &mut Guards,
+    from: usize,
+    to: usize,
+    set: &dyn Fn(usize, usize) -> bool,
+    note: &dyn Fn(&mut Guards, usize, usize),
+) {
     if set(from, to) {
         note(g, from, to);
         return;
@@ -545,10 +611,21 @@ fn uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
+    // The runtime's record, if it knows the block (`crate::regions`).
+    if let Some(run) = crate::regions::around(block * BLOCK) {
+        use victory_core::memmap::Kind;
+        match run.kind {
+            Kind::Hole => return run.end / BLOCK,
+            Kind::Mapped => return block,
+            Kind::Unknown => {}
+        }
+    }
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    let n = crate::regions::timed(crate::regions::S::Queries, Some(crate::regions::S::QueryUs), || unsafe {
+        VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info))
+    });
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {
@@ -790,6 +867,9 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // The record of what is mapped: nothing there until the runtime tells
+    // of the views it maps (`crate::title_memory_view`).
+    crate::regions::unmapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

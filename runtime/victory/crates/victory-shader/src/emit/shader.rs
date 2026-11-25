@@ -90,9 +90,20 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host sets: the number of
+/// the first thread group in x. The console dispatches any number of groups
+/// in one dimension; the host at most 65,535, so a larger dispatch runs in
+/// parts, each with the groups before it here. Asked for by compute programs
+/// that are told the x number alone (the one-dimensional ones).
+pub const USER_GROUP_BASE: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// Any double-precision value (`SFI0` Doubles).
+    pub const DOUBLES: u64 = 1 << 2;
+    /// Double division, fused multiply-add or integer conversions (`SFI0` 11.1 double
+    /// extensions).
+    pub const DOUBLE_EXT: u64 = 1 << 6;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -505,6 +516,8 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        container::settle_row_modes(&mut self.inputs);
+        container::settle_row_modes(&mut self.outputs);
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -838,6 +851,12 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::DOUBLES != 0 {
+            features |= 0x1;
+        }
+        if self.flags & flags::DOUBLE_EXT != 0 {
+            features |= 0x20;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }

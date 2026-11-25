@@ -669,6 +669,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -695,6 +696,7 @@ dependencies = [
  "tracing",
  "victory-core",
  "victory-formats",
+ "victory-game",
  "victory-pipeline",
  "victory-shader",
  "windows",
@@ -707,7 +709,9 @@ version = "0.1.0"
 dependencies = [
  "miniz_oxide",
  "opus-pure",
+ "serde",
  "tempfile",
+ "toml",
  "tracing",
  "victory-core",
  "victory-formats",

@@ -5,7 +5,11 @@
 //! "In the world" is read from the render targets the title binds per
 //! presented frame: menus and loading bind a handful, the world a hundred or
 //! more. [`THRESHOLD`] binds on [`SUSTAIN`] consecutive frames ends the mode;
-//! `VICTORY_FAST_BOOT_MAX_FRAMES` (default [`MAX_FRAMES`]) is the fallback.
+//! The fallback is a time limit, `VICTORY_FAST_BOOT_MAX_S` (default [`MAX_SECONDS`]):
+//! a frame count ran out in 45 s of 165 fps menus, before the account
+//! prompt (`VICTORY_FAST_BOOT_MAX_FRAMES` still sets one). After the world
+//! is detected, with `VICTORY_SKIP_CUTSCENES=1`, A is still pressed for
+//! [`SKIP_SECONDS`] so the intro cutscene's prompt skips it.
 //! Only our own frame-pacing sleep and our synthetic keys depend on this;
 //! the title's clocks are never touched.
 
@@ -17,8 +21,12 @@ use std::time::Instant;
 pub const THRESHOLD: u32 = 100;
 /// Consecutive world frames needed.
 pub const SUSTAIN: u32 = 3;
-/// Fallback: fast boot ends at this presented frame at the latest.
-pub const MAX_FRAMES: u64 = 6000;
+/// Fallback: fast boot ends this long after the start at the latest.
+pub const MAX_SECONDS: u64 = 420;
+/// After the world is detected: seconds A is still pressed (cutscene skip).
+pub const SKIP_SECONDS: u64 = 25;
+static WORLD_AT: OnceLock<Instant> = OnceLock::new();
+static MAX_S: OnceLock<u64> = OnceLock::new();
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static START: OnceLock<Instant> = OnceLock::new();
@@ -47,6 +55,14 @@ pub fn enabled() -> bool {
 /// and the un-throttled frame clock apply.
 pub fn active() -> bool {
     enabled() && !IN_WORLD.load(Ordering::Relaxed)
+}
+
+/// The world was detected less than [`SKIP_SECONDS`] ago: A is still
+/// pressed so the intro cutscene's skip prompt takes it.
+pub fn skipping() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| truthy(crate::env::env("VICTORY_SKIP_CUTSCENES")))
+        && WORLD_AT.get().is_some_and(|t| t.elapsed().as_secs() < SKIP_SECONDS)
 }
 
 /// Presented frames seen so far (while fast boot is on).
@@ -80,12 +96,21 @@ pub fn frame_presented() -> Option<String> {
     let max = *MAX.get_or_init(|| {
         crate::env::env("VICTORY_FAST_BOOT_MAX_FRAMES")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(MAX_FRAMES)
+            .unwrap_or(u64::MAX)
     });
+    let max_s = *MAX_S.get_or_init(|| {
+        crate::env::env("VICTORY_FAST_BOOT_MAX_S")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MAX_SECONDS)
+    });
+    let elapsed = START.get().map_or(0, |s| s.elapsed().as_secs());
     let why = if run >= SUSTAIN {
+        WORLD_AT.get_or_init(Instant::now);
         "render targets"
     } else if frame >= max {
         "frame limit"
+    } else if elapsed >= max_s {
+        "time limit"
     } else {
         return None;
     };

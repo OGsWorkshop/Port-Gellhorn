@@ -102,6 +102,32 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Translate the shaders of a title's archives into the cache and make
+    /// their compute pipelines, so that a run finds them there.
+    Warm {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Only translate: no host pipelines.
+        #[arg(long)]
+        no_pipelines: bool,
+    },
+    /// Make the host pipelines of the graphics records of the title's
+    /// precompiled pipeline cache (in its shaders.rpf) into the pipeline
+    /// library, at low priority, so that a run with
+    /// VICTORY_PRECOMPILED_GRAPHICS=1 compiles none of them. Needs a GPU.
+    PrecompileGraphics {
+        /// The title's shaders.rpf (default: shaders.rpf of the configured
+        /// game folder).
+        archive: Option<PathBuf>,
+        /// Worker threads (default: half the logical cores).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Only the first N records.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -189,6 +215,8 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        Command::PrecompileGraphics { archive, jobs, limit } => translate::precompile_graphics(archive, jobs, limit),
         Command::Run {
             exe,
             unimplemented,

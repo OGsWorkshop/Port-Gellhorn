@@ -1,7 +1,7 @@
 //! Title view slots past a capped host heap's identity window, each given a
 //! host slot of the heap's pool while it holds a view (see
-//! `host::HostHeap`). NVIDIA takes 1,000,000 shader-visible views; Grand
-//! Theft Auto VI's view heap has 1,245,184 slots, 500,000 to 700,000 of
+//! `host::HostHeap`). NVIDIA takes 1,000,000 shader-visible views; the title's
+//! view heap has 1,245,184 slots, 500,000 to 700,000 of
 //! them in use, spread over the whole heap. Title slots below the window
 //! keep their own index on the host; the others are mapped, and translated
 //! shaders look the host slot up in the heap map (a buffer of [`entry`]

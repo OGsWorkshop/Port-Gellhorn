@@ -186,6 +186,45 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // The mouse cursor for keyboard and mouse play (`gameinput::cursor`):
+    // hidden over the window while captured, captured by a click, freed when
+    // the window loses focus. The title still sees every message.
+    match message {
+        wm::WM_SETCURSOR
+            if super::gameinput::cursor::captured() && lparam as u32 & 0xFFFF == wm::HTCLIENT =>
+        {
+            // SAFETY: no cursor while it is over our client area.
+            unsafe { wm::SetCursor(std::ptr::null_mut()) };
+            return 1;
+        }
+        wm::WM_LBUTTONDOWN | wm::WM_RBUTTONDOWN | wm::WM_MBUTTONDOWN => {
+            super::gameinput::cursor::note_window(hwnd as usize);
+            super::gameinput::cursor::click();
+        }
+        wm::WM_SETFOCUS => super::gameinput::cursor::note_window(hwnd as usize),
+        // Focus moving to a window of ours (the splash, an overlay, a
+        // dialog) or to none is not a loss; the host poll frees the cursor
+        // when another program is in front.
+        wm::WM_KILLFOCUS => super::gameinput::cursor::focus_moved(wparam, "WM_KILLFOCUS"),
+        wm::WM_ACTIVATE => {
+            if wparam & 0xFFFF == wm::WA_INACTIVE as usize {
+                super::gameinput::cursor::focus_moved(lparam as usize, "WM_ACTIVATE");
+            } else {
+                super::gameinput::cursor::note_window(hwnd as usize);
+            }
+            if super::gameinput::cursor::captured() {
+                super::gameinput::cursor::clip(super::gameinput::cursor::target());
+            }
+        }
+        // The system lets go of the clip when windows move; hold it again.
+        wm::WM_MOVE | wm::WM_SIZE | wm::WM_WINDOWPOSCHANGED
+            if super::gameinput::cursor::captured() =>
+        {
+            super::gameinput::cursor::clip(super::gameinput::cursor::target());
+        }
+        wm::WM_CAPTURECHANGED => tracing::debug!("WM_CAPTURECHANGED"),
+        _ => {}
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);

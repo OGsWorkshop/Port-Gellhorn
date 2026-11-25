@@ -25,7 +25,7 @@ Measured on: Windows 10 22H2, RTX 3060 12 GB, 32 GB RAM. Series S profile (`--co
 - XCL: the final image is black; first-run shader compiles stall the world; two-pass mesh draws (`XCL_TWO_PASS_INDIRECT=1`) can reset the GPU.
 
 ## Notes on measurement
-- The 3-4 fps figure was taken with `VICTORY_OWN_UPSCALER=1`. That switch is not read by the source vendored in `runtime/victory` (it is in a separate branch of our working repository), so a build of this snapshot may differ.
+- The 3-4 fps figure was taken with `VICTORY_OWN_UPSCALER=1`. The vendored source reads that switch.
 - Other numbers (shader coverage, per-feature timings) are in `runtime/victory/README.md` and `runtime/victory/VICKY.md`; they were measured by their authors on their own machines, not on the reference machine above.
 
 ## Shader coverage

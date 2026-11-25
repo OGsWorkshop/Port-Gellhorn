@@ -5,8 +5,7 @@
 #
 # Environment it sets (you can also set these by hand before running the exe):
 #   VICTORY_GAME_DIR       the dump folder
-#   VICTORY_OWN_UPSCALER=1 ask for the title's own upscaler on the Series S profile (recommended;
-#                          only builds that carry this switch read it)
+#   VICTORY_OWN_UPSCALER=1 ask for the title's own upscaler on the Series S profile (recommended)
 #   VICTORY_NO_WATCHDOG=1  disarm the title's stall watchdog so it can wait for slow first-run
 #                          shader builds instead of ending itself
 #   VICTORY_FAST_BOOT=1    with -FastBoot: press through logos and menus (testing only)

@@ -65,15 +65,7 @@ fn build() -> &'static [u8; 32] {
         };
         match translator {
             Ok(translator) => {
-                let switches = [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                    // (VIcky #6: the loop limit changes the translation too)
-                    "VICTORY_SHADER_LOOP_LIMIT",
-                ]
-                .map(|name| (name, std::env::var_os(name)));
+                let switches = SWITCHES.map(|name| (name, std::env::var_os(name)));
                 with_host_settings(key(
                     &translator,
                     limit,
@@ -105,12 +97,28 @@ fn with_host_settings(base: [u8; 32]) -> [u8; 32] {
     let mut bytes = base.to_vec();
     bytes.push(u8::from(victory_shader::resource::rt_miss()));
     bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+    // (victory-amd) the host's widest wave, which picks how wave64 programs are made.
+    bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
     let map = victory_shader::emit::view_heap_map().map_or([u32::MAX; 2], |(w, s)| [w, s]);
     for word in map {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
     *blake3::hash(&bytes).as_bytes()
 }
+
+/// The environment switches that change what the translator makes, part of the key.
+const SWITCHES: [&str; 8] = [
+    "VICTORY_WAVE_WIDE",
+    "VICTORY_WAVE_DEEP_SKIPS",
+    "VICTORY_WAVE_OWN_BITS",
+    // (victory-amd: these three change the translation too)
+    "VICTORY_WAVE_LOCAL",
+    "VICTORY_STRICT_JOINS",
+    "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_F16_NEAREST",
+    // (VIcky #6: the loop limit changes the translation too)
+    "VICTORY_SHADER_LOOP_LIMIT",
+];
 
 /// Serialization schema version of [`encode`] / [`decode`]: bump it whenever [`HostShader`]'s
 /// on-disk format changes (the sources hash covers the translator, not this file).
@@ -172,19 +180,20 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// `VICTORY_AMBIENT_STUB=1` (the diffuse illumination's last pass writes
 /// `VICTORY_AMBIENT_STUB_VALUE`, 0.1 by default) and
 /// `VICTORY_SHADOWMASK_STUB=1` (the ray-traced distant shadows write
-/// `VICTORY_SHADOWMASK_STUB_VALUE`, 1 = lit), for the containers in
+/// `VICTORY_SHADOWMASK_STUB_VALUE`, 1 = lit; each output in its own encoding,
+/// by slot: `VICTORY_AMBIENT_STUB_SLOTS="152=rgb9e5,208=mask,*=f"`), for the containers in
 /// `VICTORY_AMBIENT_STUB_HASHES` / `VICTORY_SHADOWMASK_STUB_HASHES` (the
 /// title's by default). They replace those passes whenever switched on: the
 /// passes translate, but what they read comes from ray tracing, which does
 /// not run on the host yet. Not cached (the cache keys by container).
 fn stand_in(container: &[u8]) -> Option<HostShader> {
     use victory_shader::emit::stand_in as s;
-    let kinds = [
-        ("VICTORY_AMBIENT_STUB", s::AMBIENT_HASHES, s::AMBIENT_VALUE),
-        ("VICTORY_SHADOWMASK_STUB", s::SHADOWMASK_HASHES, s::SHADOWMASK_VALUE),
-    ];
     let hash = blake3::hash(container).to_hex()[..16].to_owned();
-    for (name, hashes, value) in kinds {
+    let kinds = [
+        ("VICTORY_AMBIENT_STUB", s::AMBIENT_HASHES, s::AMBIENT_VALUE, s::ambient_slots(&hash)),
+        ("VICTORY_SHADOWMASK_STUB", s::SHADOWMASK_HASHES, s::SHADOWMASK_VALUE, s::SHADOWMASK_SLOTS),
+    ];
+    for (name, hashes, value, defaults) in kinds {
         if std::env::var(name).ok().as_deref().map(str::trim) != Some("1") {
             continue;
         }
@@ -201,9 +210,19 @@ fn stand_in(container: &[u8]) -> Option<HostShader> {
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .unwrap_or(value);
-        match s::storing(container, value) {
-            Ok(shader) => {
-                tracing::warn!(%hash, stand_in = name, value, "pass replaced by a constant stand-in");
+        let slots = std::env::var(format!("{name}_SLOTS")).unwrap_or_default();
+        let plan = s::Plan::new(value)
+            .with_overrides(defaults)
+            .with_overrides(&slots);
+        match s::storing_plan(container, plan) {
+            Ok((shader, plan)) => {
+                tracing::warn!(
+                    %hash,
+                    stand_in = name,
+                    value,
+                    outputs = ?plan.seen,
+                    "pass replaced by a stand-in writing each output in its own encoding"
+                );
                 return Some(shader);
             }
             Err(e) => {
@@ -678,14 +697,7 @@ mod tests {
                 &[&CACHE_SCHEMA_VERSION.to_le_bytes()[..], victory_shader::SOURCE_HASH.as_bytes()].concat(),
                 victory_shader::emit::loop_limit(),
                 victory_shader::emit::group_sync(),
-                &[
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                    "VICTORY_SHADER_LOOP_LIMIT",
-                ]
-                .map(|name| (name, std::env::var_os(name))),
+                &SWITCHES.map(|name| (name, std::env::var_os(name))),
                 victory_shader::emit::shader_opt(),
             ));
             assert_eq!(build(), &expected);
