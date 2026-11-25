@@ -304,7 +304,7 @@ amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. The g
 - **Bink works:** the real `Bink2Scarlett.dll` under XCL decodes a movie from `movies.rpf` (`bink2_console_dll_decodes_a_game_movie`,
   `XCL_SAMPLE_BK2` = an extracted `.bk2`: BinkOpen → BinkDoFrame/BinkCopyToBuffer(BINKSURFACE32 = 3)/BinkNextFrame; 1280×720,
   60 frames, correct image – checked by eye). Movies in the pack: Bink 2 revision `n`, 720p/1080p, 30 fps, uncompressed in the RPF.
-- **`core_bvh4.rpf` = compressed BLASes in the console format** (session 5): RAGE resource = 208 B virtual header + physical
+- **`core_bvh4.rpf` = compressed BLASes in the console format** (session 5): engine resource = 208 B virtual header + physical
   block (separate zlib streams); physical block +0x100 = the source for `XboxBvhBuilder::Rehydrate…X` (a pure CPU function,
   ignores the device): dword 0 = 0x81020006 (bit 24 = compressed, rehydration clears it), @0x04 1503 (meaning?),
   @0x08 CRC32 (standard table, start 0, no final XOR) over NumDescs + per geometry Flags, IndexFormat, IndexCount,

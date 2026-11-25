@@ -540,7 +540,7 @@ index 0000000..160292c
 +        assert_eq!(parse_update("POST", url, body), vec![("12".into(), 100), ("13".into(), 35)]);
 +        // reads and other hosts are not updates
 +        assert!(parse_update("GET", url, body).is_empty());
-+        assert!(parse_update("POST", "https://ros.rockstargames.com/x", body).is_empty());
++        assert!(parse_update("POST", "https://other.example.com/x", body).is_empty());
 +        assert!(parse_update("POST", url, b"not json").is_empty());
 +        // percentage alone, id in the path
 +        let put = "https://achievements.xboxlive.com/users/xuid(1)/achievements/scid/21";
@@ -17480,7 +17480,7 @@ index 52c49af..40faa60 100644
      f(peb() as *mut c_void)
  }
  
-+/// `XCL_NO_WATCHDOG=1`: turn off a retail title's stall watchdog (GTA VI 1.0.2.1, ivall/xcl#505)
++/// `XCL_NO_WATCHDOG=1`: turn off a retail title's stall watchdog (ivall/xcl#505)
 +/// – its two aborting branches (heartbeat unchanged for 30 s; an in-flight timestamp too old)
 +/// become NOPs – so it can wait for a slow pipeline build instead of ending itself. Each site
 +/// is patched only when it holds exactly the expected bytes.

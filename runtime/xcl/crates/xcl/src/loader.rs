@@ -331,7 +331,7 @@ unsafe extern "system" fn main_thread(param: *mut c_void) -> u32 {
     f(peb() as *mut c_void)
 }
 
-/// `XCL_NO_WATCHDOG=1`: turn off a retail title's stall watchdog (GTA VI 1.0.2.1, ivall/xcl#505)
+/// `XCL_NO_WATCHDOG=1`: turn off a retail title's stall watchdog (ivall/xcl#505)
 /// – its two aborting branches (heartbeat unchanged for 30 s; an in-flight timestamp too old)
 /// become NOPs – so it can wait for a slow pipeline build instead of ending itself. Each site
 /// is patched only when it holds exactly the expected bytes.

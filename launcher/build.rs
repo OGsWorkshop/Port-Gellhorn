@@ -48,7 +48,7 @@ fn main() {
 }
 
 fn stage_all(dst: &Path) {
-    let xcl = PathBuf::from(std::env::var("XCL_SRC").unwrap_or_else(|_| "M:/GTA6/xcl-test".into()));
+    let xcl = PathBuf::from(std::env::var("XCL_SRC").unwrap_or_else(|_| "../runtime/xcl/target/release".into()));
     let dxc = PathBuf::from(std::env::var("DXC_SRC").unwrap_or_else(|_| {
         "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64".into()
     }));

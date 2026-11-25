@@ -203,9 +203,9 @@ mod tests {
 
     #[test]
     fn identity_and_sanitize() {
-        let xml = r#"<Game><!-- <Identity Name="Old"/> --><Identity Publisher="X" Name="Rockstar.Game &amp; Co" Version="1"/></Game>"#;
-        assert_eq!(identity(xml).as_deref(), Some("Rockstar.Game & Co"));
-        assert_eq!(sanitize("Rockstar.Game & Co"), "Rockstar.Game___Co");
+        let xml = r#"<Game><!-- <Identity Name="Old"/> --><Identity Publisher="X" Name="Publisher.Game &amp; Co" Version="1"/></Game>"#;
+        assert_eq!(identity(xml).as_deref(), Some("Publisher.Game & Co"));
+        assert_eq!(sanitize("Publisher.Game & Co"), "Publisher.Game___Co");
         assert_eq!(sanitize(""), "title");
         assert_eq!(identity("<Game/>"), None);
     }

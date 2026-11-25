@@ -351,7 +351,7 @@ mod tests {
         assert_eq!(parse_update("POST", url, body), vec![("12".into(), 100), ("13".into(), 35)]);
         // reads and other hosts are not updates
         assert!(parse_update("GET", url, body).is_empty());
-        assert!(parse_update("POST", "https://ros.rockstargames.com/x", body).is_empty());
+        assert!(parse_update("POST", "https://other.example.com/x", body).is_empty());
         assert!(parse_update("POST", url, b"not json").is_empty());
         // percentage alone, id in the path
         let put = "https://achievements.xboxlive.com/users/xuid(1)/achievements/scid/21";
