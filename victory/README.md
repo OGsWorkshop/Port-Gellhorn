@@ -32,6 +32,12 @@ draw/pipeline overhead, not by a missing presentation path; faster PCs may do
 better, but no smooth-performance claim is made. Captured frames stay local
 and are not distributed.
 
+ScarlettPort, included as a subtree at [`scarlettport/`](../scarlettport),
+reports about 3-4 fps in the lit world on an RTX 3060 with 32 GB RAM, Series S
+profile and its own upscaler. That is their measurement on their hardware; it
+is not a substitute for a measurement of this build, whose figure above stays
+unchanged until the merged runtime is run and timed.
+
 Early builds peaked at ~9.1 GB VRAM; lazy host-texture creation and capped
 placed allocations bring that to ~5.1 GB. PSV structured-buffer shader
 translation is fixed; sparse/unmapped-page handling and per-submission watch
