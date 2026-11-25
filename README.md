@@ -58,10 +58,12 @@ first-boot screens, intro video, menus, and loading into the world. World render
 A diagnostics build (`cargo build --profile diag -p victory --features diagnostics`, from `victory/`) can capture
 presented frames with `VICTORY_CAPTURE=<dir>`.
 
+
 | What | Status |
 |---|---|
-| Booting, story mode, anything playable | ❌ No |
-| Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
+| **Playable FPS** | ❌ In Progress — Gameplay runs at 2–5 FPS. Performance optimization and shader fixes needed. |
+| **Booting and story mode** | ✅ Bootable — Story mode loads, but visual glitches and shader bugs remain. |
+| **Finding and verifying your game copy (Xbox Series X\|S 1.0.2.1)** | ✅ Complete |
 | Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
 | Shaders: RDNA2 → SPIR-V translation | ✅ **26,503 / 26,503 translated**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry, with a per-shader metadata index for pipeline creation. The LLVM 23.1.5 Linux rerun at `c432cdc` and the LLVM 23.1.3 Windows rerun at `43d0015` both translated all 26,503 ([Linux](https://github.com/ItsNotRexed/Leonida/issues/644#issuecomment-7072972586), [Windows](https://github.com/ItsNotRexed/Leonida/issues/644#issuecomment-7074299915)). Translation and SPIR-V validation are separate steps; validation results are listed below. ⚠️ 23,841 are wave64: exact on 64-wide subgroups (AMD). On 32-wide subgroups (NVIDIA, Intel), compute and mesh shaders are exact with wave64 emulation (`--wave64-emulate`, on by default there); cross-half wave ops in vertex, pixel and geometry shaders are still approximate |
 | SPIR-V validation (`spirv-val`) | ✅ **26,503 / 26,503 passed** in the LLVM 23.1.5 Linux rerun at `c432cdc` and in the full-corpus rerun at `43d4703`, after `dcd8ecf` fixed the SPIR-V ID-bound error ([Linux rerun](https://github.com/ItsNotRexed/Leonida/issues/644#issuecomment-7072972586), [full-corpus rerun](https://github.com/ItsNotRexed/Leonida/issues/881#issuecomment-7075507328)). On Windows at `43d0015`, all 26,503 translated but 26,501 passed validation; the two ID-bound failures were fixed by `dcd8ecf`. The intermediate `dedd75c` run also passed 26,501. |
