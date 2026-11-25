@@ -30,6 +30,12 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // The program is mapped from the copy `load` wrote: the file's bytes
+    // and their patched copy are not read again, and were held for the
+    // whole run (two blocks of 114.7 MB each for the title, in
+    // physical memory: run 65's memory map).
+    drop(prepared);
+    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
@@ -48,10 +54,14 @@ pub fn run(
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
-    let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
+    let slot = victory_core::saves::slot_from_env()?;
+    let title_root = cfg.data_subdir(&format!("{:08X}", title.id))?;
+    let paths = victory_core::saves::resolve(&title_root, &slot)?;
+    let storage = paths.storage;
     println!(
-        "title          {:08X}, storage {} ({} MB)",
+        "title          {:08X}, save slot {slot}{}, storage {} ({} MB)",
         title.id,
+        if paths.legacy { " (pre-slot location)" } else { "" },
         storage.display(),
         title.storage_bytes >> 20
     );
@@ -186,7 +196,7 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
+/// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,

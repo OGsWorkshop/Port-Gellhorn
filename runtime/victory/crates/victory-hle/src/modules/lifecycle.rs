@@ -110,8 +110,8 @@ pub extern "system" fn CreateWindowExA(
     hwnd
 }
 
-/// A console title sizes its window to its render target (Grand Theft
-/// Auto VI: 3840x2160 on a Series X), which can exceed the host's screen.
+/// A console title sizes its window to its render target (
+/// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches).
@@ -169,16 +169,19 @@ extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     // A user close (close button, Alt+F4, window or taskbar menu); a
-    // console title never sees one, nor a WM_CLOSE from it.
-    if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+    // console title never sees one, nor a WM_CLOSE from it. A WM_CLOSE
+    // without the menu command (`taskkill` without /F, a tool closing the
+    // window) too: the title's procedure hands it to DefWindowProc, which
+    // destroys the window, and the title went on running with none.
+    if is_user_close(message, wparam) {
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
     // title then stops (no frames, no input) until a key ends the loop, and
-    // nothing shows it, since the window has no menu bar; Grand Theft Auto
-    // VI aborts itself about half a minute later. A console has no window
+    // nothing shows it, since the window has no menu bar;
+    // the title aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
@@ -192,6 +195,12 @@ extern "system" fn window_proc(
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
     }
+}
+
+/// Whether a window message asks to close the window (see `window_proc`).
+fn is_user_close(message: u32, wparam: WPARAM) -> bool {
+    message == wm::WM_CLOSE
+        || message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize
 }
 
 /// Suspends the title as the console does when it ends it, runs `then`
@@ -312,6 +321,18 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_messages_end_the_title_and_other_commands_do_not() {
+        // The close button and Alt+F4 (the menu command, with the low
+        // bits the system may set), and a plain WM_CLOSE.
+        assert!(is_user_close(wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize));
+        assert!(is_user_close(wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize | 2));
+        assert!(is_user_close(wm::WM_CLOSE, 0));
+        assert!(!is_user_close(wm::WM_SYSCOMMAND, wm::SC_KEYMENU as usize));
+        assert!(!is_user_close(wm::WM_SYSCOMMAND, wm::SC_MINIMIZE as usize));
+        assert!(!is_user_close(wm::WM_DESTROY, 0));
+    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 

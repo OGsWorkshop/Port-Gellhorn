@@ -1,10 +1,9 @@
 //! Console primitive types the host lacks. A rectangle list gives three
 //! corners per rectangle, the second the one between the other two, and
-//! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
+//! the hardware adds the fourth at `v0 + v2 - v1` (the title's
 //! full-screen rectangles come as top left, bottom left, bottom right); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU for direct draws and on the GPU for
-//! indirect draws ([`crate::rectangles`]).
+//! made from the other three on the CPU.
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
@@ -12,6 +11,12 @@
 //! [`components`] does not know keep the first vertex's value, and so do
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
+//!
+//! A pipeline the title makes for rectangles completes them on the GPU
+//! instead, in a geometry stage (`victory_shader::emit::rect_list_gs`):
+//! from the vertex shader's outputs, whichever vertex the corner is, for
+//! direct, indexed and indirect draws alike. This expansion is what is
+//! left for a pipeline that could not get that stage.
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
@@ -44,8 +49,8 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
+#[derive(Clone, Copy)]
+enum Kind {
     F32,
     F16,
     Unorm8,
@@ -53,7 +58,7 @@ pub(crate) enum Kind {
 }
 
 /// Component count and kind of the vertex formats rectangles use.
-pub(crate) fn components(format: u32) -> Option<(usize, Kind)> {
+fn components(format: u32) -> Option<(usize, Kind)> {
     Some(match format {
         2 => (4, Kind::F32),
         6 => (3, Kind::F32),
@@ -70,21 +75,11 @@ pub(crate) fn components(format: u32) -> Option<(usize, Kind)> {
 }
 
 impl Kind {
-    pub(crate) fn bytes(self) -> usize {
+    fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
             Kind::F16 | Kind::Unorm16 => 2,
             Kind::Unorm8 => 1,
-        }
-    }
-
-    /// Numeric code shared with [`crate::rectangles`]'s HLSL shader.
-    pub(crate) fn code(self) -> u32 {
-        match self {
-            Kind::F32 => 0,
-            Kind::F16 => 1,
-            Kind::Unorm16 => 2,
-            Kind::Unorm8 => 3,
         }
     }
 
@@ -152,12 +147,10 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest, halfway cases to even (the retained bit decides);
-    // a carry out of the mantissa is added into the exponent (`2 - 2^-12`
-    // is 2.0); at most it reaches infinity, 0x7c00.
+    // Rounded to nearest: a carry out of the mantissa is added into the
+    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    let retained = (man >> 13) & 1;
-    sign | (half + ((man + 0x0fff + retained) >> 13)) as u16
+    sign | (half + ((man + 0x1000) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -209,16 +202,6 @@ mod tests {
         let mut dst = vec![0u8; 6 * 2];
         expand_rects(&src, &mut dst, 2, &[(0, 54)]);
         assert_eq!(dst[10..], 0x4000_u16.to_le_bytes());
-    }
-
-    /// Halfway between two halves, the even one: 1 + 2^-11 lies between
-    /// 0x3c00 and 0x3c01, 1 + 3 * 2^-11 between 0x3c01 and 0x3c02.
-    #[test]
-    fn half_midpoints_round_to_even() {
-        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
-        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
-        // Just past a midpoint still rounds up.
-        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11) + 2f32.powi(-20)), 0x3c01);
     }
 
     /// An element that reaches past the stride (float4 at 4 in 8-byte

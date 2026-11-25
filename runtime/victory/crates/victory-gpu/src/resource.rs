@@ -91,7 +91,7 @@ pub(crate) struct ResourceDesc {
     height: u32,
     depth_or_array_size: u16,
     mip_levels: u16,
-    pub(crate) format: u32,
+    format: u32,
     sample_count: u32,
     sample_quality: u32,
     layout: u32,
@@ -178,8 +178,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         && let Some(t) = texture_layout(desc)
     {
         // As the console: the layout's own alignment unless more is asked
-        // (4 KiB for 4 KiB modes, where PC says 64 KiB). Grand Theft Auto
-        // VI keeps these sizes in its texture tables, and its streaming
+        // (4 KiB for 4 KiB modes, where PC says 64 KiB).
+        // The title keeps these sizes in its texture tables, and its streaming
         // asserts when they disagree with the streamed layout.
         let alignment = desc.alignment.max(t.alignment);
         if !alignment.is_power_of_two() {
@@ -237,256 +237,337 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
-/// R8G8B8A8_UNORM, which stands in for a packed 16-bit render target the
-/// host cannot make (see [`target_format`]).
-pub(crate) const RGBA8_UNORM: u32 = 28;
-
-/// The console's packed 16-bit colour formats a title renders to:
-/// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
-pub(crate) const PACKED_16: [u32; 2] = [86, 115];
-
-/// Whether the host GPU lacks render-target or typed unordered-access
-/// support for `format` (asked once per format). NVIDIA has neither for
-/// B4G4R4A4 and no typed UAV for B5G5R5A1, which Grand Theft Auto VI's
-/// 2560x1440 UI targets need; AMD has both.
-#[cfg(windows)]
-fn host_lacks_target(format: u32) -> bool {
-    use std::sync::OnceLock;
-    use windows::Win32::Graphics::Direct3D12::*;
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
-    let Some(i) = PACKED_16.iter().position(|&f| f == format) else {
-        return false;
+/// The format of a texture the host GPU renders to or writes as unordered
+/// access, for the title's `format`. The console's GPU does both with the
+/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
+/// the title has full-screen targets in both; a host that refuses either use
+/// (NVIDIA) refused the whole texture, so every pass that wrote it drew
+/// nothing. There 8-bit RGBA stands in: the same channels in the same
+/// order, every 4-bit level exact and every 5-bit level within 1/510.
+/// The title's pipelines and views of such targets name the stand-in too
+/// ([`view_format`], the host view checks).
+/// shortcut: copies between such a target and a texture the title fills
+/// itself in the 16-bit format are skipped ([`stands_in`]); convert them
+/// if a pass turns out to need one.
+pub(crate) fn target_format(format: u32) -> u32 {
+    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
+        return format;
     };
-    *LACKS[i].get_or_init(|| {
-        let Some(host) = crate::host::host() else { return false };
-        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-            Format: DXGI_FORMAT(format as i32),
-            ..Default::default()
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::*;
+        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        let refused = REFUSED.get_or_init(|| {
+            STAND_INS.map(|(f, _)| {
+                let Some(host) = crate::host::host() else {
+                    return false;
+                };
+                let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32),
+                    ..Default::default()
+                };
+                // SAFETY: a plain query into our own structure.
+                let asked = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut support).cast(),
+                        size_of_val(&support) as u32,
+                    )
+                };
+                let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+                    | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+                let refused = asked.is_err() || support.Support1.0 & both != both;
+                if refused {
+                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                }
+                refused
+            })
+        });
+        if refused[i] {
+            return STAND_INS[i].1;
+        }
+    }
+    format
+}
+
+/// Whether the host copy of the title texture `this` is in a stand-in
+/// format ([`target_format`]): its texels are not laid out as the title's.
+#[cfg(windows)]
+pub(crate) fn stands_in(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let own = pc_format(resource(this).desc.format);
+    target_format(own) != own
+        && host_resource(this)
+            // SAFETY: a live resource.
+            .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own))
+}
+
+/// Depth textures the title also asks unordered access for (the console
+/// allows both; the host copy loses the unordered access): how many were
+/// made, and how often such a texture was bound as the depth target,
+/// cleared as depth, and asked for an unordered access view the host could
+/// not give. Measured to decide what such textures need (a colour twin, or
+/// to be colour textures altogether).
+pub(crate) static DEPTH_UNORDERED: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether the title asked for both depth and unordered access for `this`.
+#[cfg(windows)]
+pub(crate) fn depth_and_unordered(this: This) -> bool {
+    !this.is_null() && resource(this).desc.flags & 6 == 6
+}
+
+/// The colour twin of a depth texture the title also writes as unordered
+/// access. The console allows both on one texture; the host gives a depth
+/// texture no unordered access, so shaders write a colour texture of the
+/// same size and format family instead, and one is copied into the other
+/// when a side is used after the other was written
+/// (`HostList::twin_use`).
+/// shortcut: whole textures are copied, not the mips and slices written.
+/// A depth texture with a stencil plane gets a twin for each plane (
+/// the title's tiled lighting writes each pixel's material class into
+/// the depth plane and masks into the stencil plane, then draws each class
+/// with the depth test "equal"): the stencil plane's is copied through a
+/// buffer, the depth plane's is drawn into the plane by a pass of ours
+/// (`HostList::pass_plane`). Unordered access views of a multisampled
+/// texture stay null.
+#[cfg(windows)]
+pub(crate) struct Twin {
+    /// The colour texture and the state it is in, as a host copy's.
+    pub(crate) colour: std::sync::Arc<HostTexture>,
+    /// Which side lacks what the other was written last, after the lists
+    /// submitted so far: bit 0 the depth texture, bit 1 the twin.
+    pub(crate) behind: std::sync::atomic::AtomicU32,
+    /// For a depth texture with a stencil plane, `colour` is the twin of
+    /// that plane (8 bits a texel) and this the buffer the two are copied
+    /// through: no colour format shares a family with a depth-stencil
+    /// format, but the host copies between a buffer and one plane.
+    pub(crate) through: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    /// For a depth texture with a stencil plane: the twin of its depth
+    /// plane, 16 bits a texel for the console's 16-bit depth-stencil
+    /// formats and a 32-bit float otherwise. No host colour format holds
+    /// the bits of a 24-bit depth plane, so the two are not copied: a pass
+    /// draws the twin into the plane.
+    pub(crate) plane: Option<std::sync::Arc<HostTexture>>,
+}
+
+#[cfg(windows)]
+impl Drop for Twin {
+    fn drop(&mut self) {
+        TWINS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Colour twins alive, depth textures with unordered access left without
+/// one, and the copies recorded into depth textures and into twins since
+/// the last frame-rate line.
+#[cfg(windows)]
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Depth planes drawn from their twins by the pass since the last
+/// frame-rate line; and since the start, how often a depth plane's twin
+/// lacked what was written to the plane (not given to it), and how often a
+/// depth plane was used in the list that had written its twin, before the
+/// pass (which runs when the list closes).
+#[cfg(windows)]
+pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The colour twin of title texture `this`, if it has one.
+#[cfg(windows)]
+pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, true).and_then(|made| made.1)
+}
+
+/// The twin's texture, for the unordered access views of `this`.
+#[cfg(windows)]
+pub(crate) fn twin_resource<'a>(
+    this: This,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if this.is_null() {
+        return None;
+    }
+    let (_, twin) = hosted(this, true)?;
+    // SAFETY: as in `host_resource`: the twin lives as long as the host
+    // copy, which a depth texture keeps until the title releases it.
+    twin.map(|t| unsafe { &*std::ptr::from_ref(&t.colour.texture) })
+}
+
+/// The texture of the twin of the depth plane of `this`, a depth texture
+/// with a stencil plane, for the unordered access views of that plane.
+#[cfg(windows)]
+pub(crate) fn twin_plane_resource<'a>(
+    this: This,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if this.is_null() {
+        return None;
+    }
+    let (_, twin) = hosted(this, true)?;
+    let twin = twin?;
+    // SAFETY: as in `twin_resource`.
+    twin.plane
+        .as_ref()
+        .map(|p| unsafe { &*std::ptr::from_ref(&p.texture) })
+}
+
+/// The colour twin for a texture described by `desc` whose host copy is
+/// `depth`, if the title asks for depth and unordered access both and the
+/// host can copy between the two: the same size, mips and slices in the
+/// depth format's typeless family (R16 for 16-bit depth, R32 for 32-bit),
+/// or R8 for the stencil plane of a format that has one, with unordered
+/// access only. A format with a stencil plane gets a twin for its depth
+/// plane too, R16 for the console's 16-bit depth-stencil formats and R32
+/// otherwise. `VICTORY_DEPTH_TWINS=0` makes none (such views stay null),
+/// `VICTORY_DEPTH_TWINS=stencil` only those of formats with a stencil
+/// plane, `VICTORY_DEPTH_TWINS=nodepth` none for the depth planes of such
+/// formats.
+#[cfg(windows)]
+fn twin_texture(
+    desc: &ResourceDesc,
+    depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> Option<std::sync::Arc<Twin>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::*;
+    const DEPTH_AND_UNORDERED: u32 = 6;
+    const UNORDERED: u32 = 4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    // R32 and R16 typeless: the families of the depth formats of one plane.
+    const ONE_PLANE: [u32; 2] = [39, 53];
+    if desc.dimension == BUFFER || desc.flags & DEPTH_AND_UNORDERED != DEPTH_AND_UNORDERED {
+        return None;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    // R32G8X24 and R24G8 typeless: depth with a stencil plane, whose twin
+    // is R8 typeless.
+    const WITH_STENCIL: [u32; 2] = [19, 44];
+    const R8_TYPELESS: u32 = 60;
+    let typeless = family(pc_format(desc.format));
+    let stencil = WITH_STENCIL.contains(&typeless);
+    static STENCIL_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let stencil_only = *STENCIL_ONLY
+        .get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_some_and(|v| v == "stencil"));
+    if !stencil && stencil_only {
+        return None;
+    }
+    if !(stencil || ONE_PLANE.contains(&typeless)) || desc.sample_count > 1 {
+        TWINS[1].fetch_add(1, Relaxed);
+        return None;
+    }
+    let host = crate::host::host()?;
+    let mut d = *desc;
+    d.layout = 0;
+    d.alignment = 0;
+    d.flags = UNORDERED;
+    d.format = if stencil { R8_TYPELESS } else { typeless };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: the description has the host layout, as in `host_texture`;
+    // the out pointer is ours.
+    let made = unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            (&raw const d).cast(),
+            D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
+            None,
+            &mut texture,
+        )
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
+    }
+    let Some(texture) = texture else {
+        TWINS[1].fetch_add(1, Relaxed);
+        return None;
+    };
+    crate::host::name(&texture, || {
+        format!("depth twin {}x{} f{}", d.width, d.height, d.format)
+    });
+    // The buffer a stencil plane and its twin are copied through: as big
+    // as the plane's mips and slices laid out for a copy (they follow the
+    // depth plane's in the texture's subresources).
+    let through = if stencil {
+        // SAFETY: a live texture.
+        let of = unsafe { depth.GetDesc() };
+        let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
+        let mut bytes = 0;
+        // SAFETY: a plain query; the out pointer is ours.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &of,
+                planes,
+                planes,
+                0,
+                None,
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        let Some(buffer) = host.uav_buffer(bytes) else {
+            TWINS[1].fetch_add(1, Relaxed);
+            return None;
         };
-        // SAFETY: the structure the feature names, ours.
-        let asked = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_FORMAT_SUPPORT,
-                (&raw mut support).cast(),
-                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+        Some(buffer)
+    } else {
+        None
+    };
+    // The twin of the depth plane of a format with a stencil plane: R16
+    // typeless (53) for the console's 16-bit depth-stencil formats (118 to
+    // 120), whose shaders write 16-bit steps, R32 typeless (39) otherwise.
+    static NO_PLANE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let no_plane = *NO_PLANE
+        .get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_some_and(|v| v == "nodepth"));
+    let plane = if stencil && !no_plane {
+        d.format = if (118..=120).contains(&desc.format) {
+            53
+        } else {
+            39
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: as for the first twin.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
+                None,
+                &mut texture,
             )
         };
-        let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
-        let lacks = asked.is_err() || support.Support1.0 & needed != needed;
-        if lacks {
-            tracing::info!(format, "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU");
+        if let Err(e) = made {
+            tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
-        lacks
-    })
-}
-
-#[cfg(not(windows))]
-fn host_lacks_target(_: u32) -> bool {
-    false
-}
-
-/// The format a render target or unordered-access texture of `format` is
-/// made in on the host, and that render target views and pipelines name:
-/// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
-/// write typed (each channel keeps its value, with more precision); else
-/// the format as the host has it. Textures only sampled keep theirs.
-pub(crate) fn target_format(format: u32) -> u32 {
-    let format = pc_format(format);
-    if PACKED_16.contains(&format) && host_lacks_target(format) {
-        RGBA8_UNORM
+        texture.map(|texture| {
+            crate::host::name(&texture, || {
+                format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
+            });
+            std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS))
+        })
     } else {
-        format
-    }
-}
-
-/// Expands one packed 16-bit texel in DXGI `B5G5R5A1_UNORM` (86: B bits 0-4,
-/// G 5-9, R 10-14, A 15) or `B4G4R4A4_UNORM` (115: B 0-3, G 4-7, R 8-11, A
-/// 12-15) into `R8G8B8A8_UNORM` by bit replication.
-fn unpack_16(format: u32, packed: u16) -> [u8; 4] {
-    let bits = |shift: u32, width: u32| -> u8 { ((packed >> shift) & ((1 << width) - 1)) as u8 };
-    match format {
-        86 => {
-            let (r, g, b) = (bits(10, 5), bits(5, 5), bits(0, 5));
-            let a = if packed >> 15 != 0 { 255 } else { 0 };
-            [
-                (r << 3) | (r >> 2),
-                (g << 3) | (g >> 2),
-                (b << 3) | (b >> 2),
-                a,
-            ]
-        }
-        115 => {
-            let (r, g, b, a) = (bits(8, 4), bits(4, 4), bits(0, 4), bits(12, 4));
-            [(r << 4) | r, (g << 4) | g, (b << 4) | b, (a << 4) | a]
-        }
-        _ => unreachable!("only B5G5R5A1 and B4G4R4A4 are packed 16-bit"),
-    }
-}
-
-fn quantize_unorm(v: u8, max: u16) -> u16 {
-    (u16::from(v) * max + 127) / 255
-}
-
-/// Packs one `R8G8B8A8_UNORM` texel into DXGI `B5G5R5A1_UNORM` (86) or
-/// `B4G4R4A4_UNORM` (115).
-#[allow(dead_code)] // readback counterpart for texture-to-buffer copies (PR #67)
-fn pack_16(format: u32, rgba: [u8; 4]) -> u16 {
-    let [r, g, b, a] = rgba;
-    match format {
-        86 => {
-            quantize_unorm(b, 31)
-                | (quantize_unorm(g, 31) << 5)
-                | (quantize_unorm(r, 31) << 10)
-                | (quantize_unorm(a, 1) << 15)
-        }
-        115 => {
-            quantize_unorm(b, 15)
-                | (quantize_unorm(g, 15) << 4)
-                | (quantize_unorm(r, 15) << 8)
-                | (quantize_unorm(a, 15) << 12)
-        }
-        _ => unreachable!("only B5G5R5A1 and B4G4R4A4 are packed 16-bit"),
-    }
-}
-
-/// Expands `src` (`B5G5R5A1_UNORM` 86 or `B4G4R4A4_UNORM` 115, 2 bytes per
-/// texel) into `dst` (`R8G8B8A8_UNORM`, 4 bytes per texel).
-pub(crate) fn expand_packed16(format: u32, src: &[u8], dst: &mut [u8]) {
-    if !PACKED_16.contains(&format) {
-        return;
-    }
-    for (s, d) in src
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-    {
-        *d = unpack_16(format, u16::from_le_bytes(*s));
-    }
-}
-
-/// Packs `src` (`R8G8B8A8_UNORM`, 4 bytes per texel) into `dst`
-/// (`B5G5R5A1_UNORM` 86 or `B4G4R4A4_UNORM` 115, 2 bytes per texel).
-#[allow(dead_code)] // readback counterpart for texture-to-buffer copies (PR #67)
-pub(crate) fn pack_rgba8_to_16(format: u32, src: &[u8], dst: &mut [u8]) {
-    if !PACKED_16.contains(&format) {
-        return;
-    }
-    for (s, d) in src
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(dst.as_chunks_mut::<2>().0.iter_mut())
-    {
-        *d = pack_16(format, *s).to_le_bytes();
-    }
-}
-
-fn for_rows(
-    width: usize,
-    lines: usize,
-    src: (&[u8], usize, usize),
-    dst: (&mut [u8], usize, usize),
-    mut row: impl FnMut(&[u8], &mut [u8]),
-) {
-    if width == 0 || lines == 0 {
-        return;
-    }
-    for line in 0..lines {
-        let s = &src.0[line * src.1..][..width * src.2];
-        let d = &mut dst.0[line * dst.1..][..width * dst.2];
-        row(s, d);
-    }
-}
-
-/// Expands `lines` rows of `width` texels in packed 16-bit `format`
-/// (`src_pitch` bytes apart) into `R8G8B8A8_UNORM` (`dst_pitch` bytes apart).
-pub(crate) fn expand_packed16_rows(
-    format: u32,
-    width: usize,
-    lines: usize,
-    src: &[u8],
-    src_pitch: usize,
-    dst: &mut [u8],
-    dst_pitch: usize,
-) {
-    if !PACKED_16.contains(&format) {
-        return;
-    }
-    for_rows(
-        width,
-        lines,
-        (src, src_pitch, 2),
-        (dst, dst_pitch, 4),
-        |s, d| {
-            expand_packed16(format, s, d);
-        },
-    );
-}
-
-/// Packs `lines` rows of `width` `R8G8B8A8_UNORM` texels (`src_pitch` bytes
-/// apart) into packed 16-bit `format` (`dst_pitch` bytes apart).
-#[allow(dead_code)] // readback counterpart for texture-to-buffer copies (PR #67)
-pub(crate) fn pack_rgba8_to_16_rows(
-    format: u32,
-    width: usize,
-    lines: usize,
-    src: &[u8],
-    src_pitch: usize,
-    dst: &mut [u8],
-    dst_pitch: usize,
-) {
-    if !PACKED_16.contains(&format) {
-        return;
-    }
-    for_rows(
-        width,
-        lines,
-        (src, src_pitch, 4),
-        (dst, dst_pitch, 2),
-        |s, d| {
-            pack_rgba8_to_16(format, s, d);
-        },
-    );
-}
-
-/// Whether a GPU-to-GPU copy or resolve between `to` and `from` mixes a
-/// native packed 16-bit texture with a widened (or different) format, logging
-/// once per packed format so callers can skip the command before recording
-/// barriers or marking the destination written.
-#[cfg(windows)]
-pub(crate) fn skip_mixed_packed_copy(
-    op: &str,
-    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-) -> bool {
-    use std::sync::Once;
-    // SAFETY: live host resources.
-    let (to_fmt, from_fmt) =
-        unsafe { (to.GetDesc().Format.0 as u32, from.GetDesc().Format.0 as u32) };
-    if to_fmt == from_fmt {
-        return false;
-    }
-    let Some(packed) = [from_fmt, to_fmt]
-        .into_iter()
-        .find(|f| PACKED_16.contains(f))
-    else {
-        return false;
+        None
     };
-    static ONCE: [Once; 2] = [Once::new(), Once::new()];
-    if let Some(i) = PACKED_16.iter().position(|&f| f == packed) {
-        ONCE[i].call_once(|| {
-            tracing::warn!(
-                op,
-                packed_format = packed,
-                to_format = to_fmt,
-                from_format = from_fmt,
-                "skipping GPU copy between packed 16-bit texture and widened R8G8B8A8_UNORM target"
-            );
-        });
-    }
-    true
+    TWINS[0].fetch_add(1, Relaxed);
+    Some(std::sync::Arc::new(Twin {
+        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS)),
+        behind: std::sync::atomic::AtomicU32::new(0),
+        through,
+        plane,
+    }))
 }
 
 /// The typeless format of a format's family (itself if it has none).
@@ -532,12 +613,12 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
+    // First: a view of no resource (a typed null view) has none.
     let host = host_resource(this)?;
+    let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    // Widened packed targets are typed R8G8B8A8_UNORM, so null view descs
-    // can stay null and inherit the resource's exact dimension.
+    // A stand-in target is typed.
     (format != own && format != target_format(own)).then_some(own)
 }
 
@@ -570,11 +651,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    pub(crate) format: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) depth: u32,
-    pub(crate) row_pitch: u32,
+    format: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -584,6 +665,23 @@ impl PlacedFootprint {
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
         let last = u64::from(self.width).div_ceil(block) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+    }
+
+    /// For a read back through a host buffer: this footprint at offset 0
+    /// with its rows pitched as the host wants them (multiples of 256
+    /// bytes), then the bytes that buffer needs, the bytes of a row, the
+    /// rows, and the title's own pitch.
+    pub(crate) fn host_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
+        let (element, block) = element(self.format)?;
+        let lines = (u64::from(self.height).div_ceil(block) * u64::from(self.depth)).max(1);
+        let row = u64::from(self.width).div_ceil(block) * element;
+        let pitch = row.max(1).next_multiple_of(256);
+        let host = PlacedFootprint {
+            offset: 0,
+            row_pitch: u32::try_from(pitch).ok()?,
+            ..*self
+        };
+        Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -823,7 +921,7 @@ static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::
 
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
-/// memory themselves (Grand Theft Auto VI places its back buffers in a
+/// memory themselves (the title places its back buffers in a
 /// block of its own and checks they fill it). The runtime names it before
 /// the device exists.
 pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
@@ -899,6 +997,12 @@ impl Memory {
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        // The big ones are named in the log: the memory line counts our own
+        // allocations by size, and these are the title's memory given out
+        // of ours (a heap it made through the device, a descriptor heap).
+        if info.size >= 32 << 20 {
+            tracing::info!(mb = info.size >> 20, at = ?ptr, "memory for the title from our allocator (a heap or a descriptor heap)");
+        }
         Ok(Memory {
             ptr,
             layout,
@@ -1000,9 +1104,10 @@ struct Resource {
     heap_flags: u32,
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// yet. With, for a depth texture the title also writes as unordered
+    /// access, the colour texture shaders write instead ([`Twin`]).
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: Hosted,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1015,10 +1120,470 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
-    /// A depth target's twin for unordered access ([`host_twin`]), which
-    /// its unordered access views name; lists keep the two coherent
-    /// (`HostList::transition`).
-    pub(crate) twin: Option<std::sync::Arc<HostTexture>>,
+    /// The bytes the host gives it.
+    bytes: u64,
+    /// Whether its contents come from title memory ([`fills`]): counted in
+    /// [`KINDS`] while it lives.
+    filled: bool,
+}
+
+/// What a title texture has on the host: its host copy and, for a depth
+/// texture shaders also write, the colour twin.
+#[cfg(windows)]
+type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
+
+/// A title texture's host side. The host copy is made when something first
+/// uses the texture, not when the title creates it: the title
+/// had created 3,871 textures (9.2 GB on the host) before its world's first
+/// frame, of which a frame's lists name some hundreds (run 23), on a card
+/// with 12 GB. A title texture is memory the title has either way; its host
+/// copy is the card's.
+#[cfg(windows)]
+struct Hosted {
+    /// The host copy (and twin) once made. Taken out again only by
+    /// [`let_go_idle`] and when the title releases the resource.
+    made: std::sync::Mutex<Option<Made>>,
+    /// The state and clear value the title created the texture with.
+    state: u32,
+    clear: Option<[u32; 5]>,
+    /// When the host copy was last asked for (`crate::host::moment`),
+    /// written under `made`'s lock.
+    used: std::sync::atomic::AtomicU64,
+    /// The host refused to make it: not tried again.
+    refused: std::sync::atomic::AtomicBool,
+    /// Its host copy was let go as idle once.
+    gone: std::sync::atomic::AtomicBool,
+    /// A texture of [`PLACED_TEXTURES`].
+    placed: std::sync::atomic::AtomicBool,
+}
+
+/// Counts for the memory line: host copies of textures the title fills
+/// alive and their bytes; such copies let go as idle since the start and
+/// their bytes; made again after that and their bytes; and host copies made
+/// since the start.
+#[cfg(windows)]
+pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Every title texture alive (not buffers), by address: for the sweep and
+/// the memory line. A texture leaves the table before it is freed.
+#[cfg(windows)]
+static TEXTURES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(windows)]
+fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
+    TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The title textures the host renders to or writes (targets, depth,
+/// unordered access), by the address of their memory: what a view the
+/// title places in that memory in another format shows ([`alias_of`]). A
+/// texture leaves the table before it is freed.
+#[cfg(windows)]
+static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// For `this`, a texture made for a view the title placed in memory
+/// ([`texture_at`]): the title texture the host writes that lies in the
+/// same memory, if there is one of the same size, levels and layers with
+/// texels of the same width. The console reads such a texture through the
+/// view as it is
+/// (the title packs light as R9G9B9E5 into R32_UINT textures
+/// with compute shaders, which cannot write R9G9B9E5, and samples them
+/// through R9G9B9E5 views placed at the textures' addresses: the sky, the
+/// sky and light probes, the bounced light the lighting pass adds). On the
+/// host the two are two textures and what the shaders wrote exists in one
+/// of them only: the other was filled from title memory, which nothing
+/// writes, so everything read through such a view was black.
+/// Textures of several levels or layers count too (the screen probes'
+/// light atlas has four levels, the camera's sky light cache six layers,
+/// the cloud and sky tables are volumes): only textures of one level and
+/// one layer were found at first, and the programs behind the others read
+/// the title's unwritten memory - the sky light cache's second stage wrote
+/// all zeros from a first stage that held light (run 88).
+/// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
+/// of one level and one layer, as at first.
+#[cfg(windows)]
+pub(crate) fn alias_of(this: This) -> Option<This> {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if this.is_null()
+        || !*ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "0"))
+    {
+        return None;
+    }
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let whole =
+        *WHOLE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "1"));
+    let r = resource(this);
+    // A level count of 0 asks for a full chain: not counted here.
+    let one = |d: &ResourceDesc| {
+        d.dimension != BUFFER
+            && d.mip_levels >= 1
+            && d.depth_or_array_size >= 1
+            && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
+            && d.sample_count <= 1
+    };
+    if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
+        return None;
+    }
+    // Under the table's lock: a texture leaves it before it is freed.
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let other = *targets.get(&(r.data() as u64))? as This;
+    let o = resource(other);
+    const DEPTH: u32 = 0x2;
+    let same = one(&o.desc)
+        && o.desc.dimension == r.desc.dimension
+        && o.desc.width == r.desc.width
+        && o.desc.height == r.desc.height
+        && o.desc.mip_levels == r.desc.mip_levels
+        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
+        && o.desc.flags & DEPTH == 0
+        && target_format(o.desc.format) == o.desc.format
+        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    same.then_some(other)
+}
+
+/// Whether host copies are made on first use. On by default;
+/// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
+/// as before.
+#[cfg(windows)]
+fn lazy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Whether a texture described by `desc` takes its contents from title
+/// memory: one the host neither renders to nor writes (no target, depth or
+/// unordered access flag). Its host copy can be made again from that
+/// memory; any other texture's contents exist on the host alone.
+#[cfg(windows)]
+fn fills(desc: &ResourceDesc) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
+}
+
+/// Whether the title fills texture `this` itself ([`fills`]).
+#[cfg(windows)]
+pub(crate) fn title_fills(this: This) -> bool {
+    !this.is_null() && fills(&resource(this).desc)
+}
+
+/// Whether `this` is a texture whose host copy is not made yet (and may
+/// still be): a descriptor slot written with a view of it waits
+/// (`crate::descriptor::make_waiting`).
+#[cfg(windows)]
+pub(crate) fn host_waits(this: This) -> bool {
+    if this.is_null() || !lazy() {
+        return false;
+    }
+    let r = resource(this);
+    r.desc.dimension != BUFFER
+        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
+        && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+}
+
+/// The host side of title texture `this`: made now if it is not there and
+/// `make` says so. `None` for buffers and for textures the host refuses.
+#[cfg(windows)]
+fn hosted(this: This, make: bool) -> Option<Made> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    if made.is_none() {
+        if !make || r.host.refused.load(Relaxed) {
+            return None;
+        }
+        let clear = r
+            .host
+            .clear
+            .as_ref()
+            .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+            r.host.refused.store(true, Relaxed);
+            return None;
+        };
+        let twin = twin_texture(&r.desc, &texture);
+        // One line per depth texture with unordered access: its address is
+        // the one target dumps and the captured frame's list of commands
+        // name.
+        if r.desc.flags & 6 == 6 {
+            tracing::info!(
+                resource = ?this,
+                desc = ?r.desc,
+                twin = twin.is_some(),
+                "depth texture with unordered access"
+            );
+        }
+        let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+        let mut host = HostTexture::new(texture, state);
+        host.filled = fills(&r.desc);
+        if host.filled {
+            KINDS[0].fetch_add(1, Relaxed);
+            KINDS[1].fetch_add(host.bytes, Relaxed);
+        }
+        if r.host.gone.load(Relaxed) {
+            KINDS[4].fetch_add(1, Relaxed);
+            KINDS[5].fetch_add(host.bytes, Relaxed);
+        }
+        KINDS[6].fetch_add(1, Relaxed);
+        *made = Some((std::sync::Arc::new(host), twin));
+        // Slots the title wrote with views of it while it had no host copy
+        // are made before the next submission runs.
+        crate::descriptor::texture_made(this as usize);
+    }
+    r.host.used.store(crate::host::moment(), Relaxed);
+    made.clone()
+}
+
+/// The host copy of title texture `this` if it is made, without making it
+/// (for diagnostics, which must not count as a use).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn host_made<'a>(
+    this: This,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, false)?;
+    // SAFETY: as in `host_resource`.
+    Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+}
+
+/// Unconditional host-texture floor for a given local VRAM budget (`None` when
+/// the adapter does not report one): up to 2 GiB, capped at a quarter of the
+/// reported budget so 4–6 GiB cards do not bypass the budget check early.
+#[cfg(any(windows, test))]
+fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
+    const MAX_FLOOR: u64 = 2 << 30;
+    match vram_budget {
+        Some(budget) => MAX_FLOOR.min(budget / 4),
+        None => MAX_FLOOR,
+    }
+}
+
+/// Whether more host copies of textures the title fills may be made for
+/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
+/// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
+/// memory in use by this process is under nine tenths of the budget the system
+/// gives it (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes
+/// instead). Past the budget the system moves the card's memory into the PC's,
+/// which ended runs 20 and 24.
+#[cfg(windows)]
+pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    const WITHOUT_BUDGET: u64 = 4 << 30;
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    });
+    let filled = KINDS[1].load(Relaxed);
+    if let Some(limit) = limit {
+        return filled < limit;
+    }
+    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
+    if filled < floor {
+        return true;
+    }
+    match memory {
+        Some([budget, used, ..]) => used < budget / 10 * 9,
+        None => filled < WITHOUT_BUDGET,
+    }
+}
+
+/// Lets go of the host copies of textures the title fills that nothing
+/// names any more: placed textures were never released (one host texture
+/// per address and description ever viewed: 18,639 of them, 2.5 GB, after
+/// nine minutes of run 24), nor those of texture objects before the title
+/// released them. A host copy goes when
+/// - the title fills the texture ([`fills`]) and the host never copied
+///   into it: its contents are in title memory;
+/// - only the resource holds it: no list not yet reset names it (a list
+///   holds the copies of the textures it uses, `HostList::transition`);
+/// - only the host copy holds the host texture: no descriptor slot views
+///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
+///   read it through a slot made earlier, by a table or by an index;
+/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+///
+/// The next use makes the host copy anew and uploads the title's memory
+/// again (its staging state goes with it). The title resource stays: its
+/// address is what views and lists name.
+/// shortcut: [`host_resource`] hands out the host texture without holding
+/// it; a thread that asked for it and has not yet recorded its use (which
+/// makes the list or the slot hold it) is protected by that idle time alone.
+/// Every caller uses it at once, within the title's call.
+/// Called before a submission starts, by the thread that submits.
+/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+#[cfg(windows)]
+pub(crate) fn let_go_idle() {
+    use std::sync::atomic::Ordering::Relaxed;
+    const IDLE_FRAMES: u64 = 4;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    // For the trail (`crate::host::trail`): how many went, their bytes,
+    // and the first one.
+    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let gone = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let idle = made.as_ref().is_some_and(|(host, _)| {
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                    && std::sync::Arc::strong_count(host) == 1
+                    && crate::host::references(&host.texture) == 1
+            });
+            if idle {
+                // Under the lock: the next use must not find the staging
+                // state of the texture let go (it says "uploaded").
+                crate::texture::unstage(at as This);
+                made.take()
+            } else {
+                None
+            }
+        };
+        if let Some((host, _)) = gone {
+            r.host.gone.store(true, Relaxed);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(host.bytes, Relaxed);
+            went += 1;
+            bytes += host.bytes;
+            if first.is_none() {
+                first = Some(at);
+            }
+            crate::host::retire(host);
+        }
+    }
+    if went > 0 {
+        crate::host::trail(|| {
+            format!(
+                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                bytes >> 10,
+                first.unwrap_or(0)
+            )
+        });
+    }
+}
+
+/// For the memory line: title textures with a host copy the host renders
+/// to or writes and those copies' bytes (twins included); title textures
+/// without a host copy and the bytes of title memory they are; host copies
+/// of textures the title fills and their bytes; of all title textures,
+/// the placed ones with a host copy; the bytes of the twins alone (the
+/// layer's own: the console has no second texture for a depth texture
+/// shaders write); and, of the host copies of placed textures the title
+/// fills, the bytes of those whose title memory is not mapped any more and
+/// of those a descriptor slot still shows (the card holds a texture the
+/// title has given up for as long as a slot shows it). The last two are
+/// estimates from every 16th such texture: asking Windows about the memory
+/// of all 16,000 takes too long.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn census() -> [u64; 10] {
+    const EVERY: u64 = 16;
+    let mut count = [0u64; 10];
+    let mut placed_filled = 0u64;
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        match made.as_ref() {
+            Some((host, twin)) => {
+                let kind = if host.filled { 4 } else { 0 };
+                count[kind] += 1;
+                count[kind + 1] += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+                count[7] += twin.as_ref().map_or(0, |t| t.colour.bytes);
+                let placed = r.host.placed.load(std::sync::atomic::Ordering::Relaxed);
+                if placed {
+                    count[6] += 1;
+                }
+                if placed && host.filled {
+                    placed_filled += 1;
+                    // Its first page: a texture's smallest mips lie there,
+                    // and are mapped first and unmapped last.
+                    if placed_filled.is_multiple_of(EVERY) && !crate::texture::committed(r.data().cast_const(), 1) {
+                        count[8] += host.bytes * EVERY;
+                        if crate::host::references(&host.texture) > 1 {
+                            count[9] += host.bytes * EVERY;
+                        }
+                    }
+                }
+            }
+            None => {
+                count[2] += 1;
+                count[3] += footprint(&r.desc).map_or(0, |f| f.size);
+            }
+        }
+    }
+    count
+}
+
+/// Host textures alive (the title's and the twins) and the bytes the host
+/// gives them, for the memory line.
+#[cfg(windows)]
+pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The bytes the host allocates for `texture`.
+#[cfg(windows)]
+fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
+    let Some(host) = crate::host::host() else {
+        return 0;
+    };
+    // SAFETY: plain queries on a live resource and device.
+    unsafe {
+        let desc = texture.GetDesc();
+        host.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes
+    }
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bytes = host_bytes(&texture);
+        HOST_TEXTURES[0].fetch_add(1, Relaxed);
+        HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        HostTexture {
+            texture,
+            state: std::sync::atomic::AtomicU32::new(state),
+            bytes,
+            filled: false,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        HOST_TEXTURES[0].fetch_sub(1, Relaxed);
+        HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        if self.filled {
+            KINDS[0].fetch_sub(1, Relaxed);
+            KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+    }
+}
+
+/// How many textures placed in title memory have a resource of ours
+/// (never released), for the memory line.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_textures() -> u64 {
+    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -1026,14 +1591,16 @@ pub(crate) struct HostTexture {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let (host, _) = hosted(this, true)?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
     (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
-/// The host GPU's copy of a title resource, if it has one.
+/// The host GPU's copy of a title resource, if it has one: made now if
+/// this is the texture's first use ([`Hosted`]). Asking is a use; what must
+/// not count as one asks `host_made`.
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
     this: This,
@@ -1041,33 +1608,13 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
-}
-
-/// The host texture unordered access views of a title texture name: the
-/// twin of a depth target that has one, with the format such a view takes
-/// when the title's names none or a depth format; else the host copy.
-#[cfg(windows)]
-pub(crate) fn host_unordered<'a>(
-    this: This,
-) -> Option<(
-    &'a windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    Option<u32>,
-)> {
-    if this.is_null() {
-        return None;
-    }
-    let host = resource(this).host.as_deref()?;
-    let Some(twin) = &host.twin else {
-        return Some((&host.texture, None));
-    };
-    // SAFETY: a live resource.
-    let typeless = unsafe { twin.texture.GetDesc() }.Format.0 as u32;
-    let format = TWIN_FORMATS
-        .iter()
-        .find(|&&(f, _)| f == typeless)
-        .map(|&(_, f)| f);
-    Some((&twin.texture, format))
+    let (host, _) = hosted(this, true)?;
+    // SAFETY: the resource holds the host copy until the title releases it
+    // (lists and slots that name the texture hold it past that), or until
+    // `let_go_idle` takes it: only from a texture the title fills, that no
+    // list and no slot holds and that nothing asked for in seconds (the
+    // asking just made is noted under the same lock).
+    Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1076,7 +1623,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    hosted(this, true).map(|made| made.0)
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -1098,20 +1645,22 @@ fn host_texture(
     d.alignment = 0;
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
-    // allows both; Grand Theft Auto VI's shadow maps ask for it): the host
-    // copy loses UAV use, its unordered access views name a twin
-    // (`host_twin`).
+    // allows both; the title's shadow maps ask for it).
+    // The host copy loses the unordered access: shaders write a colour
+    // twin instead ([`Twin`]).
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
+        if d.flags & UNORDERED != 0 {
+            DEPTH_UNORDERED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         d.flags &= !UNORDERED;
     }
-    const RENDER_TARGET: u32 = 1;
-    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
-        target_format(d.format)
-    } else {
-        pc_format(d.format)
-    };
+    d.format = pc_format(d.format);
+    const TARGET: u32 = 1;
+    if d.flags & (TARGET | UNORDERED) != 0 {
+        d.format = target_format(d.format);
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1128,11 +1677,10 @@ fn host_texture(
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
-            target_format(value[0])
-        } else {
-            pc_format(value[0])
-        };
+        value[0] = pc_format(value[0]);
+        if d.flags & (TARGET | UNORDERED) != 0 {
+            value[0] = target_format(value[0]);
+        }
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {
@@ -1164,67 +1712,6 @@ fn host_texture(
         });
     }
     texture
-}
-
-/// Depth families that have unordered access formats (16-bit and 32-bit
-/// depth; the stencil ones have none), and the format with the depth
-/// format's bits: R16_UNORM for D16_UNORM, R32_FLOAT for D32_FLOAT.
-#[cfg(windows)]
-const TWIN_FORMATS: [(u32, u32); 2] = [(53, 56), (39, 41)];
-
-/// A twin for the unordered access of host depth target `depth`: its
-/// description with unordered access instead of depth use, in the
-/// typeless format of its family, so that views of the twin take any
-/// format of the family (the title's own). Copies between the two keep
-/// the bits (CopyResource takes depth resources and formats of one type
-/// group). `None` without such a family (stencil), multisampled, or not
-/// 2D.
-#[cfg(windows)]
-fn host_twin(
-    depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    use windows::Win32::Graphics::Direct3D12::*;
-    let host = crate::host::host()?;
-    // SAFETY: a live resource.
-    let mut d = unsafe { depth.GetDesc() };
-    let typeless = family(d.Format.0 as u32);
-    if d.SampleDesc.Count > 1
-        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        || !TWIN_FORMATS.iter().any(|&(f, _)| f == typeless)
-    {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(
-                format = d.Format.0,
-                samples = d.SampleDesc.Count,
-                "no unordered access twin for this depth target: its UAV writes are dropped"
-            )
-        });
-        return None;
-    }
-    d.Format.0 = typeless as i32;
-    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let mut twin: Option<ID3D12Resource> = None;
-    // SAFETY: the host's own description, changed to a legal one; the out
-    // pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            &d,
-            D3D12_RESOURCE_STATE_COMMON,
-            None,
-            &mut twin,
-        )
-    };
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no unordered access twin");
-    }
-    twin
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1281,8 +1768,6 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
-    #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1290,27 +1775,33 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            // Depth and unordered access (see `host_texture`).
-            const BOTH: u32 = 2 | 4;
-            let twin = (desc.flags & BOTH == BOTH)
-                .then(|| host_twin(&texture))
-                .flatten()
-                .map(|texture| {
-                    std::sync::Arc::new(HostTexture {
-                        texture,
-                        state: 0.into(),
-                        twin: None,
-                    })
-                });
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-                twin,
-            })
-        }),
+        host: Hosted {
+            made: std::sync::Mutex::new(None),
+            state,
+            // SAFETY: the title passes a whole clear value (the format,
+            // then color or depth and stencil: 5 words) or null.
+            clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
+            used: std::sync::atomic::AtomicU64::new(0),
+            refused: std::sync::atomic::AtomicBool::new(false),
+            gone: std::sync::atomic::AtomicBool::new(false),
+            placed: std::sync::atomic::AtomicBool::new(false),
+        },
     });
+    // The host copy waits for the texture's first use ([`Hosted`]).
+    #[cfg(windows)]
+    if desc.dimension != BUFFER {
+        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        textures().insert(at);
+        if !fills(&desc) {
+            TARGETS_AT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(resource.data() as u64, at);
+        }
+        if !lazy() {
+            let _ = hosted(at as This, true);
+        }
+    }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
@@ -1322,11 +1813,28 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
-        #[cfg(feature = "diagnostics")]
-        if self
+        // Out of the table of textures first: the sweep looks at the ones
+        // in it, under its lock.
+        if self.desc.dimension != BUFFER {
+            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            if !fills(&self.desc) {
+                let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+                let at = self.data() as u64;
+                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
+                    targets.remove(&at);
+                }
+            }
+        }
+        let made = self
             .host
+            .made
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        #[cfg(feature = "diagnostics")]
+        if made
             .as_ref()
-            .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
+            .is_some_and(|(h, _)| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
             // lists not yet run still named (a GPU page fault).
@@ -1338,6 +1846,14 @@ impl Drop for Resource {
                     desc = ?self.desc,
                     "a title texture was released while a list not yet reset names its host copy"
                 );
+            }
+        }
+        // A running submission may still read the host copy (and a depth
+        // texture's colour twin).
+        if let Some((host, twin)) = made {
+            crate::host::retire(host);
+            if let Some(twin) = twin {
+                crate::host::retire(twin);
             }
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
@@ -1391,7 +1907,7 @@ pub(crate) extern "system" fn create_committed(
     )
 }
 
-/// Device method 0x3f8, inferred from Grand Theft Auto VI's calls
+/// Device method 0x3f8, inferred from the title's calls
 /// (title+0x193e1b4: its back buffers, heap flag "allow display"): the
 /// committed resource creation of the enhanced-barrier interfaces,
 /// `(heap, heap flags, desc1, initial layout, clear value, protected
@@ -1454,7 +1970,7 @@ pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HR
 }
 
 /// Device method 0x428, one of the `ID3D12Device9` to `ID3D12Device11`
-/// additions. From Grand Theft Auto VI's call: a resource at a virtual
+/// additions. From the title's call: a resource at a virtual
 /// address the title mapped itself, `(address, desc1, initial barrier
 /// layout, clear value, iid, out)`, as `CreatePlacedResourceX` with
 /// enhanced barriers. GPU addresses are CPU addresses, so the resource is
@@ -1504,15 +2020,28 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 /// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, Grand Theft Auto VI's streamed and
+/// resource object (device 0x230, the title's streamed and
 /// interface textures), by address and description: a resource at that
 /// address, made the first time a draw reads one.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
+/// The resource is kept for the run (views and lists name its address);
+/// its host texture is let go when nothing names it any more
+/// ([`let_go_idle`]) and made again on the next use.
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The bytes of title memory a texture with the resource description
+/// `desc` (as words) takes where the title placed it; `None` for a buffer
+/// and for a description without a size.
+#[cfg(windows)]
+pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    footprint(&d).map(|f| f.size)
+}
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
@@ -1541,7 +2070,11 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    resource(out)
+        .host
+        .placed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1825,7 +2358,7 @@ mod tests {
         slot::<Custom>(device, 0xd0)(&mut p, device, 1, 1);
         assert_eq!(p.cpu_pages, 1, "default: not CPU-visible");
 
-        // 0x428: a buffer over memory the title owns, as GTA VI asks.
+        // 0x428: a buffer over memory the title owns, as the title asks.
         type At = extern "system" fn(
             This,
             u64,
@@ -2060,6 +2593,12 @@ mod tests {
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+        // The upload list holds the texture from its recording on: checked
+        // before the submission, the one point where both paths hold it
+        // through the title's list (with `late` the submission takes the
+        // host list, and the flight lets it go when the card has run it,
+        // which can be at once).
+        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
         // Read the host texture back into a readback buffer.
@@ -2098,8 +2637,10 @@ mod tests {
         let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
-        // The upload list holds the texture until it is reset.
-        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+        // Waited for, the upload list holds the texture until it is reset.
+        if !crate::host::late() {
+            assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+        }
         use windows::core::Interface;
         let out_to = Location {
             resource: readback.as_raw().cast_const().cast(),
@@ -2150,130 +2691,72 @@ mod tests {
         }
     }
 
-    /// A depth target the title also writes as unordered access (shadow
-    /// maps): what a compute shader writes through its view reaches the
-    /// depth, in the list and in the next one, and the depth keeps its
-    /// values where the shader does not write.
+    /// A 16-bit depth texture the title also asks unordered access for gets
+    /// a colour twin, and the host copies one into the other, both ways: a
+    /// pattern put into the twin is copied to the depth texture, the twin
+    /// is overwritten with zeros, and the pattern comes back from the depth
+    /// texture. A copy the host does not allow ends the test (with the
+    /// debug layer's message under `VICTORY_D3D12_DEBUG=1` in a diagnostics
+    /// build).
     #[cfg(windows)]
     #[test]
-    fn unordered_writes_reach_a_depth_target() {
-        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+    fn a_depth_texture_and_its_twin_copy_into_each_other() {
         use windows::Win32::Graphics::Direct3D12::*;
-        use windows::Win32::Graphics::Dxgi::Common::*;
-        use windows::core::{Interface, s};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
-        let null: This = std::ptr::null();
-        let mut depth = null;
-        // 8x8 D16_UNORM, depth and unordered access.
-        let desc = ResourceDesc {
-            flags: 2 | 4,
-            ..texture(8, 8, 55, 1)
-        };
+        let null = std::ptr::null();
         const DEPTH_WRITE: u32 = 0x10;
-        let (iid, clear) = (&RESOURCE_IIDS[0], null.cast());
-        let made = create_committed(
-            null,
-            &PROPERTIES,
-            0,
-            &desc,
-            DEPTH_WRITE,
-            clear,
-            iid,
-            &mut depth,
-        );
-        assert_eq!(made, S_OK);
-        // The title's view, R16_UNORM 2D.
-        let heap = crate::descriptor::host::HostHeap::new(false, 1).unwrap();
-        let view = Some([56, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
-        heap.make_at(
-            0,
-            &crate::descriptor::View::Unordered(depth as usize, 0, view),
-        );
-        const FILL: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(UAV(u0))"
-cbuffer Fill : register(b0) { float value; uint columns; };
-RWTexture2D<unorm float> depth : register(u0);
-[RootSignature(RS)]
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x < columns) depth[id.xy] = value;
-}
-"#;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; out pointer
-        // ours. Then the blob's own bytes, the root signature inside.
-        let (root, pso) = unsafe {
-            let (source, len) = (FILL.as_ptr().cast(), FILL.len());
-            let (name, main, model) = (s!("fill"), s!("main"), s!("cs_5_1"));
-            D3DCompile(
-                source, len, name, None, None, main, model, 0, 0, &mut code, None,
-            )
-            .unwrap();
-            let code = code.unwrap();
-            let (start, size) = (code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let bytes = std::slice::from_raw_parts(start, size);
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            };
-            let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
+        let desc = ResourceDesc {
+            flags: 6,
+            ..texture(4, 4, 55, 1)
         };
-        // Writes `value` to the columns before `columns`.
-        let fill = |list: &crate::host::HostList, value: f32, columns: u32| {
-            // As draws ready the views their shaders write.
-            const UNORDERED_ACCESS: u32 = 0x8;
-            crate::list::ensure_state(list, depth, UNORDERED_ACCESS);
-            let constants = [value.to_bits(), columns];
-            // SAFETY: an open list; our heap, root signature and pipeline.
-            unsafe {
-                let l = &list.list;
-                l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
-                l.SetComputeRootSignature(&root);
-                l.SetPipelineState(&pso);
-                l.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
-                l.SetComputeRootDescriptorTable(1, heap.heap.GetGPUDescriptorHandleForHeapStart());
-                l.Dispatch(1, 1, 1);
+        let mut depth = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                DEPTH_WRITE,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut depth
+            ),
+            S_OK
+        );
+        let host_depth = host_resource(depth).unwrap();
+        let Some(twin) = twin_resource(depth) else {
+            return; // twins are turned off
+        };
+        // SAFETY: live resources.
+        let (d, t) = unsafe { (host_depth.GetDesc(), twin.GetDesc()) };
+        // Both R16 typeless: one a depth texture, one with unordered access.
+        assert_eq!((d.Format.0, d.Flags.0), (53, 2));
+        assert_eq!((t.Format.0, t.Flags.0), (53, 4));
+
+        // Four rows of four 16-bit texels, 256 bytes apart as copies place
+        // them: the pattern, then as many zeros.
+        let mut pattern = vec![0u8; 1024];
+        for row in 0..4 {
+            for b in 0..8 {
+                pattern[row * 256 + b] = (1 + row * 8 + b) as u8;
             }
-        };
-
-        // One list clears the depth, then writes four columns as it ends.
-        let first = host.new_list().unwrap();
-        crate::list::ensure_state(&first, depth, DEPTH_WRITE);
-        let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
-            Format: DXGI_FORMAT_D16_UNORM,
-            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
-            ..Default::default()
-        };
-        let dsv = host.dsv(host_resource(depth).unwrap(), Some(&dsv));
-        // SAFETY: an open list and a fresh view.
+        }
+        let (upload, data) = host.upload_buffer(2048).unwrap();
+        // SAFETY: the buffer's mapping, 2048 bytes.
         unsafe {
-            first
-                .list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.25, 0, None)
-        };
-        fill(&first, 0.75, 4);
-        first.close();
-        host.execute(&[&first]);
-
-        // The next writes two columns, then copies the depth out.
-        let second = host.new_list().unwrap();
-        fill(&second, 0.5, 2);
-        crate::list::ensure_state(&second, depth, 0x800); // copy source
-        let memory = D3D12_HEAP_PROPERTIES {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 1024);
+            std::ptr::write_bytes(data.add(1024), 0, 1024);
+        }
+        let readback_heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
         };
-        let buffer = D3D12_RESOURCE_DESC {
+        let readback_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: 8 * 256,
+            Width: 1024,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -2284,65 +2767,605 @@ void main(uint3 id : SV_DispatchThreadID) {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut out: Option<ID3D12Resource> = None;
-        let state = D3D12_RESOURCE_STATE_COPY_DEST;
-        let flags = D3D12_HEAP_FLAG_NONE;
+        let mut readback: Option<ID3D12Resource> = None;
         // SAFETY: plain creation of a readback buffer.
         unsafe {
-            let device = &host.device;
-            device
-                .CreateCommittedResource(&memory, flags, &buffer, state, None, &mut out)
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
                 .unwrap();
         }
-        let readback = out.unwrap();
-        #[repr(C)]
-        struct Location(This, u32, PlacedFootprint);
-        // As the host has the depth: R16_TYPELESS.
-        let rows = PlacedFootprint {
-            offset: 0,
-            format: 53,
-            width: 8,
-            height: 8,
-            depth: 1,
-            row_pitch: 256,
-        };
-        let to = Location(readback.as_raw().cast_const().cast(), 1, rows);
-        let texture = host_resource(depth).unwrap().as_raw().cast_const().cast();
-        let from = Location(
-            texture,
-            0,
-            PlacedFootprint {
-                offset: 0,
-                ..NO_FOOTPRINT
+        let readback = readback.unwrap();
+
+        // A texture's one subresource; the four rows of a buffer at `offset`.
+        let whole = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
             },
+        };
+        let rows = |buffer: &ID3D12Resource, offset: u64| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: offset,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT(53),
+                        Width: 4,
+                        Height: 4,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let (written, tested, source, dest) = (
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
         );
-        // SAFETY: an open list, live resources, locations in the host layout.
+        let moved = crate::host::transition;
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list and live resources; the two textures are one
+        // size in one format family.
         unsafe {
-            let (to, from) = ((&raw const to).cast(), (&raw const from).cast());
-            second.list.CopyTextureRegion(to, 0, 0, 0, from, None)
-        };
-        second.close();
-        host.execute(&[&second]);
+            let l = &list.list;
+            // The pattern into the twin, the twin into the depth texture.
+            l.ResourceBarrier(&[moved(twin, written, dest), moved(host_depth, tested, dest)]);
+            l.CopyTextureRegion(&whole(twin), 0, 0, 0, &rows(&upload, 0), None);
+            l.ResourceBarrier(&[moved(twin, dest, source)]);
+            l.CopyResource(host_depth, twin);
+            // Zeros over the twin, then the depth texture back into it.
+            l.ResourceBarrier(&[moved(twin, source, dest)]);
+            l.CopyTextureRegion(&whole(twin), 0, 0, 0, &rows(&upload, 1024), None);
+            l.ResourceBarrier(&[moved(host_depth, dest, source)]);
+            l.CopyResource(twin, host_depth);
+            // The twin read back; both textures to the states they had.
+            l.ResourceBarrier(&[moved(twin, dest, source)]);
+            l.CopyTextureRegion(&rows(&readback, 0), 0, 0, 0, &whole(twin), None);
+            l.ResourceBarrier(&[
+                moved(twin, source, written),
+                moved(host_depth, source, tested),
+            ]);
+        }
+        list.close();
+        host.execute(&[&list]);
         let mut mapped = std::ptr::null_mut();
-        // SAFETY: the copy finished (execute waits); 8 rows of 256 bytes.
+        // SAFETY: the copies finished (execute waits); the buffer is 1024 bytes.
         let read = unsafe {
-            readback.Map(0, None, Some(&mut mapped)).unwrap();
-            std::slice::from_raw_parts(mapped.cast::<u16>(), 8 * 128)
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE {
+                        Begin: 0,
+                        End: 1024,
+                    }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
         };
-        for y in 0..8 {
-            for x in 0..8 {
-                let value: f32 = match x {
-                    0..2 => 0.5,
-                    2..4 => 0.75,
-                    _ => 0.25,
-                };
-                let wanted = (value * 65535.0).round() as i32;
-                let got = i32::from(read[y * 128 + x]);
-                assert!(
-                    (got - wanted).abs() <= 1,
-                    "texel ({x}, {y}): {got:#x}, wanted {value} ({wanted:#x})"
-                );
+        for row in 0..4 {
+            let at = row * 256;
+            assert_eq!(read[at..at + 8], pattern[at..at + 8], "row {row}");
+        }
+    }
+
+    /// A depth texture with a stencil plane that the title also asks
+    /// unordered access for gets a twin of the stencil plane, and what
+    /// shaders write there is in the stencil plane once the list is closed:
+    /// a pattern put into the twin is read back from the plane.
+    #[cfg(windows)]
+    #[test]
+    fn a_stencil_planes_twin_reaches_the_plane() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        const DEPTH_WRITE: u32 = 0x10;
+        let desc = ResourceDesc {
+            flags: 6,
+            ..texture(4, 4, 45, 1)
+        };
+        let mut depth = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                DEPTH_WRITE,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut depth
+            ),
+            S_OK
+        );
+        let host_depth = host_resource(depth).unwrap();
+        let Some(twin) = twin_resource(depth) else {
+            return; // twins are turned off
+        };
+        // SAFETY: live resources.
+        let (d, t) = unsafe { (host_depth.GetDesc(), twin.GetDesc()) };
+        // R24G8 typeless with depth, R8 typeless with unordered access.
+        assert_eq!((d.Format.0, d.Flags.0), (44, 2));
+        assert_eq!((t.Format.0, t.Flags.0), (60, 4));
+
+        // Four rows of four texels, 256 bytes apart as copies place them.
+        let mut pattern = vec![0u8; 1024];
+        for row in 0..4 {
+            for b in 0..4 {
+                pattern[row * 256 + b] = (1 + row * 4 + b) as u8;
             }
+        }
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        // SAFETY: the buffer's mapping, 1024 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 1024) };
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            // Room for the rows as the host places them (512 bytes apart
+            // for the stencil plane on NVIDIA, not 256).
+            Width: 4096,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        // How the host lays the stencil plane (subresource 1) out in a buffer.
+        let mut plane = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        // SAFETY: a plain query writing one footprint.
+        unsafe {
+            host.device
+                .GetCopyableFootprints(&d, 1, 1, 0, Some(&mut plane), None, None, None);
+        }
+        let pattern_rows = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: DXGI_FORMAT(60),
+                Width: 4,
+                Height: 4,
+                Depth: 1,
+                RowPitch: 256,
+            },
+        };
+
+        // A subresource of a texture; rows of a buffer.
+        let whole = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: index,
+            },
+        };
+        let rows = |buffer: &ID3D12Resource, placed: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: placed,
+                },
+            }
+        };
+        let (written, source, dest) = (
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let moved = crate::host::transition;
+
+        // The pattern into the twin, where a shader would write it.
+        let fill = host.new_list().unwrap();
+        // SAFETY: an open list and live resources.
+        unsafe {
+            let l = &fill.list;
+            l.ResourceBarrier(&[moved(twin, written, dest)]);
+            l.CopyTextureRegion(&whole(twin, 0), 0, 0, 0, &rows(&upload, pattern_rows), None);
+            l.ResourceBarrier(&[moved(twin, dest, written)]);
+        }
+        fill.close();
+        host.execute(&[&fill]);
+
+        // A list in which a shader writes the twin: closing it copies the
+        // twin into the stencil plane.
+        let list = host.new_list().unwrap();
+        assert!(list.twin_use(depth, true, true));
+        list.twins_written();
+        list.close();
+        host.execute(&[&list]);
+
+        // The stencil plane read back from the state the list left it in.
+        let state = host_copy(depth).unwrap().state.load(Relaxed);
+        let state = D3D12_RESOURCE_STATES(state as i32);
+        let back = host.new_list().unwrap();
+        // SAFETY: an open list and live resources; a whole subresource.
+        unsafe {
+            let l = &back.list;
+            l.ResourceBarrier(&[moved(host_depth, state, source)]);
+            let (to, from) = (rows(&readback, plane), whole(host_depth, 1));
+            l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            l.ResourceBarrier(&[moved(host_depth, source, state)]);
+        }
+        back.close();
+        host.execute(&[&back]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copies finished (execute waits); the buffer is 4096 bytes.
+        let read = unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE {
+                        Begin: 0,
+                        End: 4096,
+                    }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 4096)
+        };
+        let pitch = plane.Footprint.RowPitch as usize;
+        for row in 0..4 {
+            let (at, from) = (row * pitch, row * 256);
+            assert_eq!(read[at..at + 4], pattern[from..from + 4], "row {row}");
+        }
+    }
+
+    /// The depth plane of a depth-stencil texture is drawn from the plane's
+    /// twin when the list that wrote the twin closes: class numbers are put
+    /// into the twin of a texture in the console's 16-bit depth-stencil
+    /// format, and draws with the depth test "equal" at the depth the
+    /// title's lighting computes for a class (the number times the float
+    /// nearest 1/65535) then cover the texels of that class and no other.
+    #[cfg(windows)]
+    #[test]
+    fn a_depth_planes_twin_is_drawn_into_the_plane() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        use windows::core::s;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        const DEPTH_WRITE: u32 = 0x10;
+        let desc = ResourceDesc {
+            flags: 6,
+            ..texture(4, 4, 118, 1)
+        };
+        let mut depth = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                DEPTH_WRITE,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut depth
+            ),
+            S_OK
+        );
+        let host_depth = host_resource(depth).unwrap();
+        let Some(plane) = twin_plane_resource(depth) else {
+            return; // these twins are turned off
+        };
+        // SAFETY: live resources.
+        let (d, t) = unsafe { (host_depth.GetDesc(), plane.GetDesc()) };
+        // R24G8 typeless with depth, R16 typeless with unordered access.
+        assert_eq!((d.Format.0, d.Flags.0), (44, 2));
+        assert_eq!((t.Format.0, t.Flags.0), (53, 4));
+
+        // Four rows of four class numbers (16 bits each), 256 bytes apart
+        // as copies place them. 128 and 129 are the classes whose 24-bit
+        // depth lies nearest a half step.
+        const CLASSES: [u16; 16] = [
+            8, 65, 128, 129, 65, 8, 129, 128, 0, 255, 65, 64, 129, 130, 8, 65,
+        ];
+        let mut pattern = vec![0u8; 1024];
+        for (i, class) in CLASSES.into_iter().enumerate() {
+            let at = i / 4 * 256 + i % 4 * 2;
+            pattern[at..at + 2].copy_from_slice(&class.to_le_bytes());
+        }
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        // SAFETY: the buffer's mapping, 1024 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 1024) };
+        let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1024,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a buffer.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut made,
+                    )
+                    .unwrap();
+            }
+            made.unwrap()
+        };
+        let readback = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        // The colour target the draws cover: 4x4, 8 bits a texel.
+        let target = {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(61),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a texture.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut made,
+                    )
+                    .unwrap();
+            }
+            made.unwrap()
+        };
+        let rows_of = |format: i32| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: DXGI_FORMAT(format),
+                Width: 4,
+                Height: 4,
+                Depth: 1,
+                RowPitch: 256,
+            },
+        };
+        // A texture's one subresource; rows of a buffer.
+        let whole = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let rows = |buffer: &ID3D12Resource, placed: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: placed,
+                },
+            }
+        };
+        let (written, source, dest, tested, drawn) = (
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+        let moved = crate::host::transition;
+
+        // The class numbers into the twin, where a shader would write them.
+        let fill = host.new_list().unwrap();
+        // SAFETY: an open list and live resources.
+        unsafe {
+            let l = &fill.list;
+            l.ResourceBarrier(&[moved(plane, written, dest)]);
+            l.CopyTextureRegion(&whole(plane), 0, 0, 0, &rows(&upload, rows_of(53)), None);
+            l.ResourceBarrier(&[moved(plane, dest, written)]);
+        }
+        fill.close();
+        host.execute(&[&fill]);
+
+        // A list in which a shader writes the twins: closing it draws the
+        // depth plane's twin into the plane.
+        let list = host.new_list().unwrap();
+        assert!(list.twin_use(depth, true, true));
+        list.twins_written();
+        list.close();
+        host.execute(&[&list]);
+
+        // The draws: a triangle over the target at the depth of a class,
+        // as the title's lighting places its rectangles.
+        const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants = 1, b0)"
+cbuffer Drawn : register(b0) { uint number; };
+[RootSignature(RS)]
+float4 corner(uint i : SV_VertexID) : SV_Position {
+    float z = float(number) * asfloat(0x37800080);
+    return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, z, 1.0);
+}
+float4 lit() : SV_Target { return 1.0; }
+"#;
+        let vs = crate::host::compile(SOURCE, s!("corner"), s!("vs_5_1")).unwrap();
+        let ps = crate::host::compile(SOURCE, s!("lit"), s!("ps_5_1")).unwrap();
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        let mut formats = [DXGI_FORMAT(0); 8];
+        formats[0] = DXGI_FORMAT(61);
+        // SAFETY: plain creation; the description points at live data.
+        let (signature, pipeline) = unsafe {
+            let signature: ID3D12RootSignature =
+                host.device.CreateRootSignature(0, &vs[..]).unwrap();
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&signature),
+                VS: code(&vs[..]),
+                PS: code(&ps[..]),
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                // As the title's lighting: test "equal", nothing written.
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: true.into(),
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                    DepthFunc: D3D12_COMPARISON_FUNC_EQUAL,
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: formats,
+                DSVFormat: DXGI_FORMAT(45),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState =
+                host.device.CreateGraphicsPipelineState(&desc).unwrap();
+            (signature, pipeline)
+        };
+        let state = host_copy(depth).unwrap().state.load(Relaxed);
+        let state = D3D12_RESOURCE_STATES(state as i32);
+        let colour = host.rtv(Some(&target), None);
+        let depth_view = host.dsv(
+            host_depth,
+            Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: DXGI_FORMAT(45),
+                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            }),
+        );
+        let back = host.new_list().unwrap();
+        // SAFETY: an open list and live resources and views.
+        unsafe {
+            let l = &back.list;
+            if state != tested {
+                l.ResourceBarrier(&[moved(host_depth, state, tested)]);
+            }
+            l.ClearRenderTargetView(colour, &[0.0; 4], None);
+            l.SetGraphicsRootSignature(&signature);
+            l.SetPipelineState(&pipeline);
+            l.OMSetRenderTargets(1, Some(&colour), false, Some(&depth_view));
+            l.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: 4.0,
+                Height: 4.0,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]);
+            l.RSSetScissorRects(&[RECT {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 4,
+            }]);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
+            // Classes 65 and 129 are drawn; the others are not.
+            for class in [65u32, 129] {
+                l.SetGraphicsRoot32BitConstant(0, class, 0);
+                l.DrawInstanced(3, 1, 0, 0);
+            }
+            l.ResourceBarrier(&[moved(&target, drawn, source)]);
+            let (to, from) = (rows(&readback, rows_of(61)), whole(&target));
+            l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        back.close();
+        host.execute(&[&back]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
+        let read = unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE {
+                        Begin: 0,
+                        End: 1024,
+                    }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
+        };
+        for (i, class) in CLASSES.into_iter().enumerate() {
+            let covered = read[i / 4 * 256 + i % 4] != 0;
+            let drawn = matches!(class, 65 | 129);
+            assert_eq!(covered, drawn, "texel {i}, class {class}");
         }
     }
 
@@ -2406,376 +3429,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     #[test]
-    fn packed_16_conversion_matches_dxgi_layout() {
-        // B5G5R5A1_UNORM (86): B in bits 0-4, G 5-9, R 10-14, A 15.
-        let mut out = [0u8; 4];
-        for (packed, expected) in [
-            (0x0000u16, [0, 0, 0, 0]),
-            (0xffff, [255, 255, 255, 255]),
-            (0x8000, [0, 0, 0, 255]),
-            (0x7c00, [255, 0, 0, 0]),
-            (0x03e0, [0, 255, 0, 0]),
-            (0x001f, [0, 0, 255, 0]),
-            // Bit replication: v << 3 | v >> 2 (r=24->198, g=10->82, b=21->173).
-            (0x8000 | (24 << 10) | (10 << 5) | 21, [198, 82, 173, 255]),
-            ((1 << 10) | (16 << 5) | 2, [8, 132, 16, 0]),
-        ] {
-            expand_packed16(86, &packed.to_le_bytes(), &mut out);
-            assert_eq!(out, expected, "B5G5R5A1 {packed:#06x}");
-        }
-
-        // B4G4R4A4_UNORM (115): B in bits 0-3, G 4-7, R 8-11, A 12-15.
-        for (packed, expected) in [
-            (0x0000u16, [0, 0, 0, 0]),
-            (0xffff, [255, 255, 255, 255]),
-            (0xf000, [0, 0, 0, 255]),
-            (0x0f00, [255, 0, 0, 0]),
-            (0x00f0, [0, 255, 0, 0]),
-            (0x000f, [0, 0, 255, 0]),
-            (0xca73, [0xaa, 0x77, 0x33, 0xcc]),
-        ] {
-            expand_packed16(115, &packed.to_le_bytes(), &mut out);
-            assert_eq!(out, expected, "B4G4R4A4 {packed:#06x}");
-        }
-
-        // Every 16-bit value round-trips losslessly through RGBA8 and back.
-        for format in PACKED_16 {
-            let mut rgba = [0u8; 4];
-            let mut back = [0u8; 2];
-            for value in 0..=u16::MAX {
-                let raw = value.to_le_bytes();
-                expand_packed16(format, &raw, &mut rgba);
-                pack_rgba8_to_16(format, &rgba, &mut back);
-                assert_eq!(back, raw, "format {format} value {value:#06x}");
-            }
-        }
-
-        // Alpha thresholding on B5G5R5A1 and pitched multi-row expansion/packing.
-        let mut back = [0u8; 4];
-        pack_rgba8_to_16(86, &[0, 0, 0, 127, 0, 0, 0, 128], &mut back);
-        assert_eq!(
-            [
-                u16::from_le_bytes([back[0], back[1]]),
-                u16::from_le_bytes([back[2], back[3]]),
-            ],
-            [0x0000, 0x8000]
-        );
-
-        let src_rows = [
-            0x1fu8, 0x00, 0xe0, 0x03, 0xaa, 0xaa, // row 0: 2 texels + 2B pitch pad
-            0x00, 0x7c, 0x00, 0x80, // row 1: 2 texels (exact end, no pad)
-        ];
-        let mut dst_rows = [0u8; 16 + 8]; // pitch 16 on row 0, 8 bytes on row 1
-        expand_packed16_rows(86, 2, 2, &src_rows, 6, &mut dst_rows, 16);
-        assert_eq!(&dst_rows[0..8], &[0, 0, 255, 0, 0, 255, 0, 0]);
-        assert_eq!(&dst_rows[16..24], &[255, 0, 0, 0, 0, 0, 0, 255]);
-
-        let mut repacked = [0u8; 10];
-        pack_rgba8_to_16_rows(86, 2, 2, &dst_rows, 16, &mut repacked, 6);
-        assert_eq!(&repacked[0..4], &src_rows[0..4]);
-        assert_eq!(&repacked[6..10], &src_rows[6..10]);
-    }
-
-    #[test]
-    fn target_format_is_identity_for_non_packed_formats() {
-        for format in 0..=200u32 {
-            if PACKED_16.contains(&format) {
-                assert!(
-                    [format, RGBA8_UNORM].contains(&target_format(format)),
-                    "unexpected target format for {format}"
-                );
-            } else if (118..=120).contains(&format) {
-                assert_eq!(target_format(format), format - 118 + 45);
-            } else {
-                assert_eq!(target_format(format), format, "format {format}");
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn packed_16_targets_copy_and_skip_mixed_transfers() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::core::Interface;
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
-        let null = std::ptr::null();
-        let iid = &RESOURCE_IIDS[0];
-        const COPY_DEST: u32 = 0x400;
-        let make_tex = |format, flags, samples| {
-            let mut out = null;
-            let desc = ResourceDesc {
-                flags,
-                sample_count: samples,
-                ..texture(4, 4, format, 1)
-            };
-            assert_eq!(
-                create_committed(
-                    null,
-                    &PROPERTIES,
-                    0,
-                    &desc,
-                    COPY_DEST,
-                    null.cast(),
-                    iid,
-                    &mut out
-                ),
-                S_OK
-            );
-            out
-        };
-
-        let queue_iid = guid(
-            0x0ec870a6,
-            0x5d7e,
-            0x4c22,
-            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
-        );
-        let allocator_iid = guid(
-            0x6102dee4,
-            0xaf59,
-            0x4b09,
-            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
-        );
-        let list_iid = guid(
-            0x5b160d0f,
-            0xac1b,
-            0x4185,
-            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
-        );
-        let (mut queue, mut allocator, mut list) = (null, null, null);
-        let queue_desc = [0u32; 4];
-        assert_eq!(
-            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
-            S_OK
-        );
-        assert_eq!(
-            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
-            S_OK
-        );
-        assert_eq!(
-            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
-            S_OK
-        );
-
-        #[repr(C)]
-        struct Location {
-            resource: This,
-            kind: u32,
-            footprint: PlacedFootprint,
-        }
-        type CopyRegion =
-            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
-        type CopyRes = extern "system" fn(This, This, This);
-        type Resolve = extern "system" fn(This, This, u32, This, u32, u32);
-        type Close = extern "system" fn(This) -> HRESULT;
-        type Reset = extern "system" fn(This, This, This) -> HRESULT;
-        type Execute = extern "system" fn(This, u32, *const This);
-
-        for fmt in PACKED_16 {
-            let rt = make_tex(fmt, 1 | 4, 1);
-            let rt2 = make_tex(fmt, 1, 1);
-            let msaa_rt = make_tex(fmt, 1, 4);
-            let sampled = make_tex(fmt, 0, 1);
-            let mut source = null;
-            assert_eq!(
-                create_committed(
-                    null,
-                    &PROPERTIES,
-                    0,
-                    &buffer(2048),
-                    0,
-                    null.cast(),
-                    iid,
-                    &mut source
-                ),
-                S_OK
-            );
-            let (data, _) = buffer_bytes(source).unwrap();
-            // SAFETY: the buffer holds 2048 bytes.
-            let bytes = unsafe { std::slice::from_raw_parts_mut(data, 2048) };
-            // Non-zero buffer offset (512) with 4x4 packed 16-bit texels.
-            let texels: [u16; 16] = [
-                0x0000, 0xffff, 0x8000, 0x7c00, 0x03e0, 0x001f, 0xca73, 0x92a5, 0x1234, 0x5678,
-                0x9abc, 0xdef0, 0x8421, 0x4210, 0x0f0f, 0xf0f0,
-            ];
-            for row in 0..4 {
-                let at = 512 + row * 256;
-                for col in 0..4 {
-                    let le = texels[row * 4 + col].to_le_bytes();
-                    bytes[at + col * 2..at + col * 2 + 2].copy_from_slice(&le);
-                }
-            }
-            let src_fp = PlacedFootprint {
-                offset: 512,
-                format: fmt,
-                width: 4,
-                height: 4,
-                depth: 1,
-                row_pitch: 256,
-            };
-            let to = Location {
-                resource: rt,
-                kind: 0,
-                footprint: PlacedFootprint {
-                    offset: 0,
-                    ..src_fp
-                },
-            };
-            let from = Location {
-                resource: source,
-                kind: 1,
-                footprint: src_fp,
-            };
-            slot::<CopyRegion>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
-            assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
-            slot::<Execute>(queue, 0x50)(queue, 1, &list);
-
-            // Read back from the host copy in its effective host format.
-            let host_image = host_resource(rt).unwrap();
-            // SAFETY: live host textures.
-            let (host_fmt, sampled_fmt) = unsafe {
-                (
-                    host_image.GetDesc().Format.0 as u32,
-                    host_resource(sampled).unwrap().GetDesc().Format.0 as u32,
-                )
-            };
-            assert_eq!(host_fmt, target_format(fmt));
-            assert_eq!(sampled_fmt, fmt);
-            assert_eq!(view_format(rt), None);
-
-            let readback_heap = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_READBACK,
-                ..Default::default()
-            };
-            let readback_desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: 1024,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            };
-            let mut readback: Option<ID3D12Resource> = None;
-            // SAFETY: plain creation of a readback buffer.
-            unsafe {
-                host.device
-                    .CreateCommittedResource(
-                        &readback_heap,
-                        D3D12_HEAP_FLAG_NONE,
-                        &readback_desc,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        None,
-                        &mut readback,
-                    )
-                    .unwrap();
-            }
-            let readback = readback.unwrap();
-            let back = host.new_list().unwrap();
-            let (_, before) = host_transition(rt, 0x800).unwrap();
-            let out_to = Location {
-                resource: readback.as_raw().cast_const().cast(),
-                kind: 1,
-                footprint: PlacedFootprint {
-                    offset: 0,
-                    format: host_fmt,
-                    width: 4,
-                    height: 4,
-                    depth: 1,
-                    row_pitch: 256,
-                },
-            };
-            let out_from = Location {
-                resource: host_image.as_raw().cast_const().cast(),
-                kind: 0,
-                footprint: to.footprint,
-            };
-            // SAFETY: an open list, live resources, locations in the host layout.
-            unsafe {
-                back.list.ResourceBarrier(&[crate::host::transition(
-                    host_image,
-                    D3D12_RESOURCE_STATES(before as i32),
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-                back.list.CopyTextureRegion(
-                    (&raw const out_to).cast(),
-                    0,
-                    0,
-                    0,
-                    (&raw const out_from).cast(),
-                    None,
-                );
-            }
-            back.close();
-            host.execute(&[&back]);
-            let mut mapped = std::ptr::null_mut();
-            // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
-            let read = unsafe {
-                readback
-                    .Map(
-                        0,
-                        Some(&D3D12_RANGE {
-                            Begin: 0,
-                            End: 1024,
-                        }),
-                        Some(&mut mapped),
-                    )
-                    .unwrap();
-                std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
-            };
-            for row in 0..4 {
-                let src_row = &bytes[512 + row * 256..][..8];
-                let dst_row = &read[row * 256..];
-                if host_fmt == RGBA8_UNORM {
-                    let mut expected = [0u8; 16];
-                    expand_packed16(fmt, src_row, &mut expected);
-                    assert_eq!(&dst_row[..16], &expected, "format {fmt} row {row}");
-                } else {
-                    assert_eq!(&dst_row[..8], src_row, "format {fmt} row {row}");
-                }
-            }
-
-            // Mixed transfers (native <-> widened) must be skipped cleanly and
-            // target->target resolves must succeed with the effective host format.
-            assert_eq!(slot::<Reset>(list, 0x50)(list, allocator, null), S_OK);
-            let tex_to = Location {
-                resource: rt2,
-                kind: 0,
-                footprint: PlacedFootprint {
-                    offset: 0,
-                    ..src_fp
-                },
-            };
-            let tex_from = Location {
-                resource: sampled,
-                kind: 0,
-                footprint: PlacedFootprint {
-                    offset: 0,
-                    ..src_fp
-                },
-            };
-            slot::<CopyRegion>(list, 0x80)(list, &tex_to, 0, 0, 0, &tex_from, null.cast());
-            slot::<CopyRes>(list, 0x88)(list, sampled, rt2);
-            slot::<Resolve>(list, 0x98)(list, rt2, 0, msaa_rt, 0, fmt);
-            slot::<Resolve>(list, 0x98)(list, sampled, 0, msaa_rt, 0, fmt);
-            assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
-            slot::<Execute>(queue, 0x50)(queue, 1, &list);
-            assert_eq!(slot::<Reset>(list, 0x50)(list, allocator, null), S_OK);
-            // SAFETY: a plain query.
-            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-
-            for r in [rt, rt2, msaa_rt, sampled, source] {
-                assert_eq!(slot::<Release>(r, 0x10)(r), 0);
-            }
-        }
-        for o in [list, allocator, queue] {
-            assert_eq!(slot::<Release>(o, 0x10)(o), 0);
-        }
+    fn texture_floor_scales_with_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(texture_floor_bytes(None), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(4 * GIB)), GIB);
+        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 6 * GIB / 4);
+        assert_eq!(texture_floor_bytes(Some(8 * GIB)), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
     }
 }
