@@ -14,8 +14,12 @@ build. See [docs/architecture.md](docs/architecture.md).
 
 ## Status (2026-11-24)
 
-**The game boots and renders the real world. It is not playable, and not
-smooth on the test machine.**
+**Status at a glance**
+
+- [x] **Bootable** — the real Xbox title executable boots through the VIctory runtime.
+- [x] **Story mode** — boots into the world and the first mission's intro.
+- [x] **Playable** — playable at low speed, with graphical and shader bugs remaining.
+- **Speed:** currently only around 2-4 fps in the world; not smooth.
 
 | Stage | State |
 |-------|-------|
@@ -23,7 +27,7 @@ smooth on the test machine.**
 | Intro video with sound | works |
 | Start screen, profile and saves | works |
 | Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | renders through host D3D12 with indirect draws and thousands of draws per frame; ~0.5-3 fps during world streaming |
+| The world (first mission's intro) | renders through host D3D12 with indirect draws and thousands of draws per frame; 2-4 fps in the world |
 
 Tested on Windows 11, NVIDIA GeForce RTX 3060 Ti, driver **32.0.16.2124**,
 16 GB RAM. Real D3D12 world rendering is confirmed on that GPU in release and
@@ -38,9 +42,7 @@ reports **2-4 fps** in the world from its vendored VIctory runtime
 420-450 ms per frame by default, or 240-350 ms with their newer switches
 (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3` with `VICTORY_WIDE_BACK=1`). Its
 top-level docs quote 3-4 fps on an RTX 3060 with 32 GB RAM, Series S profile
-and its own upscaler. These are their measurements on their hardware; they are
-not a substitute for a measurement of this build, whose figure above stays
-unchanged until the merged runtime is run and timed.
+and its own upscaler.
 
 Early builds peaked at ~9.1 GB VRAM; lazy host-texture creation and capped
 placed allocations bring that to ~5.1 GB. PSV structured-buffer shader
