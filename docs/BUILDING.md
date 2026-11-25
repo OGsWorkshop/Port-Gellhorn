@@ -30,7 +30,9 @@ cargo rustc --release -p victory --bin victory --features diagnostics --locked -
 
 The two `/EXPORT` flags are required so Windows loads the Agility SDK placed next to the executable. `.\scripts\setup-victory.ps1` runs this command and does the Agility SDK step.
 
-Tests that do not need a GPU: `cargo test --release --locked --lib -p victory-core -p victory-formats -p victory-pe -p victory-loader -p victory-shader -p victory-pipeline`. Tests in `victory-gpu` and `victory-hle` need a Shader Model 6.6 device.
+The source in `runtime/victory` is fxceless/victory-fork plus merged community work and our changes (`runtime/victory/SCARLETTPORT.md`). Run it with `.\scripts\play-victory.ps1 -Game <your dump>` (Series S profile by default); the environment it sets is described in [RUNTIMES.md](RUNTIMES.md).
+
+Tests that do not need a GPU: `cargo test --release --locked --lib -p victory-core -p victory-formats -p victory-pe -p victory-loader -p victory-shader -p victory-pipeline`. Tests in `victory-gpu` and `victory-hle` need a Shader Model 6.6 device. With `VICTORY_TEST_NO_GPU=1` they run as on a machine without a card (device tests are skipped).
 
 ## Agility SDK
 
@@ -45,7 +47,7 @@ cd launcher
 cargo build --release --locked
 ```
 
-`build.rs` copies the runtime files into `launcher\runtime` from `XCL_SRC` (a folder holding `xcl.exe` and `D3D12\`) and `DXC_SRC` (a folder holding `dxcompiler.dll` and `dxil.dll`, for example the Windows SDK `bin\<version>\x64`). Files already in `launcher\runtime` are used as is.
+`build.rs` copies the runtime files into `launcher\runtime` from `XCL_SRC` (a folder holding `xcl.exe` and `D3D12\`; default `runtime\xcl\target\release`) and `DXC_SRC` (a folder holding `dxcompiler.dll` and `dxil.dll`, for example the Windows SDK `bin\<version>\x64`). Files already in `launcher\runtime` are used as is.
 
 To compile the launcher without any runtime files (CI does this), set `SCARLETT_NO_EMBED=1`. It embeds empty placeholders; the result builds but cannot run a game.
 

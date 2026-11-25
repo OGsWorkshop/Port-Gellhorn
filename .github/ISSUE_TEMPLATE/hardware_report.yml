@@ -24,7 +24,7 @@ body:
     id: runtime
     attributes:
       label: Runtime
-      options: [XCL, VIctory stack]
+      options: [XCL, VIctory-based runtime]
     validations:
       required: true
   - type: input

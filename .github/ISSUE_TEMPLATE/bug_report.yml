@@ -6,7 +6,7 @@ body:
     id: runtime
     attributes:
       label: Runtime
-      options: [XCL, VIctory stack, Launcher, Scripts, Other]
+      options: [XCL, VIctory-based runtime, Launcher, Scripts, Other]
     validations:
       required: true
   - type: input

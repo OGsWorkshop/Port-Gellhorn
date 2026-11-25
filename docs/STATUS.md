@@ -1,33 +1,37 @@
 # Technical status
 
-Reference machine: Windows 10 22H2, RTX 3060 12 GB, 32 GB RAM.
+Measured on: Windows 10 22H2, RTX 3060 12 GB, 32 GB RAM. Series S profile (`--console series-s`) with the title's own upscaler.
+
+## Summary
+
+- The VIctory-based runtime reaches the **lit world** at about **3-4 fps**.
+- **Shadowed areas are too dark.**
+- The **intro cutscene is very slow** unless it is skipped.
+- **Not yet verified playable.**
 
 ## What works
-- Executable maps, all imports bind (0 missing), the game's console DLLs load and run.
-- Intro, first-boot setup and menus at 30 fps (XCL); audio plays. No Xbox Live: sign-in fails cleanly and the game carries on offline.
-- World packs stream in through DirectStorage; the open world loads.
-- VIctory stack: world geometry drawn live (debug colour view, about 1 fps) and the movement tutorial is reached. Exposure, luminance and tonemap shaders (36) translate.
-- XCL: world-start GPU crash fixed (the game survives 7+ minutes in the world), pipeline journal and offline build, launcher.
+- Executable maps, all imports bind, the title's console DLLs load and run.
+- Intro, first-boot setup and menus at 30 fps; audio plays. No Xbox Live: sign-in fails cleanly and the title carries on offline.
+- World data streams in through DirectStorage; the open world loads.
+- VIctory-based runtime: the world is drawn with the title's own lighting. Autosave and reload of a checkpoint are reported working by the base (`runtime/victory/README.md`).
+- XCL: world-start GPU crash fixed (the title survives 7+ minutes in the world), pipeline journal and offline build, launcher.
 
 ## What does not
-- The final image is black on both runtimes: some lighting shaders still fail to translate on NVIDIA and their work is dropped.
-- VIctory is about 1 fps in the world; title memory copies cost up to ~600 ms per frame.
-- XCL: first-run shader compiles stall the world; two-pass mesh draws (`XCL_TWO_PASS_INDIRECT=1`) can reset the GPU; memory reaches ~29 GB committed at world start.
+- Shadowed areas are too dark: the title's ray-traced bounce light and shadows do not run yet (`runtime/victory/docs/fork-ray-tracing.md` describes the work so far).
+- About 3-4 fps in the world; the intro cutscene is very slow unless skipped.
+- Some HUD text is cut off in captures.
+- Some cards lose the first room's walls and roof with certain switches (`runtime/victory/VICKY.md`).
+- Memory use is high (the base reports around 24 GB in use during play).
+- XCL: the final image is black; first-run shader compiles stall the world; two-pass mesh draws (`XCL_TWO_PASS_INDIRECT=1`) can reset the GPU.
 
-## Shader failure groups (VIctory, one world run)
-| Failure | Shaders |
-|---|:---:|
-| Descriptor read only as data | 149 |
-| `v_readfirstlane` in divergent control flow | 101 (uniform case fixed) |
-| Lane mask read as data (mesh and compute) | 94 (fixed in our stack) |
-| Structured buffer of unknown stride | 63 |
-| Cross-lane wave op in divergent flow | 57 |
-| Title heap above NVIDIA's 1,000,000-descriptor cap | capped to 868,927 slots in our stack |
+## Notes on measurement
+- The 3-4 fps figure was taken with `VICTORY_OWN_UPSCALER=1`. That switch is not read by the source vendored in `runtime/victory` (it is in a separate branch of our working repository), so a build of this snapshot may differ.
+- Other numbers (shader coverage, per-feature timings) are in `runtime/victory/README.md` and `runtime/victory/VICKY.md`; they were measured by their authors on their own machines, not on the reference machine above.
 
 ## Shader coverage
-- Pack: ~26,500 containers / 26,084 programs. XCL translates all to HLSL; DXC compiles them in the background.
-- VIctory (integration build): DXIL for 14,136/14,208 VS/PS, 2,261/2,582 CS, 8,365/8,520 MS on a 32-lane host.
+- XCL translates the title's whole shader pack to HLSL (26,084 programs); DXC compiles them in the background.
+- For the VIctory-based runtime, see the status tables in `runtime/victory/README.md`.
 
 ## Known gaps
-- Mesh pipelines with a real AS + MS pair.
+- Ray tracing: structure builder and trace programs are partly translated and off by default.
 - On 32-lane GPUs, wave64 compute groups larger than 64 threads and whole-wave sections.

@@ -47,3 +47,24 @@ captures/
 *.dump
 precompiled-dump/
 settings.xml
+
+# More: captures, shader dumps and compiled shaders, archives and game package formats
+*.cso
+*.dxil
+*.spv
+*.pix
+*.rdc
+*.etl
+*.npy
+*.pkl
+*.xvd
+*.xsp
+*.pck
+*.bin.gz
+shader-dump*/
+shaders-dump/
+dumps/
+frames/
+research/
+notes-private/
+victory-data/
