@@ -9,6 +9,12 @@ No emulator, no streaming. The title's own x64 code runs on your CPU, and its RD
 
 Developed and tested so far against one open-world title. It reaches the lit world on an RTX 3060 at about 3-4 fps (Series S profile). It is **not yet verified playable**.
 
+![progress](https://img.shields.io/badge/progress-50%25-ff2d95?style=for-the-badge)
+
+```
+██████████░░░░░░░░░░  50%
+```
+
 `boots` ✅ → `intro & menus` ✅ → `world loads` ✅ → `lit world` ✅ (3-4 fps) → `shadowed areas` 🔨 → `playable speed` ⏳
 
 <a href="https://www.paypal.me/SalwanStudios"><img src="https://img.shields.io/badge/DONATE-PayPal-blue?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" height="45"/></a>
@@ -88,8 +94,11 @@ Details: [`docs/STATUS.md`](docs/STATUS.md). Plan: [`docs/ROADMAP.md`](docs/ROAD
 | Intro, setup and menus | ✅ | 30 fps, audio plays |
 | Open world loads | ✅ | world data streams in through DirectStorage |
 | Lit world renders | ✅ | about 3-4 fps on an RTX 3060, Series S profile |
+| All shaders translate and validate | ✅ | 26,084 of 26,084 (71 oversized mesh shaders validate when linked to their pixel shaders) |
+| Keyboard and mouse | ✅ | click to capture, W walks the character |
 | Shadowed areas | 🔨 | too dark |
 | Intro cutscene | 🔨 | very slow unless skipped |
+| Speed work | 🔨 | batched indirect draws, precise GPU waits, fewer memory copies: built, being measured |
 | Playable | ⏳ | not verified |
 | 30 fps on a mid-range PC | ⏳ | the goal |
 
